@@ -22,6 +22,7 @@
 #pragma once
 #include "expr_tree.h"
 #include <string>
+#include <vector>
 
 struct EvaluationContext {
 	double x = 0.0;
@@ -44,6 +45,8 @@ struct QuadraticResult {
 	double first = 0.0;
 	double second = 0.0;
 	std::string message;
+	std::string firstExact;
+	std::string secondExact;
 };
 
 QuadraticResult solveQuadratic(double a, double b, double c);
@@ -61,3 +64,7 @@ bool isLinearEquation(const Row* equation);
 
 bool solveQuadraticEquation(const Row* equation, QuadraticResult& result,
 							std::string& message);
+
+bool solveGeneralEquation(const Row* equation, const EvaluationContext& context,
+						  char& variable, std::vector<double>& roots,
+						  std::string& message);

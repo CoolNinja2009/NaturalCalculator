@@ -116,8 +116,8 @@ void layoutButtons(int areaLeft, int areaTop, int areaW, int areaH) {
     const int cols = 4;
     const int rows = 7; // last row is the wide "=" button spanning all cols
     int gap = 6;
-    int cellW = (areaW - gap * (cols + 1)) / cols;
-    int cellH = (areaH - gap * (rows + 1)) / rows;
+    int cellW = std::max(1, (areaW - gap * (cols + 1)) / cols);
+    int cellH = std::max(1, (areaH - gap * (rows + 1)) / rows);
 
     auto place = [&](int col, int row, int colSpan, const wchar_t* label, Action act,
                       bool isOp = false, bool accent = false, bool isFunc = false,
@@ -169,11 +169,10 @@ void layoutButtons(int areaLeft, int areaTop, int areaW, int areaH) {
     place(0, 6, 4, L"=", ActEquals, false, true);
 }
 
-void recomputeLayout() {
-    RECT rc;
-    GetClientRect(g.hwnd, &rc);
+void recomputeLayout(const RECT& rc) {
     int w = rc.right - rc.left;
     int h = rc.bottom - rc.top;
+    if (w <= 0 || h <= 0) return;
 
     int topBarH = 40;
     int editorH = std::max(70, h / 6);
@@ -186,6 +185,12 @@ void recomputeLayout() {
 
     layoutButtons(g.buttonAreaRect.left, g.buttonAreaRect.top,
                   w, g.buttonAreaRect.bottom - g.buttonAreaRect.top);
+}
+
+void recomputeLayout() {
+    RECT rc;
+    GetClientRect(g.hwnd, &rc);
+    recomputeLayout(rc);
 }
 
 // ------------------------------------------------------------- actions
@@ -380,10 +385,21 @@ int editorTextX(HDC hdc, const std::string& text, int index) {
     return g.editorRect.left + 16 + size.cx;
 }
 
+std::wstring wideResult(const std::string& result) {
+    if (result.empty()) return {};
+    int length = MultiByteToWideChar(CP_UTF8, 0, result.data(),
+                                     (int)result.size(), nullptr, 0);
+    if (length <= 0) return std::wstring(result.begin(), result.end());
+    std::wstring converted(length, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, result.data(), (int)result.size(),
+                        converted.data(), length);
+    return converted;
+}
+
 std::wstring outputText(int entryIndex) {
     if (entryIndex < 0 || entryIndex >= (int)g.workspace.history().size()) return {};
     const std::string& result = g.workspace.history()[entryIndex]->result;
-    return L"= " + std::wstring(result.begin(), result.end());
+    return L"= " + wideResult(result);
 }
 
 void copySelectedOutput() {
@@ -677,10 +693,12 @@ void paintButton(HDC hdc, const ButtonDef& b, const Theme& theme) {
 
     // Bevel highlight along the top edge for a subtle raised look.
     HPEN hi = CreatePen(PS_SOLID, 1, shade(fill, theme.isDark ? 25 : 40));
-    SelectObject(hdc, hi);
+    HPEN oldHi = (HPEN)SelectObject(hdc, hi);
     MoveToEx(hdc, b.rect.left + radius, b.rect.top + 2, nullptr);
     LineTo(hdc, b.rect.right - radius, b.rect.top + 2);
+    SelectObject(hdc, oldHi);
     SelectObject(hdc, oldBrush);
+    DeleteObject(brush);
     DeleteObject(hi);
 
     SetBkMode(hdc, TRANSPARENT);
@@ -708,8 +726,30 @@ void paint(HDC hdc, RECT client) {
     screenTheme.placeholder = theme.screenPlaceholder;
 
     HDC mem = CreateCompatibleDC(hdc);
-    HBITMAP bmp = CreateCompatibleBitmap(hdc, client.right, client.bottom);
-    HBITMAP oldBmp = (HBITMAP)SelectObject(mem, bmp);
+    if (!mem) {
+        HBRUSH fallback = CreateSolidBrush(theme.background);
+        FillRect(hdc, &client, fallback);
+        DeleteObject(fallback);
+        return;
+    }
+    HBITMAP bmp = CreateCompatibleBitmap(hdc, client.right - client.left,
+                                        client.bottom - client.top);
+    if (!bmp) {
+        DeleteDC(mem);
+        HBRUSH fallback = CreateSolidBrush(theme.background);
+        FillRect(hdc, &client, fallback);
+        DeleteObject(fallback);
+        return;
+    }
+    HGDIOBJ oldBmp = SelectObject(mem, bmp);
+    if (!oldBmp || oldBmp == HGDI_ERROR) {
+        DeleteObject(bmp);
+        DeleteDC(mem);
+        HBRUSH fallback = CreateSolidBrush(theme.background);
+        FillRect(hdc, &client, fallback);
+        DeleteObject(fallback);
+        return;
+    }
 
     HBRUSH bgBrush = CreateSolidBrush(theme.background);
     FillRect(mem, &client, bgBrush);
@@ -796,7 +836,7 @@ void paint(HDC hdc, RECT client) {
                 HFONT old = (HFONT)SelectObject(mem, g.uiFontSmall);
                 SetTextColor(mem, hist[i]->isError ? RGB(0xD8, 0x3B, 0x3B) : screenTheme.resultColor);
                 SetBkMode(mem, TRANSPARENT);
-                std::wstring res = L"= " + std::wstring(hist[i]->result.begin(), hist[i]->result.end());
+                std::wstring res = L"= " + wideResult(hist[i]->result);
                 RECT rr = { g.historyRect.left + pad, y + s.height() + 2,
                             g.historyRect.right - pad, y + s.height() + 24 };
                 int selectionBegin = -1;
@@ -942,7 +982,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             HDC hdc = BeginPaint(hwnd, &ps);
             RECT client;
             GetClientRect(hwnd, &client);
-            paint(hdc, client);
+            if (client.right > client.left && client.bottom > client.top) {
+                recomputeLayout(client);
+                paint(hdc, client);
+            }
             EndPaint(hwnd, &ps);
             return 0;
         }

@@ -144,6 +144,46 @@ static void testAssignmentsPersist() {
     assert(rootWorkspace.history().back()->result == "y = 2");
 }
 
+static void testGeneralEquations() {
+    Workspace workspace;
+    workspace.current() = expressionFrom("2^x+x=8");
+    assert(workspace.commitCurrent());
+    assert(workspace.history().back()->result.find("x =") == 0);
+    assert(workspace.history().back()->result.find("2.4") != std::string::npos);
+    assertNear(workspace.solvedValues().x, std::stod(workspace.history().back()->result.substr(4)));
+
+    workspace.current() = expressionFrom("x^2+2x-4");
+    assert(workspace.commitCurrent());
+    assert(workspace.history().back()->result.find("x1 =") == 0);
+    assert(workspace.history().back()->result.find(", x2 =") != std::string::npos);
+
+    workspace.current() = expressionFrom("x^2+1=0");
+    assert(workspace.commitCurrent());
+    assert(workspace.history().back()->result == "\xE2\x88\x85");
+
+    workspace.current() = expressionFrom("2^x+1=0");
+    assert(workspace.commitCurrent());
+    assert(workspace.history().back()->result == "\xE2\x88\x85");
+
+    workspace.current() = expressionFrom("2^x^2=1");
+    assert(workspace.commitCurrent());
+    assert(workspace.history().back()->result.find("x = 0") == 0);
+
+    workspace.current() = expressionFrom("x^2=2");
+    assert(workspace.commitCurrent());
+    assert(workspace.history().back()->result.find("\xE2\x88\x9A") != std::string::npos);
+    assert(workspace.history().back()->result.find("x1 = \xE2\x88\x9A" "2") == 0);
+    assert(workspace.history().back()->result.find(" = ") != std::string::npos);
+
+    Expression squareRootPower;
+    insertDigit(squareRootPower, '2');
+    insertPower(squareRootPower);
+    insertDigit(squareRootPower, '1');
+    insertFraction(squareRootPower);
+    insertDigit(squareRootPower, '2');
+    assert(evaluateToString(squareRootPower.root.get()).find("\xE2\x88\x9A" "2 = ") == 0);
+}
+
 static void testFactorials() {
     Expression five = expressionFrom("5");
     insertOperator(five, '!');
@@ -205,6 +245,7 @@ int main() {
     testQuadratics();
     testInvalidLinearTerms();
     testAssignmentsPersist();
+    testGeneralEquations();
     testFactorials();
     testStandaloneClosingParen();
     testPowerEditing();

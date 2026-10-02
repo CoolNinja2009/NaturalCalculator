@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <stdexcept>
 #include <algorithm>
+#include <vector>
 
 namespace {
 
@@ -41,6 +42,74 @@ bool sameRange(const std::vector<std::unique_ptr<Item>>& items,
     for (size_t i = 0; i < leftEnd - leftBegin; ++i) {
         if (!sameItem(items[leftBegin + i].get(), items[rightBegin + i].get())) return false;
     }
+    return true;
+}
+
+void collectVariables(const Row* row, bool& hasX, bool& hasY) {
+    if (!row) return;
+    for (const auto& item : row->items) {
+        if (item->type == ItemType::Variable) {
+            hasX = hasX || item->variableName == 'x';
+            hasY = hasY || item->variableName == 'y';
+        }
+        collectVariables(item->a.get(), hasX, hasY);
+        collectVariables(item->b.get(), hasX, hasY);
+    }
+}
+
+std::string numberString(double value) {
+    char buffer[64];
+    std::snprintf(buffer, sizeof(buffer), "%.10g", value);
+    return buffer;
+}
+
+std::string radicalText(double value, double& outside, double& inside) {
+    outside = 1.0;
+    inside = value;
+    double rounded = std::round(value);
+    if (value <= 0.0 || value > 1e12 || std::fabs(value - rounded) > 1e-10)
+        return "\xE2\x88\x9A" + numberString(value);
+    long long integer = (long long)rounded;
+    long long factor = 1;
+    for (long long candidate = (long long)std::sqrt((double)integer); candidate >= 2; --candidate) {
+        long long square = candidate * candidate;
+        if (integer % square == 0) {
+            factor = candidate;
+            break;
+        }
+    }
+    outside = (double)factor;
+    inside = (double)(integer / (factor * factor));
+    if (factor == 1) return "\xE2\x88\x9A" + numberString(inside);
+    return numberString(outside) + "\xE2\x88\x9A" + numberString(inside);
+}
+
+bool simpleSquareRootPower(const Row* row, std::string& form) {
+    if (!row || row->items.size() != 1 || row->items[0]->type != ItemType::Power)
+        return false;
+    const Item* power = row->items[0].get();
+    const Row* base = power->a.get();
+    const Row* exponent = power->b.get();
+    if (!base || base->items.size() != 1 || base->items[0]->type != ItemType::Number ||
+        !exponent || exponent->items.size() != 1 || exponent->items[0]->type != ItemType::Fraction)
+        return false;
+    const Item* fraction = exponent->items[0].get();
+    if (!fraction->a || !fraction->b || fraction->a->items.size() != 1 ||
+        fraction->b->items.size() != 1 ||
+        fraction->a->items[0]->type != ItemType::Number ||
+        fraction->b->items[0]->type != ItemType::Number ||
+        fraction->a->items[0]->numText != "1" || fraction->b->items[0]->numText != "2")
+        return false;
+    double radicand = 0.0;
+    try { radicand = std::stod(base->items[0]->numText); }
+    catch (...) { return false; }
+    if (radicand <= 0.0 || std::floor(radicand) != radicand || radicand > 1e12)
+        return false;
+    double squareRoot = std::sqrt(radicand);
+    if (std::fabs(squareRoot - std::round(squareRoot)) < 1e-10)
+        return false;
+    double outside = 1.0, inside = radicand;
+    form = radicalText(radicand, outside, inside);
     return true;
 }
 
@@ -475,6 +544,9 @@ std::string evaluateToString(const Row* root, const EvaluationContext& context) 
         double v = evaluate(root, context);
         if (!std::isfinite(v))
             return std::isnan(v) ? "Error" : (v > 0 ? "Infinity" : "-Infinity");
+        std::string radical;
+        if (simpleSquareRootPower(root, radical))
+            return radical + " = " + numberString(v);
 
         // Prefer plain fixed notation; fall back to scientific for very
         // large/small magnitudes.
@@ -681,20 +753,167 @@ bool solveQuadraticEquation(const Row* equation, QuadraticResult& result,
             equals = i;
         }
     }
-    if (equals == 0 || equals + 1 >= equation->items.size()) {
+    bool hasEquals = equals < equation->items.size();
+    if (hasEquals && (equals == 0 || equals + 1 >= equation->items.size())) {
         message = "Incomplete equation";
         return false;
     }
-    PolynomialParser leftParser(equation, 0, equals);
-    PolynomialParser rightParser(equation, equals + 1, equation->items.size());
-    Polynomial left = leftParser.parseRow();
-    Polynomial right = rightParser.parseRow();
+    Polynomial left, right;
+    if (hasEquals) {
+        PolynomialParser leftParser(equation, 0, equals);
+        PolynomialParser rightParser(equation, equals + 1, equation->items.size());
+        left = leftParser.parseRow();
+        right = rightParser.parseRow();
+    } else {
+        PolynomialParser expressionParser(equation, 0, equation->items.size());
+        left = expressionParser.parseRow();
+    }
     if (!left.valid || !right.valid) { message = "Equation must be polynomial in x"; return false; }
     double a = left.coefficient[2] - right.coefficient[2];
     double b = left.coefficient[1] - right.coefficient[1];
     double c = left.coefficient[0] - right.coefficient[0];
     if (std::fabs(a) < 1e-12) { message = "Not a quadratic equation"; return false; }
     result = solveQuadratic(a, b, c);
+    if (result.rootCount > 0) {
+        double discriminant = b * b - 4.0 * a * c;
+        double squareRoot = std::sqrt(std::max(0.0, discriminant));
+        if (std::fabs(squareRoot - std::round(squareRoot)) > 1e-10) {
+            double outside = 1.0, inside = discriminant;
+            std::string radical = radicalText(discriminant, outside, inside);
+            auto rootForm = [&](bool positive) {
+                double radicalCoefficient = outside / (2.0 * a);
+                if (std::fabs(b) < 1e-12 && std::fabs(std::fabs(radicalCoefficient) - 1.0) < 1e-10) {
+                    bool negative = positive ? radicalCoefficient < 0.0 : radicalCoefficient > 0.0;
+                    return std::string(negative ? "-" : "") + "\xE2\x88\x9A" + numberString(inside);
+                }
+                return "(" + numberString(-b) + (positive ? "+" : "-") + radical +
+                       ")/" + numberString(2.0 * a);
+            };
+            result.firstExact = rootForm(true);
+            if (result.rootCount == 2) result.secondExact = rootForm(false);
+        }
+    }
     message.clear();
+    return true;
+}
+
+bool solveGeneralEquation(const Row* equation, const EvaluationContext& context,
+                          char& variable, std::vector<double>& roots,
+                          std::string& message) {
+    if (!equation) { message = "Invalid equation"; return false; }
+    size_t equals = equation->items.size();
+    for (size_t i = 0; i < equation->items.size(); ++i) {
+        if (equation->items[i]->type == ItemType::Equals) {
+            if (equals != equation->items.size()) { message = "Use one '=' per equation"; return false; }
+            equals = i;
+        }
+    }
+    if (equals == 0 || equals + 1 >= equation->items.size()) {
+        message = "Incomplete equation";
+        return false;
+    }
+    bool hasX = false, hasY = false;
+    collectVariables(equation, hasX, hasY);
+    if (hasX == hasY) {
+        message = hasX ? "Needs a second equation for x and y" : "Equation needs a variable";
+        return false;
+    }
+    variable = hasX ? 'x' : 'y';
+
+    auto residual = [&](double value, double& output) {
+        EvaluationContext trial = context;
+        if (variable == 'x') trial.x = value;
+        else trial.y = value;
+        try {
+            RowParser left(equation, trial, 0, equals);
+            RowParser right(equation, trial, equals + 1, equation->items.size());
+            output = left.parseRow() - right.parseRow();
+            return std::isfinite(output);
+        } catch (const std::exception&) {
+            return false;
+        }
+    };
+
+    roots.clear();
+    constexpr double lower = -1000.0;
+    constexpr double upper = 1000.0;
+    constexpr int samples = 40000;
+    constexpr double tolerance = 1e-9;
+    double previousX = lower, previousValue = 0.0;
+    bool previousValid = residual(previousX, previousValue);
+    double olderX = previousX, olderValue = previousValue;
+    bool olderValid = false;
+    bool allZero = previousValid && std::fabs(previousValue) < tolerance;
+
+    auto addRoot = [&](double root) {
+        for (double found : roots)
+            if (std::fabs(found - root) < 1e-6) return;
+        roots.push_back(root);
+    };
+
+    for (int sample = 1; sample <= samples; ++sample) {
+        double currentX = lower + (upper - lower) * sample / samples;
+        double currentValue = 0.0;
+        bool currentValid = residual(currentX, currentValue);
+        if (currentValid && std::fabs(currentValue) < tolerance) addRoot(currentX);
+        if (currentValid && std::fabs(currentValue) >= tolerance) allZero = false;
+        if (previousValid && currentValid &&
+            ((previousValue < 0.0 && currentValue > 0.0) ||
+             (previousValue > 0.0 && currentValue < 0.0))) {
+            double left = previousX, right = currentX;
+            double leftValue = previousValue;
+            for (int iteration = 0; iteration < 80; ++iteration) {
+                double middle = (left + right) * 0.5;
+                double middleValue = 0.0;
+                if (!residual(middle, middleValue)) break;
+                if ((leftValue < 0.0 && middleValue > 0.0) ||
+                    (leftValue > 0.0 && middleValue < 0.0)) right = middle;
+                else { left = middle; leftValue = middleValue; }
+            }
+            addRoot((left + right) * 0.5);
+        }
+        if (olderValid && previousValid && currentValid &&
+            std::fabs(previousValue) < std::fabs(olderValue) &&
+            std::fabs(previousValue) < std::fabs(currentValue)) {
+            double left = olderX, right = currentX;
+            constexpr double ratio = 0.6180339887498949;
+            double first = right - ratio * (right - left);
+            double second = left + ratio * (right - left);
+            double firstValue = 0.0, secondValue = 0.0;
+            bool firstValid = residual(first, firstValue);
+            bool secondValid = residual(second, secondValue);
+            for (int iteration = 0; iteration < 64; ++iteration) {
+                double firstMagnitude = firstValid ? std::fabs(firstValue) : INFINITY;
+                double secondMagnitude = secondValid ? std::fabs(secondValue) : INFINITY;
+                if (firstMagnitude < secondMagnitude) {
+                    right = second;
+                    second = first;
+                    secondValue = firstValue;
+                    secondValid = firstValid;
+                    first = right - ratio * (right - left);
+                    firstValid = residual(first, firstValue);
+                } else {
+                    left = first;
+                    first = second;
+                    firstValue = secondValue;
+                    firstValid = secondValid;
+                    second = left + ratio * (right - left);
+                    secondValid = residual(second, secondValue);
+                }
+            }
+            double minimum = (left + right) * 0.5;
+            double minimumValue = 0.0;
+            if (residual(minimum, minimumValue) && std::fabs(minimumValue) < 1e-8)
+                addRoot(minimum);
+        }
+        olderX = previousX;
+        olderValue = previousValue;
+        olderValid = previousValid;
+        previousX = currentX;
+        previousValue = currentValue;
+        previousValid = currentValid;
+    }
+    if (allZero) message = "Every value is a solution";
+    else message = roots.empty() ? "\xE2\x88\x85" : std::string();
     return true;
 }

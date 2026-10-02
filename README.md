@@ -100,6 +100,11 @@ copy it anywhere and run it.
   two-variable system. The second line displays both values.
 - Type a quadratic directly in the main window, such as `x^2+5x+6=0`, and
   press Enter to display its roots. The coefficient dialog follows dark mode.
+- Nonlinear single-variable equations such as `2^x+x=8` are solved numerically
+  over `-1000` to `1000` (including repeated roots when detectable);
+  irrational quadratic roots and square-root powers such as `2^(1/2)` show an
+  exact radical form followed by its decimal value. Equations with no detected
+  real roots display `∅`.
 - A single equation that reduces to one variable, such as `x+2y=x-3`,
   reports that variable and explains when the other remains free.
 - Press Up to recall the previous submitted expression, like a shell history.

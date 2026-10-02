@@ -11,21 +11,29 @@ bool Workspace::commitCurrent(const EvaluationContext& context) {
     auto entry = std::make_unique<HistoryEntry>();
     entry->expr = std::move(current_);
 
-    if (hasEquals(entry->expr->root.get())) {
-        QuadraticResult quadratic;
-        char variable = 0;
-        double value = 0.0;
-        std::string message;
-        if (solveQuadraticEquation(entry->expr->root.get(), quadratic, message)) {
-            if (quadratic.rootCount == 0) entry->result = quadratic.message;
+    bool hasEquation = hasEquals(entry->expr->root.get());
+    QuadraticResult quadratic;
+    char variable = 0;
+    double value = 0.0;
+    std::string message;
+    bool isQuadratic = solveQuadraticEquation(entry->expr->root.get(), quadratic, message);
+    if (hasEquation || isQuadratic) {
+        if (isQuadratic) {
+            if (quadratic.rootCount == 0) entry->result = "\xE2\x88\x85";
             else if (quadratic.rootCount == 1) {
-                char result[96];
-                std::snprintf(result, sizeof(result), "x = %.10g", quadratic.first);
-                entry->result = result;
+                char valueText[64];
+                std::snprintf(valueText, sizeof(valueText), "%.10g", quadratic.first);
+                entry->result = quadratic.firstExact.empty() ?
+                    "x = " + std::string(valueText) :
+                    "x = " + quadratic.firstExact + " = " + valueText;
             } else {
-                char result[128];
-                std::snprintf(result, sizeof(result), "x1 = %.10g, x2 = %.10g", quadratic.first, quadratic.second);
-                entry->result = result;
+                char firstText[64], secondText[64];
+                std::snprintf(firstText, sizeof(firstText), "%.10g", quadratic.first);
+                std::snprintf(secondText, sizeof(secondText), "%.10g", quadratic.second);
+                entry->result = quadratic.firstExact.empty() ?
+                    "x1 = " + std::string(firstText) + ", x2 = " + secondText :
+                    "x1 = " + quadratic.firstExact + " = " + firstText +
+                    ", x2 = " + quadratic.secondExact + " = " + secondText;
             }
             entry->isError = false;
         } else if (solveVariableAssignment(entry->expr->root.get(), context, variable, value, message)) {
@@ -43,8 +51,30 @@ bool Workspace::commitCurrent(const EvaluationContext& context) {
             if (variable == 'x') solvedValues_.x = value;
             else solvedValues_.y = value;
         } else {
-            entry->result = message;
-            entry->isError = false;
+            std::vector<double> roots;
+            if (solveGeneralEquation(entry->expr->root.get(), context, variable, roots, message)) {
+                if (!message.empty()) entry->result = message;
+                else if (roots.size() == 1) {
+                    char result[96];
+                    std::snprintf(result, sizeof(result), "%c = %.10g", variable, roots[0]);
+                    entry->result = result;
+                    if (variable == 'x') solvedValues_.x = roots[0];
+                    else solvedValues_.y = roots[0];
+                } else {
+                    entry->result.clear();
+                    for (size_t i = 0; i < roots.size(); ++i) {
+                        char result[96];
+                        std::snprintf(result, sizeof(result), "%c%zu = %.10g",
+                                      variable, i + 1, roots[i]);
+                        if (i) entry->result += ", ";
+                        entry->result += result;
+                    }
+                }
+                entry->isError = false;
+            } else {
+                entry->result = message;
+                entry->isError = false;
+            }
         }
     } else {
         try {
