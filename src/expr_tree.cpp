@@ -263,6 +263,22 @@ static std::unique_ptr<Item> consumeLeftAtom(Expression& expr) {
     return taken;
 }
 
+// When an existing structural item (Paren/Sqrt/Fraction/Power) is moved
+// into a different row -- e.g. consumeLeftAtom() pulls it out to become
+// the numerator of a brand-new Fraction -- the item's own child rows
+// still think they live in the row they were *originally* created in
+// (Row::ownerParentRow is set once, at creation, and otherwise never
+// updated). Left uncorrected, that stale pointer makes
+// ownerIndexInParentRow() search the wrong row for the item, silently
+// breaking arrow-key navigation and backspace/delete for anything nested
+// inside the moved item (e.g. typing "(2+3)" and then pressing '/' or '^'
+// to wrap it). Call this immediately after re-homing such an item.
+static void reparentItemChildren(Item* item, Row* newParentRow) {
+    if (!item) return;
+    if (item->a) item->a->ownerParentRow = newParentRow;
+    if (item->b) item->b->ownerParentRow = newParentRow;
+}
+
 void insertFraction(Expression& expr) {
     Row* row = expr.cursor.row;
     int insertPos = expr.cursor.index;
@@ -275,7 +291,10 @@ void insertFraction(Expression& expr) {
 
     attachRow(fracItem->a, fracPtr, row);
     attachRow(fracItem->b, fracPtr, row);
-    if (consumed) fracItem->a->items.push_back(std::move(consumed));
+    if (consumed) {
+        reparentItemChildren(consumed.get(), fracItem->a.get());
+        fracItem->a->items.push_back(std::move(consumed));
+    }
 
     row->items.insert(row->items.begin() + insertPos, std::move(fracItem));
 
@@ -301,7 +320,10 @@ void insertPower(Expression& expr) {
 
     attachRow(powItem->a, powPtr, row);
     attachRow(powItem->b, powPtr, row);
-    if (consumed) powItem->a->items.push_back(std::move(consumed));
+    if (consumed) {
+        reparentItemChildren(consumed.get(), powItem->a.get());
+        powItem->a->items.push_back(std::move(consumed));
+    }
 
     row->items.insert(row->items.begin() + insertPos, std::move(powItem));
 
@@ -376,10 +398,19 @@ void moveLeft(Expression& expr) {
                 return;
             case ItemType::Fraction:
             case ItemType::Power:
+                // Entering a closed fraction/power from the right lands
+                // in its rightmost row -- the denominator/exponent --
+                // not the numerator/base. This mirrors how the caret
+                // exited it in the first place when it was built left to
+                // right, and matches natural-display calculators (Casio
+                // fx-991ES): arrowing left over "2/3" steps into "3".
+                expr.cursor.row = prev->b.get();
+                expr.cursor.index = (int)prev->b->items.size();
+                return;
             case ItemType::Paren:
             case ItemType::Sqrt:
-                // Enter from the right -> land at the end of its primary
-                // (leftmost/top) row.
+                // These have only one child row, so entering from either
+                // side lands in the same place: its end.
                 expr.cursor.row = prev->a.get();
                 expr.cursor.index = (int)prev->a->items.size();
                 return;
@@ -388,6 +419,18 @@ void moveLeft(Expression& expr) {
 
     // idx == 0: step out of the current structure, if any.
     if (row->owner) {
+        // Leaving the start of a denominator/exponent steps sideways into
+        // the end of its sibling numerator/base, instead of exiting the
+        // whole structure -- otherwise the numerator would be completely
+        // unreachable by arrow keys once you'd arrowed into the
+        // denominator.
+        if (isBRow(row) &&
+            (row->owner->type == ItemType::Fraction || row->owner->type == ItemType::Power)) {
+            Row* a = row->owner->a.get();
+            expr.cursor.row = a;
+            expr.cursor.index = (int)a->items.size();
+            return;
+        }
         int k = ownerIndexInParentRow(row);
         if (k >= 0) {
             expr.cursor.row = row->ownerParentRow;
@@ -423,6 +466,17 @@ void moveRight(Expression& expr) {
 
     // idx == end of row: step out of the current structure, if any.
     if (row->owner) {
+        // Leaving the end of a numerator/base steps sideways into the
+        // start of its sibling denominator/exponent, instead of exiting
+        // the whole structure -- otherwise the denominator would be
+        // completely unreachable by arrow keys.
+        if (isARow(row) &&
+            (row->owner->type == ItemType::Fraction || row->owner->type == ItemType::Power)) {
+            Row* b = row->owner->b.get();
+            expr.cursor.row = b;
+            expr.cursor.index = 0;
+            return;
+        }
         int k = ownerIndexInParentRow(row);
         if (k >= 0) {
             expr.cursor.row = row->ownerParentRow;
@@ -432,23 +486,28 @@ void moveRight(Expression& expr) {
     // else: already at the very end of the whole expression; no-op.
 }
 
-void moveUp(Expression& expr) {
+// Returns true if the cursor actually moved (i.e. it was inside a
+// denominator/exponent and stepped up into the numerator/base). Callers
+// (e.g. the Up arrow key handler) use this to fall back to other
+// behavior -- like recalling history -- only when there is genuinely
+// nowhere to navigate to inside the current expression.
+bool moveUp(Expression& expr) {
     Row* row = expr.cursor.row;
     if (isBRow(row)) { // in denominator/exponent -> go to numerator/base
         Item* owner = row->owner;
         Row* target = owner->a.get();
         expr.cursor.row = target;
-        expr.cursor.index = (int)target->items.size() < expr.cursor.index
-                                 ? (int)target->items.size()
-                                 : expr.cursor.index;
         if (expr.cursor.index > (int)target->items.size())
             expr.cursor.index = (int)target->items.size();
+        return true;
     }
     // In a-row, or in a single-row structure (Paren/Sqrt), or in root:
     // no vertical sibling to move to (simplification).
+    return false;
 }
 
-void moveDown(Expression& expr) {
+// Mirror of moveUp: returns true if the cursor moved.
+bool moveDown(Expression& expr) {
     Row* row = expr.cursor.row;
     if (isARow(row) && row->owner &&
         (row->owner->type == ItemType::Fraction || row->owner->type == ItemType::Power)) {
@@ -457,7 +516,9 @@ void moveDown(Expression& expr) {
         expr.cursor.row = target;
         if (expr.cursor.index > (int)target->items.size())
             expr.cursor.index = (int)target->items.size();
+        return true;
     }
+    return false;
 }
 
 // -------------------------------------------------------------- deletion

@@ -130,13 +130,19 @@ void insertOpenParen(Expression& expr);
 void insertCloseParen(Expression& expr);
 
 // Cursor motion. These understand structure: entering a Fraction from the
-// left steps into the end of the numerator (or start, depending on
-// direction), Up/Down move between numerator and denominator (and base/
-// exponent), etc.
+// left steps into the start of the numerator (or into the end of the
+// denominator if entering from the right), Up/Down move between numerator
+// and denominator (and base/exponent), etc.
 void moveLeft(Expression& expr);
 void moveRight(Expression& expr);
-void moveUp(Expression& expr);
-void moveDown(Expression& expr);
+
+// moveUp/moveDown return true if the cursor actually moved (i.e. there was
+// a numerator<->denominator or base<->exponent sibling to move to).
+// Callers that overload Up/Down for something else (e.g. recalling
+// history when there's nowhere left to navigate structurally) should only
+// do so when these return false.
+bool moveUp(Expression& expr);
+bool moveDown(Expression& expr);
 
 // Backspace: delete the item just before the cursor. If that item is
 // structural and one of its child rows is empty while the other has

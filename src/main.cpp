@@ -1179,7 +1179,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     return 0;
                 }
                 case VK_UP:
-                    if (!g.workspace.recallPrevious()) moveUp(cur);
+                    // Structural navigation takes priority: if the cursor
+                    // is inside a denominator/exponent, Up should move it
+                    // to the numerator/base above, matching natural
+                    // calculators. Only fall back to recalling a previous
+                    // history entry when there's nowhere left to navigate
+                    // to inside the current expression -- otherwise Up
+                    // could never reach a numerator once you'd arrowed
+                    // down into a denominator, and would instead silently
+                    // replace what you were typing with old history.
+                    if (!moveUp(cur)) g.workspace.recallPrevious();
                     ensureCaretVisible();
                     InvalidateRect(hwnd, nullptr, FALSE);
                     return 0;
