@@ -149,10 +149,13 @@ struct RowParser {
         switch (it->type) {
             case ItemType::Number: {
                 pos++;
-                if (it->numText.empty() || it->numText == ".")
+                std::string numberText = it->numText;
+                while (!atEnd() && items[pos]->type == ItemType::Number)
+                    numberText += items[pos++]->numText;
+                if (numberText.empty() || numberText == ".")
                     throw std::runtime_error("Invalid number");
                 try {
-                    return std::stod(it->numText);
+                    return std::stod(numberText);
                 } catch (...) {
                     throw std::runtime_error("Invalid number");
                 }
@@ -326,9 +329,13 @@ struct PolynomialParser {
         if (atEnd()) return { { 0, 0, 0 }, false };
         const Item* item = items[pos++].get();
         switch (item->type) {
-            case ItemType::Number:
-                try { return { { std::stod(item->numText), 0, 0 }, true }; }
+            case ItemType::Number: {
+                std::string numberText = item->numText;
+                while (!atEnd() && items[pos]->type == ItemType::Number)
+                    numberText += items[pos++]->numText;
+                try { return { { std::stod(numberText), 0, 0 }, true }; }
                 catch (...) { return { { 0, 0, 0 }, false }; }
+            }
             case ItemType::Variable:
                 return item->variableName == 'x' ? Polynomial{ { 0, 1, 0 }, true } : Polynomial{ { 0, 0, 0 }, false };
             case ItemType::Paren:
@@ -437,9 +444,13 @@ struct LinearParser {
         if (atEnd()) return { 0, 0, 0, false };
         const Item* item = items[pos++].get();
         switch (item->type) {
-            case ItemType::Number:
-                try { return { 0, 0, std::stod(item->numText), true }; }
+            case ItemType::Number: {
+                std::string numberText = item->numText;
+                while (!atEnd() && items[pos]->type == ItemType::Number)
+                    numberText += items[pos++]->numText;
+                try { return { 0, 0, std::stod(numberText), true }; }
                 catch (...) { return { 0, 0, 0, false }; }
+            }
             case ItemType::Variable:
                 return item->variableName == 'x' ? Linear{ 1, 0, 0, true } : Linear{ 0, 1, 0, true };
             case ItemType::Paren:

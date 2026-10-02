@@ -324,6 +324,18 @@ int editorCharacterAtPoint(POINT point) {
     return result;
 }
 
+void editorCursorAtPoint(POINT point) {
+    HDC hdc = GetDC(g.hwnd);
+    if (!hdc) return;
+    Expression& expression = g.workspace.current();
+    Size size = measureExpression(hdc, expression.root.get());
+    int midY = (g.editorRect.top + g.editorRect.bottom) / 2;
+    int baseline = midY + (size.ascent - size.descent) / 2;
+    placeCursorAtPoint(expression, hdc, g.editorRect.left + 16, baseline,
+                       point.x, point.y);
+    ReleaseDC(g.hwnd, hdc);
+}
+
 void insertPlainText(Expression& expression, const std::string& text) {
     for (char character : text) {
         if (character >= '0' && character <= '9') insertDigit(expression, character);
@@ -1027,7 +1039,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 g.editorSelecting = true;
                 g.editorAnchor = editorCharacterAtPoint(pt);
                 g.editorCaret = g.editorAnchor;
-                g.editorTextCursor = g.editorAnchor;
+                g.editorTextCursor = -1;
+                editorCursorAtPoint(pt);
                 g.allSelected = false;
                 g.rangeSelected = false;
                 g.outputEntry = -1;
@@ -1242,7 +1255,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         g.editorCaret = 0;
                         g.editorTextCursor = -1;
                     } else {
-                        g.editorTextCursor = 0;
+                        cur.cursor.index = 0;
+                        g.editorTextCursor = -1;
                         g.editorAnchor = g.editorCaret = 0;
                     }
                     ensureCaretVisible();
@@ -1255,7 +1269,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         g.editorCaret = (int)cur.toPlainString().size();
                         g.editorTextCursor = -1;
                     } else {
-                        g.editorTextCursor = (int)cur.toPlainString().size();
+                        cur.cursor.index = (int)cur.cursor.row->items.size();
+                        g.editorTextCursor = -1;
                         g.editorAnchor = g.editorCaret = 0;
                     }
                     ensureCaretVisible();

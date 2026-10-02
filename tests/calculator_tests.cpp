@@ -1,5 +1,6 @@
 #include "evaluator.h"
 #include "expr_tree.h"
+#include "layout.h"
 #include "workspace.h"
 #include <cassert>
 #include <cmath>
@@ -227,6 +228,66 @@ static void testStandaloneClosingParen() {
     assert(expression.toPlainString() == "5 + 4");
 }
 
+static void testCloseParenExitsNestedStructure() {
+    Expression expression;
+    insertOpenParen(expression);
+    insertVariable(expression, 'x');
+    insertPower(expression);
+    insertDigit(expression, '2');
+    insertCloseParen(expression);
+    insertOperator(expression, '+');
+    insertDigit(expression, '1');
+
+    assert(expression.toPlainString() == "((x)^(2)) + 1");
+    assertNear(evaluate(expression.root.get(), { 3.0, 0.0 }), 10.0);
+}
+
+static void testClickPlacesStructuralCursor() {
+    HDC hdc = CreateCompatibleDC(nullptr);
+    assert(hdc);
+    HFONT font = CreateFontW(-fontHeightForDepth(0), 0, 0, 0, FW_NORMAL,
+                             FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS,
+                             CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                             DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    assert(font);
+    HFONT oldFont = (HFONT)SelectObject(hdc, font);
+    SIZE prefix{};
+    GetTextExtentPoint32W(hdc, L"12", 2, &prefix);
+    SelectObject(hdc, oldFont);
+    DeleteObject(font);
+
+    Expression expression = expressionFrom("1234");
+    assert(placeCursorAtPoint(expression, hdc, 10, 50, 10 + prefix.cx, 50));
+    insertOperator(expression, '+');
+    assert(expression.toPlainString() == "12 + 34");
+
+    Expression digits = expressionFrom("1234");
+    assert(placeCursorAtPoint(digits, hdc, 10, 50, 10 + prefix.cx, 50));
+    insertDigit(digits, '9');
+    insertDigit(digits, '8');
+    assert(digits.toPlainString() == "129834");
+    assertNear(evaluate(digits.root.get()), 129834.0);
+
+    Expression power;
+    insertVariable(power, 'x');
+    insertPower(power);
+    insertDigit(power, '2');
+    moveRight(power);
+    insertOperator(power, '+');
+    insertDigit(power, '3');
+    Cursor exponentStart{ power.root->items[0]->b.get(), 0 };
+    CaretInfo exponentCaret;
+    drawExpression(hdc, power.root.get(), 10, 50, darkTheme(),
+                   &exponentStart, &exponentCaret);
+    assert(exponentCaret.valid);
+    int exponentY = (exponentCaret.top + exponentCaret.bottom) / 2;
+    assert(placeCursorAtPoint(power, hdc, 10, 50, exponentCaret.x, exponentY));
+    insertDigit(power, '4');
+    assert(power.toPlainString() == "(x)^(42) + 3");
+    assertNear(evaluate(power.root.get(), { 2.0, 0.0 }), std::pow(2.0, 42.0) + 3.0);
+    DeleteDC(hdc);
+}
+
 static void testPowerEditing() {
     Expression expression;
     insertDigit(expression, '2');
@@ -248,6 +309,8 @@ int main() {
     testGeneralEquations();
     testFactorials();
     testStandaloneClosingParen();
+        testCloseParenExitsNestedStructure();
+        testClickPlacesStructuralCursor();
     testPowerEditing();
     std::cout << "All calculator edge-case tests passed\n";
     return 0;

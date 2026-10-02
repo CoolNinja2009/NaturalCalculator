@@ -65,6 +65,11 @@ Size measureExpression(HDC hdc, const Row* root);
 void drawExpression(HDC hdc, const Row* root, int originX, int baselineY,
                      const Theme& theme, const Cursor* cursor, CaretInfo* outCaret);
 
+// Moves the expression cursor to the closest insertion point in the rendered
+// tree. A click inside a number splits that digit run at the selected offset.
+bool placeCursorAtPoint(Expression& expression, HDC hdc, int originX,
+                        int baselineY, int pointX, int pointY);
+
 // Font size (in logical points, negative = pixel height convention used
 // by CreateFont) for a given nesting depth. Exposed for layout math in
 // main.cpp (e.g. computing line heights for the workspace).

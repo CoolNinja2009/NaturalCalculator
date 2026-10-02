@@ -370,14 +370,23 @@ void insertCloseParen(Expression& expr) {
     // bare ')' character here would draw as a small flat glyph instead of
     // the tall stretched bracket a real Paren renders, which is exactly
     // the "mismatched bracket" look this avoids.
-    Row* row = expr.cursor.row;
-    if (row->owner && row->owner->type == ItemType::Paren && row->owner->a.get() == row) {
+    Row* insertionRow = expr.cursor.row;
+    int insertionIndex = expr.cursor.index;
+    Row* row = insertionRow;
+    while (row && row->owner) {
         int k = ownerIndexInParentRow(row);
-        if (k >= 0) {
+        if (k < 0) break;
+        if (row->owner->type == ItemType::Paren && row->owner->a.get() == row) {
             expr.cursor.row = row->ownerParentRow;
             expr.cursor.index = k + 1;
+            return;
         }
+        row = row->ownerParentRow;
     }
+    auto close = std::make_unique<Item>(ItemType::CloseParen);
+    insertionRow->items.insert(insertionRow->items.begin() + insertionIndex, std::move(close));
+    expr.cursor.row = insertionRow;
+    expr.cursor.index = insertionIndex + 1;
 }
 
 // ---------------------------------------------------------------- motion

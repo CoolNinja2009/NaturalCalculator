@@ -2,6 +2,7 @@
 #include "layout.h"
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <unordered_map>
 
 Theme lightTheme() {
@@ -420,6 +421,121 @@ void drawItemImpl(HDC hdc, const Item* it, int depth, int x, int baselineY,
     }
 }
 
+struct HitCandidate {
+    Row* row = nullptr;
+    int index = 0;
+    Item* number = nullptr;
+    int numberOffset = 0;
+    long long distance = std::numeric_limits<long long>::max();
+};
+
+void considerHit(HitCandidate& best, Row* row, int index, Item* number,
+                 int numberOffset, int x, int y, int pointX, int pointY) {
+    long long dx = (long long)pointX - x;
+    long long dy = (long long)pointY - y;
+    long long distance = dx * dx + 4 * dy * dy;
+    if (distance < best.distance) {
+        best = { row, index, number, numberOffset, distance };
+    }
+}
+
+int numberPrefixWidth(HDC hdc, const Item* item, int depth, int count) {
+    HFONT font = fontForDepth(depth);
+    HFONT old = (HFONT)SelectObject(hdc, font);
+    std::wstring prefix(item->numText.begin(), item->numText.begin() + count);
+    SIZE size{};
+    GetTextExtentPoint32W(hdc, prefix.c_str(), (int)prefix.size(), &size);
+    SelectObject(hdc, old);
+    return size.cx;
+}
+
+void findRowHit(HDC hdc, Row* row, int depth, int x, int baselineY,
+                int pointX, int pointY, HitCandidate& best);
+
+void findItemHit(HDC hdc, Row* parent, int index, Item* item, int depth,
+                 int x, int baselineY, int pointX, int pointY,
+                 HitCandidate& best) {
+    Size size = measureItemImpl(hdc, item, depth);
+    considerHit(best, parent, index, nullptr, 0, x, baselineY, pointX, pointY);
+    considerHit(best, parent, index + 1, nullptr, 0, x + size.width, baselineY, pointX, pointY);
+    switch (item->type) {
+        case ItemType::Number:
+            for (int offset = 0; offset <= (int)item->numText.size(); ++offset) {
+                int caretX = x + numberPrefixWidth(hdc, item, depth, offset);
+                if (offset == 0)
+                    considerHit(best, parent, index, nullptr, 0, caretX, baselineY, pointX, pointY);
+                else if (offset == (int)item->numText.size())
+                    considerHit(best, parent, index + 1, nullptr, 0, caretX, baselineY, pointX, pointY);
+                else
+                    considerHit(best, parent, index, item, offset, caretX, baselineY, pointX, pointY);
+            }
+            return;
+        case ItemType::Paren: {
+            Size inner = measureRowImpl(hdc, item->a.get(), depth);
+            int glyphW = measureParenWidth(hdc, depth, inner.height());
+            findRowHit(hdc, item->a.get(), depth, x + glyphW, baselineY,
+                       pointX, pointY, best);
+            return;
+        }
+        case ItemType::Power: {
+            Size base = measureRowImpl(hdc, item->a.get(), depth);
+            int expX = x + base.width + scaledPx(2, depth);
+            int expBaseline = baselineY - (int)(base.ascent * 0.55);
+            findRowHit(hdc, item->a.get(), depth, x, baselineY,
+                       pointX, pointY, best);
+            findRowHit(hdc, item->b.get(), depth + 1, expX, expBaseline,
+                       pointX, pointY, best);
+            return;
+        }
+        case ItemType::Fraction: {
+            Size numerator = measureRowImpl(hdc, item->a.get(), depth + 1);
+            Size denominator = measureRowImpl(hdc, item->b.get(), depth + 1);
+            int gap = scaledPx(4, depth);
+            int bar = scaledPx(2, depth);
+            int hpad = scaledPx(6, depth);
+            int maxWidth = std::max(numerator.width, denominator.width);
+            int numeratorX = x + hpad + (maxWidth - numerator.width) / 2;
+            int denominatorX = x + hpad + (maxWidth - denominator.width) / 2;
+            int numeratorY = baselineY - gap - bar - numerator.descent;
+            int denominatorY = baselineY + gap + bar + denominator.ascent;
+            findRowHit(hdc, item->a.get(), depth + 1, numeratorX, numeratorY,
+                       pointX, pointY, best);
+            findRowHit(hdc, item->b.get(), depth + 1, denominatorX, denominatorY,
+                       pointX, pointY, best);
+            return;
+        }
+        case ItemType::Sqrt: {
+            int radicalWidth = scaledPx(16, depth);
+            findRowHit(hdc, item->a.get(), depth, x + radicalWidth, baselineY,
+                       pointX, pointY, best);
+            return;
+        }
+        case ItemType::Variable:
+        case ItemType::Operator:
+        case ItemType::Equals:
+        case ItemType::CloseParen:
+            return;
+    }
+}
+
+void findRowHit(HDC hdc, Row* row, int depth, int x, int baselineY,
+                int pointX, int pointY, HitCandidate& best) {
+    if (rowIsEmpty(row)) {
+        considerHit(best, row, 0, nullptr, 0, x, baselineY, pointX, pointY);
+        return;
+    }
+    int cursorX = x;
+    for (size_t index = 0; index < row->items.size(); ++index) {
+        Item* item = row->items[index].get();
+        considerHit(best, row, (int)index, nullptr, 0, cursorX, baselineY, pointX, pointY);
+        findItemHit(hdc, row, (int)index, item, depth, cursorX, baselineY,
+                    pointX, pointY, best);
+        cursorX += measureItemImpl(hdc, item, depth).width;
+    }
+    considerHit(best, row, (int)row->items.size(), nullptr, 0,
+                cursorX, baselineY, pointX, pointY);
+}
+
 } // namespace
 
 Size measureExpression(HDC hdc, const Row* root) { return measureExpressionImpl(hdc, root); }
@@ -428,6 +544,32 @@ void drawExpression(HDC hdc, const Row* root, int originX, int baselineY,
                      const Theme& theme, const Cursor* cursor, CaretInfo* outCaret) {
     if (outCaret) *outCaret = CaretInfo{};
     drawRowImpl(hdc, root, 0, originX, baselineY, theme, cursor, outCaret);
+}
+
+bool placeCursorAtPoint(Expression& expression, HDC hdc, int originX,
+                        int baselineY, int pointX, int pointY) {
+    HitCandidate hit;
+    findRowHit(hdc, expression.root.get(), 0, originX, baselineY,
+               pointX, pointY, hit);
+    if (!hit.row) return false;
+    if (hit.number && hit.numberOffset > 0 &&
+        hit.numberOffset < (int)hit.number->numText.size()) {
+        std::string left = hit.number->numText.substr(0, hit.numberOffset);
+        std::string right = hit.number->numText.substr(hit.numberOffset);
+        auto leftItem = std::make_unique<Item>(ItemType::Number);
+        leftItem->numText = std::move(left);
+        auto rightItem = std::make_unique<Item>(ItemType::Number);
+        rightItem->numText = std::move(right);
+        hit.row->items[hit.index] = std::move(leftItem);
+        hit.row->items.insert(hit.row->items.begin() + hit.index + 1,
+                              std::move(rightItem));
+        expression.cursor.row = hit.row;
+        expression.cursor.index = hit.index + 1;
+    } else {
+        expression.cursor.row = hit.row;
+        expression.cursor.index = hit.index;
+    }
+    return true;
 }
 
 int fontHeightForDepth(int depth) { return fontPxForDepth(depth); }

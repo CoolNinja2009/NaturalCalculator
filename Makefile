@@ -45,5 +45,5 @@ clean:
 	rm -rf $(BUILD_DIR)
 
 test:
-	$(CXX) -std=c++17 -O2 -Wall -Wextra -Isrc src/expr_tree.cpp src/evaluator.cpp src/workspace.cpp tests/calculator_tests.cpp -o $(BUILD_DIR)/calculator_tests.exe
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Isrc src/expr_tree.cpp src/evaluator.cpp src/layout.cpp src/workspace.cpp tests/calculator_tests.cpp -lgdi32 -o $(BUILD_DIR)/calculator_tests.exe
 	$(BUILD_DIR)/calculator_tests.exe
