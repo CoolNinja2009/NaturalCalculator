@@ -113,11 +113,17 @@ bool simpleSquareRootPower(const Row* row, std::string& form) {
     return true;
 }
 
+// Distinguishable subtype so Pro Mode can catch "too large" and re-run the
+// expression in log10-domain arithmetic (see BigValue / evaluateProToString).
+struct FactorialTooLargeError : std::runtime_error {
+    FactorialTooLargeError() : std::runtime_error("Factorial result is too large") {}
+};
+
 double factorial(double value) {
     if (value < 0.0 || std::floor(value) != value)
         throw std::runtime_error("Factorial needs a non-negative integer");
     if (value > 170.0)
-        throw std::runtime_error("Factorial result is too large");
+        throw FactorialTooLargeError();
     double result = 1.0;
     for (int i = 2; i <= (int)value; ++i) result *= i;
     return result;
@@ -267,6 +273,344 @@ struct RowParser {
         return v;
     }
 };
+
+// --- Pro Mode "super large" arithmetic -------------------------------------
+//
+// Values beyond double range are carried as (sign, log10|v|) pairs:
+// multiplication turns into log addition, factorials of astronomic
+// arguments come from lgamma(), and powers like 2^10000000000 or
+// 10000000000! produce real answers formatted as "m * 10^e". Results whose
+// log10 lands within +/-15 are round-tripped back to a plain double and
+// formatted exactly like ordinary results.
+
+struct BigValue {
+    bool isZero = true;      // exactly zero
+    bool negative = false;   // sign; meaningless when isZero
+    double log10Abs = 0.0;   // log10(|value|); meaningless when isZero
+};
+
+std::string formatFiniteDouble(double v) {
+    // Shared with evaluateToString: plain fixed notation, falling back to
+    // scientific for very large/small magnitudes.
+    double av = std::fabs(v);
+    char buf[64];
+    if (av != 0.0 && (av >= 1e15 || av < 1e-9)) {
+        std::snprintf(buf, sizeof(buf), "%.6e", v);
+        return std::string(buf);
+    }
+    std::snprintf(buf, sizeof(buf), "%.10f", v);
+    std::string s(buf);
+    // trim trailing zeros, then trailing '.'
+    size_t dot = s.find('.');
+    if (dot != std::string::npos) {
+        size_t last = s.find_last_not_of('0');
+        if (last == dot) last--; // strip the dot too
+        s.erase(last + 1);
+    }
+    return s;
+}
+
+BigValue bigFromDouble(double value) {
+    BigValue v;
+    if (value == 0.0) return v;
+    v.isZero = false;
+    v.negative = value < 0.0;
+    v.log10Abs = std::log10(std::fabs(value));
+    return v;
+}
+
+// True when a double is (within roundtrip fuzz of) a whole number. Values
+// that came through log10() can be off by an ulp, e.g. pow(10, log10(123))
+// = 123.00000000000001.
+bool bigIsIntegral(double value) {
+    if (!std::isfinite(value)) return false;
+    double rounded = std::round(value);
+    if (rounded == 0.0) return value == 0.0;
+    return std::fabs(value - rounded) <= 1e-9 * rounded;
+}
+
+BigValue bigAdd(const BigValue& a, const BigValue& b) {
+    if (a.isZero) return b;
+    if (b.isZero) return a;
+    BigValue r;
+    r.isZero = false;
+    if (a.negative == b.negative) {
+        // |a| + |b| = 10^hi * (1 + 10^-d)
+        double hi = std::max(a.log10Abs, b.log10Abs);
+        double d = std::fabs(a.log10Abs - b.log10Abs);
+        r.negative = a.negative;
+        r.log10Abs = d > 17.0 ? hi : hi + std::log10(1.0 + std::pow(10.0, -d));
+        return r;
+    }
+    // Signs differ: |a| - |b|.
+    const BigValue& big = a.log10Abs >= b.log10Abs ? a : b;
+    const BigValue& small = a.log10Abs >= b.log10Abs ? b : a;
+    double d = big.log10Abs - small.log10Abs;
+    if (d > 17.0) {                    // the smaller magnitude is negligible
+        r.negative = big.negative;
+        r.log10Abs = big.log10Abs;
+        return r;
+    }
+    double t = 1.0 - std::pow(10.0, -d);
+    if (t <= 0.0) return BigValue{};   // exact cancellation
+    r.negative = big.negative;
+    r.log10Abs = big.log10Abs + std::log10(t);
+    return r;
+}
+
+BigValue bigSub(const BigValue& a, const BigValue& b) {
+    BigValue negated = b;
+    if (!negated.isZero) negated.negative = !negated.negative;
+    return bigAdd(a, negated);
+}
+
+BigValue bigMul(const BigValue& a, const BigValue& b) {
+    if (a.isZero || b.isZero) return BigValue{};
+    BigValue r;
+    r.isZero = false;
+    r.negative = a.negative != b.negative;
+    r.log10Abs = a.log10Abs + b.log10Abs;
+    if (!std::isfinite(r.log10Abs)) throw std::runtime_error("Result is too large");
+    return r;
+}
+
+BigValue bigDiv(const BigValue& a, const BigValue& b) {
+    if (b.isZero) throw std::runtime_error("Division by zero");
+    if (a.isZero) return BigValue{};
+    BigValue r;
+    r.isZero = false;
+    r.negative = a.negative != b.negative;
+    r.log10Abs = a.log10Abs - b.log10Abs;
+    return r;
+}
+
+BigValue bigPow(const BigValue& base, const BigValue& exponent) {
+    if (base.isZero) {
+        if (exponent.isZero) return bigFromDouble(1.0);   // 0^0 = 1, like std::pow
+        if (exponent.negative) throw std::runtime_error("Division by zero");
+        return BigValue{};                                // 0^positive = 0
+    }
+    // The exponent's actual value (it is itself stored in log10 space).
+    double expValue = 0.0;
+    if (!exponent.isZero) {
+        expValue = std::pow(10.0, exponent.log10Abs);
+        if (exponent.negative) expValue = -expValue;
+    }
+    BigValue r;
+    r.isZero = false;
+    r.negative = false;
+    if (base.negative) {
+        if (!exponent.isZero && !std::isfinite(expValue)) {
+            // Beyond 2^53 every finite double is a whole number and the
+            // low bit reads 0, so a huge exponent counts as even.
+            r.negative = false;
+        } else {
+            if (!bigIsIntegral(expValue)) throw std::runtime_error("Complex result");
+            r.negative = std::fmod(std::round(expValue), 2.0) != 0.0;
+        }
+    }
+    r.log10Abs = expValue * base.log10Abs;
+    if (!std::isfinite(r.log10Abs)) throw std::runtime_error("Result is too large");
+    return r;
+}
+
+BigValue bigSqrt(const BigValue& v) {
+    if (v.isZero) return BigValue{};
+    if (v.negative) throw std::runtime_error("Root of negative number");
+    BigValue r;
+    r.isZero = false;
+    r.log10Abs = v.log10Abs / 2.0;
+    return r;
+}
+
+BigValue bigFactorial(const BigValue& v) {
+    if (v.isZero) return bigFromDouble(1.0);   // 0! = 1
+    if (v.negative)
+        throw std::runtime_error("Factorial needs a non-negative integer");
+    double n = std::pow(10.0, v.log10Abs);
+    if (!std::isfinite(n)) throw std::runtime_error("Result is too large");
+    if (!bigIsIntegral(n) || std::round(n) < 1.0)
+        throw std::runtime_error("Factorial needs a non-negative integer");
+    n = std::round(n);
+    double log10Factorial = std::lgamma(n + 1.0) / std::log(10.0);
+    if (!std::isfinite(log10Factorial)) throw std::runtime_error("Result is too large");
+    BigValue r;
+    r.isZero = false;
+    r.log10Abs = log10Factorial;
+    return r;
+}
+
+BigValue bigEvaluate(const Row* root, const EvaluationContext& context);
+
+// Mirrors RowParser exactly, but every value lives in the log10 domain.
+struct BigParser {
+    const std::vector<std::unique_ptr<Item>>& items;
+    const EvaluationContext& context;
+    size_t pos = 0;
+    size_t end = 0;
+
+    BigParser(const Row* row, const EvaluationContext& values)
+        : items(row->items), context(values), pos(0), end(row->items.size()) {}
+
+    bool atEnd() const { return pos >= end; }
+    const Item* peek() const { return atEnd() ? nullptr : items[pos].get(); }
+
+    bool peekIsOperatorChar(char c) const {
+        const Item* it = peek();
+        return it && it->type == ItemType::Operator && it->opChar == c;
+    }
+
+    BigValue parseNumberLiteral() {
+        std::string numberText = items[pos++]->numText;
+        while (!atEnd() && items[pos]->type == ItemType::Number)
+            numberText += items[pos++]->numText;
+        if (numberText.empty() || numberText == ".")
+            throw std::runtime_error("Invalid number");
+        try {
+            return bigFromDouble(std::stod(numberText));
+        } catch (const std::out_of_range&) {
+            // Literal too large for a double (e.g. a 400-digit integer):
+            // derive log10 directly from its digits.
+            if (numberText.find('.') != std::string::npos)
+                throw std::runtime_error("Invalid number");
+            std::string digits;
+            for (char c : numberText)
+                if (c >= '0' && c <= '9') digits += c;
+            size_t firstSignificant = digits.find_first_not_of('0');
+            if (firstSignificant == std::string::npos) return BigValue{};
+            digits = digits.substr(firstSignificant);
+            std::string head = digits.substr(0, 15);
+            double significand = std::stod(head.substr(0, 1) + "." +
+                                           (head.size() > 1 ? head.substr(1) : std::string("0")));
+            BigValue v;
+            v.isZero = false;
+            v.log10Abs = (double)(digits.size() - 1) + std::log10(significand);
+            return v;
+        } catch (...) {
+            throw std::runtime_error("Invalid number");
+        }
+    }
+
+    BigValue parseAtom() {
+        if (atEnd())
+            throw std::runtime_error("Incomplete expression");
+        const Item* it = items[pos].get();
+        switch (it->type) {
+            case ItemType::Number:
+                return parseNumberLiteral();
+            case ItemType::Variable:
+                pos++;
+                if (it->variableName == 'x') return bigFromDouble(context.x);
+                if (it->variableName == 'y') return bigFromDouble(context.y);
+                throw std::runtime_error("Unknown variable");
+            case ItemType::Fraction: {
+                pos++;
+                BigValue numerator = bigEvaluate(it->a.get(), context);
+                BigValue denominator = bigEvaluate(it->b.get(), context);
+                return bigDiv(numerator, denominator);
+            }
+            case ItemType::Paren:
+                pos++;
+                return bigEvaluate(it->a.get(), context);
+            case ItemType::Power:
+                pos++;
+                return bigPow(bigEvaluate(it->a.get(), context),
+                              bigEvaluate(it->b.get(), context));
+            case ItemType::Sqrt:
+                pos++;
+                return bigSqrt(bigEvaluate(it->a.get(), context));
+            case ItemType::Operator:
+                throw std::runtime_error("Unexpected operator");
+            case ItemType::Equals:
+                throw std::runtime_error("Equation needs two lines");
+            case ItemType::CloseParen:
+                throw std::runtime_error("Unmatched closing parenthesis");
+        }
+        throw std::runtime_error("Unknown item");
+    }
+
+    BigValue parseFactor() {
+        bool negated = false;
+        while (peekIsOperatorChar('-') || peekIsOperatorChar('+')) {
+            if (peekIsOperatorChar('-')) negated = !negated;
+            pos++;
+        }
+        BigValue v = parseAtom();
+        while (peekIsOperatorChar('!')) {
+            pos++;
+            v = bigFactorial(v);
+        }
+        if (negated && !v.isZero) v.negative = !v.negative;
+        return v;
+    }
+
+    // '*' explicit, or bare adjacency of two atoms (implicit multiplication,
+    // e.g. "2(3+4)").
+    BigValue parseTerm() {
+        BigValue v = parseFactor();
+        for (;;) {
+            if (peekIsOperatorChar('*')) {
+                pos++;
+                v = bigMul(v, parseFactor());
+                continue;
+            }
+            const Item* next = peek();
+            if (next && next->type != ItemType::Operator) {
+                v = bigMul(v, parseFactor());
+                continue;
+            }
+            break;
+        }
+        return v;
+    }
+
+    BigValue parseRow() {
+        if (atEnd()) return BigValue{}; // empty row evaluates to 0
+        BigValue v = parseTerm();
+        for (;;) {
+            if (peekIsOperatorChar('+')) {
+                pos++;
+                v = bigAdd(v, parseTerm());
+            } else if (peekIsOperatorChar('-')) {
+                pos++;
+                v = bigSub(v, parseTerm());
+            } else {
+                break;
+            }
+        }
+        if (!atEnd())
+            throw std::runtime_error("Malformed expression");
+        return v;
+    }
+};
+
+BigValue bigEvaluate(const Row* root, const EvaluationContext& context) {
+    if (!root) return BigValue{};
+    BigParser parser(root, context);
+    return parser.parseRow();
+}
+
+std::string formatBigValue(const BigValue& v) {
+    if (v.isZero) return "0";
+    if (v.log10Abs >= -15.0 && v.log10Abs <= 15.0) {
+        double value = std::pow(10.0, v.log10Abs);
+        return formatFiniteDouble(v.negative ? -value : value);
+    }
+    double exponent = std::floor(v.log10Abs);
+    double mantissa = std::pow(10.0, v.log10Abs - exponent);
+    char mant[64];
+    std::snprintf(mant, sizeof(mant), "%.10g", mantissa);
+    if (std::string(mant) == "10") {   // renormalise "10 * 10^e"
+        exponent += 1.0;
+        std::snprintf(mant, sizeof(mant), "1");
+    }
+    char exponentText[64];
+    std::snprintf(exponentText, sizeof(exponentText), "%.0f", exponent);
+    std::string sign = v.negative ? "-" : "";
+    if (std::string(mant) == "1")
+        return sign + "10^" + exponentText;
+    return sign + mant + " * 10^" + exponentText;
+}
 
 struct Linear {
     double x = 0.0;
@@ -558,26 +902,7 @@ std::string evaluateToString(const Row* root, const EvaluationContext& context) 
         std::string radical;
         if (simpleSquareRootPower(root, radical))
             return radical + " = " + numberString(v);
-
-        // Prefer plain fixed notation; fall back to scientific for very
-        // large/small magnitudes.
-        double av = std::fabs(v);
-        char buf[64];
-        if (av != 0.0 && (av >= 1e15 || av < 1e-9)) {
-            std::snprintf(buf, sizeof(buf), "%.6e", v);
-        } else {
-            std::snprintf(buf, sizeof(buf), "%.10f", v);
-            std::string s(buf);
-            // trim trailing zeros, then trailing '.'
-            size_t dot = s.find('.');
-            if (dot != std::string::npos) {
-                size_t last = s.find_last_not_of('0');
-                if (last == dot) last--; // strip the dot too
-                s.erase(last + 1);
-            }
-            return s;
-        }
-        return std::string(buf);
+        return formatFiniteDouble(v);
     } catch (const std::exception& e) {
         return std::string(e.what());
     }
@@ -585,6 +910,18 @@ std::string evaluateToString(const Row* root, const EvaluationContext& context) 
 
 std::string evaluateToString(const Row* root) {
     return evaluateToString(root, EvaluationContext{});
+}
+
+std::string evaluateProToString(const Row* root, const EvaluationContext& context) {
+    bool bigNeeded = false;
+    try {
+        double value = evaluate(root, context);
+        bigNeeded = !std::isfinite(value);
+    } catch (const FactorialTooLargeError&) {
+        bigNeeded = true;
+    }
+    if (!bigNeeded) return evaluateToString(root, context);
+    return formatBigValue(bigEvaluate(root, context));
 }
 
 QuadraticResult solveQuadratic(double a, double b, double c) {

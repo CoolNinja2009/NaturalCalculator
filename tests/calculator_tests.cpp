@@ -300,6 +300,83 @@ static void testClickPlacesStructuralCursor() {
     DeleteDC(hdc);
 }
 
+static void testProModeBigNumbers() {
+    EvaluationContext pro;
+    pro.bigNumbers = true;
+
+    // 10,000,000,000! — far beyond double range; log10 factorials via lgamma.
+    Expression hugeFactorial = expressionFrom("10000000000!");
+    std::string factorialResult = evaluateProToString(hugeFactorial.root.get(), pro);
+    assert(factorialResult.find("* 10^95657055186") != std::string::npos);
+
+    // Outside pro mode the same input keeps its historical error.
+    Expression plainFactorial = expressionFrom("10000000000!");
+    assert(evaluateToString(plainFactorial.root.get()) == "Factorial result is too large");
+
+    // Astronomic powers: 2^10000000000.
+    Expression hugePower = expressionFrom("2^10000000000");
+    std::string powerResult = evaluateProToString(hugePower.root.get(), pro);
+    assert(powerResult.find("* 10^3010299956") != std::string::npos);
+
+    // Overflowing intermediates cancel exactly in log domain.
+    Expression cancel = expressionFrom("10^400");
+    insertFraction(cancel);
+    insertDigit(cancel, '1');
+    insertDigit(cancel, '0');
+    insertPower(cancel);
+    insertDigit(cancel, '4');
+    insertDigit(cancel, '0');
+    insertDigit(cancel, '0');
+    assert(evaluateProToString(cancel.root.get(), pro) == "1");
+
+    // Huge + small terms stay huge.
+    Expression mixed = expressionFrom("10^400+5");
+    assert(evaluateProToString(mixed.root.get(), pro) == "10^400");
+
+    // Roots of huge numbers: sqrt(10^400) = 10^200.
+    Expression bigRoot;
+    insertSqrt(bigRoot);
+    insertDigit(bigRoot, '1');
+    insertDigit(bigRoot, '0');
+    insertPower(bigRoot);
+    insertDigit(bigRoot, '4');
+    insertDigit(bigRoot, '0');
+    insertDigit(bigRoot, '0');
+    assert(evaluateProToString(bigRoot.root.get(), pro) == "10^200");
+
+    // Ordinary values are untouched by pro mode.
+    Expression simple = expressionFrom("2+3");
+    assert(evaluateProToString(simple.root.get(), pro) == "5");
+
+    // Real math errors still surface as errors.
+    Expression divisionByZero;
+    insertDigit(divisionByZero, '1');
+    insertFraction(divisionByZero);
+    insertDigit(divisionByZero, '0');
+    bool threw = false;
+    try { evaluateProToString(divisionByZero.root.get(), pro); }
+    catch (const std::exception& error) {
+        threw = std::string(error.what()) == "Division by zero";
+    }
+    assert(threw);
+
+    // Fractional factorial input stays rejected in pro mode too.
+    Expression fractional = expressionFrom("2.5!");
+    threw = false;
+    try { evaluateProToString(fractional.root.get(), pro); }
+    catch (const std::exception& error) {
+        threw = std::string(error.what()) == "Factorial needs a non-negative integer";
+    }
+    assert(threw);
+
+    // End-to-end through the workspace commit path.
+    Workspace proWorkspace;
+    proWorkspace.current() = expressionFrom("10000000000!");
+    assert(proWorkspace.commitCurrent(pro));
+    assert(proWorkspace.history().back()->result.find("* 10^95657055186") != std::string::npos);
+    assert(!proWorkspace.history().back()->isError);
+}
+
 static void testPowerEditing() {
     Expression expression;
     insertDigit(expression, '2');
@@ -320,6 +397,7 @@ int main() {
     testAssignmentsPersist();
     testGeneralEquations();
     testProModeTriggerCalculation();
+    testProModeBigNumbers();
     testFactorials();
     testStandaloneClosingParen();
         testCloseParenExitsNestedStructure();

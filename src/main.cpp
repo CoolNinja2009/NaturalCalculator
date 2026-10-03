@@ -335,7 +335,9 @@ void doAction(int action) {
         case ActBackspace: backspace(cur); break;
         case ActEquals: {
             bool proTrigger = isProModeTrigger(cur.root.get());
-            if (g.workspace.commitCurrent(g.values)) {
+            EvaluationContext context = g.values;
+            context.bigNumbers = g.proMode;   // super-large results only in Pro Mode
+            if (g.workspace.commitCurrent(context)) {
                 if (g.workspace.hasSolvedValues()) g.values = g.workspace.solvedValues();
                 g.scrollToBottomPending = true;
                 if (proTrigger) activateProMode();

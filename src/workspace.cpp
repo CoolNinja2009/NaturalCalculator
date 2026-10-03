@@ -89,10 +89,16 @@ bool Workspace::commitCurrent(const EvaluationContext& context) {
         }
     } else {
         try {
-            double v = evaluate(entry->expr->root.get(), context);
-            entry->result = evaluateToString(entry->expr->root.get(), context);
+            if (context.bigNumbers) {
+                // Pro Mode: normal formatting while the result fits a
+                // double, log10-domain "m * 10^e" beyond that.
+                entry->result = evaluateProToString(entry->expr->root.get(), context);
+            } else {
+                double v = evaluate(entry->expr->root.get(), context);
+                entry->result = evaluateToString(entry->expr->root.get(), context);
+                (void)v;
+            }
             entry->isError = false;
-            (void)v;
         } catch (const std::exception& e) {
             entry->result = e.what();
             entry->isError = true;

@@ -98,6 +98,9 @@ copy it anywhere and run it.
 
 - Type `x+y=5`, press Enter, then type `x-y=6` and press Enter to solve the
   two-variable system. The second line displays both values.
+- Once Calc Pro Max is active, results that overflow a double — like
+  `10000000000!`, `2^10000000000`, `(10^400)^(1/2)` or 400-digit integers —
+  are computed in log-space and displayed as `m * 10^e` instead of erroring.
 - Type a quadratic directly in the main window, such as `x^2+5x+6=0`, and
   press Enter to display its roots. The coefficient dialog follows dark mode.
 - Nonlinear single-variable equations such as `2^x+x=8` are solved numerically

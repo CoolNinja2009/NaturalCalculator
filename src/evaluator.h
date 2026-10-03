@@ -27,6 +27,10 @@
 struct EvaluationContext {
 	double x = 0.0;
 	double y = 0.0;
+	// Pro Mode: when true, expressions whose result overflows a double (or
+	// whose factorial exceeds double range) are evaluated in base-10
+	// logarithm space and rendered as "m * 10^e" instead of erroring.
+	bool bigNumbers = false;
 };
 
 // Evaluate the whole expression. Throws std::runtime_error on error.
@@ -38,6 +42,12 @@ double evaluate(const Row* root, const EvaluationContext& context);
 // On error, returns the exception's message prefixed with an error glyph.
 std::string evaluateToString(const Row* root);
 std::string evaluateToString(const Row* root, const EvaluationContext& context);
+
+// Pro Mode variant of evaluateToString: identical output while the result
+// fits a double, but falls back to log10-domain arithmetic whenever normal
+// evaluation overflows or a factorial exceeds double range, so inputs like
+// 10000000000! or 2^10000000000 produce real "m * 10^e" results.
+std::string evaluateProToString(const Row* root, const EvaluationContext& context);
 
 struct QuadraticResult {
 	bool valid = true;
