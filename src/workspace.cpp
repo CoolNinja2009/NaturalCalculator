@@ -1,6 +1,7 @@
 // workspace.cpp
 #include "workspace.h"
 #include "evaluator.h"
+#include <cmath>
 #include <cstdio>
 
 bool Workspace::commitCurrent(const EvaluationContext& context) {
@@ -11,6 +12,16 @@ bool Workspace::commitCurrent(const EvaluationContext& context) {
     auto entry = std::make_unique<HistoryEntry>();
     entry->expr = std::move(current_);
 
+    if (isProModeTrigger(entry->expr->root.get())) {
+        double log10Value = (std::lgamma(2000.0) + std::log(1999.0)) / std::log(10.0);
+        double exponent = std::floor(log10Value);
+        double mantissa = std::pow(10.0, log10Value - exponent);
+        char expanded[96];
+        std::snprintf(expanded, sizeof(expanded), "1999 * 1999! = %.10g * 10^%.0f (approx.)",
+                      mantissa, exponent);
+        entry->result = expanded;
+        entry->isError = false;
+    } else {
     bool hasEquation = hasEquals(entry->expr->root.get());
     QuadraticResult quadratic;
     char variable = 0;
@@ -86,6 +97,7 @@ bool Workspace::commitCurrent(const EvaluationContext& context) {
             entry->result = e.what();
             entry->isError = true;
         }
+    }
     }
 
     history_.push_back(std::move(entry));

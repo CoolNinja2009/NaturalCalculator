@@ -185,6 +185,18 @@ static void testGeneralEquations() {
     assert(evaluateToString(squareRootPower.root.get()).find("\xE2\x88\x9A" "2 = ") == 0);
 }
 
+static void testProModeTriggerCalculation() {
+    Workspace workspace;
+    workspace.current() = expressionFrom("2000!-1999!");
+    assert(isProModeTrigger(workspace.current().root.get()));
+    assert(workspace.commitCurrent());
+    assert(workspace.history().back()->result.find("1999 * 1999!") == 0);
+    assert(workspace.history().back()->result.find("10^") != std::string::npos);
+
+    Expression other = expressionFrom("2000!-1998!");
+    assert(!isProModeTrigger(other.root.get()));
+}
+
 static void testFactorials() {
     Expression five = expressionFrom("5");
     insertOperator(five, '!');
@@ -307,6 +319,7 @@ int main() {
     testInvalidLinearTerms();
     testAssignmentsPersist();
     testGeneralEquations();
+    testProModeTriggerCalculation();
     testFactorials();
     testStandaloneClosingParen();
         testCloseParenExitsNestedStructure();

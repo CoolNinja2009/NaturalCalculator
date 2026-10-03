@@ -22,7 +22,7 @@ OBJECTS  := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/%.o,$(SOURCES))
 
 CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -municode -mwindows -DUNICODE -D_UNICODE
 LDFLAGS  := -static -static-libgcc -static-libstdc++ -municode -mwindows -s
-LIBS     := -lgdi32 -luser32 -lkernel32 -ldwmapi -ladvapi32 -lcomctl32 -lcomdlg32
+LIBS     := -lgdi32 -luser32 -lkernel32 -ldwmapi -ladvapi32 -lcomctl32 -lcomdlg32 -lgdiplus -lole32
 
 .PHONY: all clean run test
 
@@ -34,7 +34,7 @@ $(BUILD_DIR):
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(RC_OBJECT): src/app.rc src/app.ico src/resource.h | $(BUILD_DIR)
+$(RC_OBJECT): src/app.rc src/app.ico src/explosion_sheet.png src/resource.h | $(BUILD_DIR)
 	$(WINDRES) $< -O coff -o $@
 
 $(TARGET): $(OBJECTS) $(RC_OBJECT)

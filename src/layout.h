@@ -11,6 +11,9 @@
 // correctly.
 
 #pragma once
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include "expr_tree.h"
 

@@ -68,3 +68,5 @@ bool solveQuadraticEquation(const Row* equation, QuadraticResult& result,
 bool solveGeneralEquation(const Row* equation, const EvaluationContext& context,
 						  char& variable, std::vector<double>& roots,
 						  std::string& message);
+
+bool isProModeTrigger(const Row* expression);

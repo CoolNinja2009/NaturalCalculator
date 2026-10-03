@@ -928,3 +928,13 @@ bool solveGeneralEquation(const Row* equation, const EvaluationContext& context,
     else message = roots.empty() ? "\xE2\x88\x85" : std::string();
     return true;
 }
+
+bool isProModeTrigger(const Row* expression) {
+    if (!expression || expression->items.size() != 5) return false;
+    const auto& items = expression->items;
+    return items[0]->type == ItemType::Number && items[0]->numText == "2000" &&
+           items[1]->type == ItemType::Operator && items[1]->opChar == '!' &&
+           items[2]->type == ItemType::Operator && items[2]->opChar == '-' &&
+           items[3]->type == ItemType::Number && items[3]->numText == "1999" &&
+           items[4]->type == ItemType::Operator && items[4]->opChar == '!';
+}

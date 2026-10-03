@@ -7,10 +7,15 @@
 // already resident in the OS, so there is essentially nothing extra to
 // load.
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <windowsx.h>
 #include <winreg.h>
 #include <dwmapi.h>
+#include <objbase.h>
+#include <gdiplus.h>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -70,6 +75,18 @@ struct App {
     int editorCaret = 0;
     int editorTextCursor = -1;
     EvaluationContext values;
+    bool proMode = false;
+    DWORD proModeStarted = 0;
+    DWORD explosionStarted = 0;
+    bool explosionActive = false;
+    ULONG_PTR gdiplusToken = 0;
+    Gdiplus::Image* explosionImage = nullptr;
+    IStream* explosionStream = nullptr;
+    UINT explosionFrameCount = 0;
+    int petX = -1;
+    int petY = -1;
+    bool petDragging = false;
+    POINT petDragOffset{};
     std::vector<ButtonDef> buttons;
     RECT topBarRect{}, historyRect{}, editorRect{}, buttonAreaRect{};
     HFONT uiFont = nullptr;
@@ -79,6 +96,8 @@ struct App {
 } g;
 
 constexpr UINT_PTR kCaretTimerId = 1;
+constexpr UINT_PTR kProAnimationTimerId = 2;
+constexpr DWORD kProTransitionMs = 720;
 constexpr int kMinWidth = 340;
 constexpr int kMinHeight = 480;
 constexpr wchar_t kSettingsKey[] = L"Software\\NaturalCalculator";
@@ -107,6 +126,61 @@ void saveDarkMode(bool dark) {
     RegSetValueExW(key, kDarkModeValue, 0, REG_DWORD,
                    reinterpret_cast<const BYTE*>(&value), sizeof(value));
     RegCloseKey(key);
+}
+
+void loadProExplosionAsset() {
+    Gdiplus::GdiplusStartupInput startupInput;
+    if (Gdiplus::GdiplusStartup(&g.gdiplusToken, &startupInput, nullptr) != Gdiplus::Ok)
+        return;
+
+    HRSRC resource = FindResourceW(GetModuleHandleW(nullptr),
+                                   MAKEINTRESOURCEW(IDR_EXPLOSION_SHEET), RT_RCDATA);
+    if (!resource) return;
+    DWORD resourceSize = SizeofResource(GetModuleHandleW(nullptr), resource);
+    HGLOBAL loadedResource = LoadResource(GetModuleHandleW(nullptr), resource);
+    const void* source = loadedResource ? LockResource(loadedResource) : nullptr;
+    if (!source || resourceSize == 0) return;
+
+    HGLOBAL imageMemory = GlobalAlloc(GMEM_MOVEABLE, resourceSize);
+    if (!imageMemory) return;
+    void* destination = GlobalLock(imageMemory);
+    if (!destination) { GlobalFree(imageMemory); return; }
+    std::memcpy(destination, source, resourceSize);
+    GlobalUnlock(imageMemory);
+
+    if (FAILED(CreateStreamOnHGlobal(imageMemory, TRUE, &g.explosionStream))) {
+        GlobalFree(imageMemory);
+        return;
+    }
+    Gdiplus::Image* image = Gdiplus::Image::FromStream(g.explosionStream, FALSE);
+    if (!image || image->GetLastStatus() != Gdiplus::Ok) {
+        delete image;
+        g.explosionStream->Release();
+        g.explosionStream = nullptr;
+        return;
+    }
+
+    if (image->GetWidth() < 2490 || image->GetHeight() < 1680) {
+        delete image;
+        g.explosionStream->Release();
+        g.explosionStream = nullptr;
+        return;
+    }
+    g.explosionFrameCount = 29;
+    g.explosionImage = image;
+}
+
+void releaseProExplosionAsset() {
+    delete g.explosionImage;
+    g.explosionImage = nullptr;
+    if (g.explosionStream) {
+        g.explosionStream->Release();
+        g.explosionStream = nullptr;
+    }
+    if (g.gdiplusToken) {
+        Gdiplus::GdiplusShutdown(g.gdiplusToken);
+        g.gdiplusToken = 0;
+    }
 }
 
 // ------------------------------------------------------------- layout
@@ -193,6 +267,27 @@ void recomputeLayout() {
     recomputeLayout(rc);
 }
 
+double proTransitionProgress() {
+    if (!g.proMode) return 0.0;
+    return std::clamp((GetTickCount() - g.proModeStarted) /
+                      (double)kProTransitionMs, 0.0, 1.0);
+}
+
+void activateProMode() {
+    if (g.proMode) return;
+    RECT client{};
+    GetClientRect(g.hwnd, &client);
+    g.proMode = true;
+    g.proModeStarted = GetTickCount();
+    g.explosionStarted = g.proModeStarted;
+    g.explosionActive = true;
+    g.petX = std::max(8, (int)client.right - 62);
+    int editorHeight = (int)(g.editorRect.bottom - g.editorRect.top);
+    g.petY = (int)g.editorRect.top + std::max(6, (editorHeight - 58) / 2);
+    setDarkTitleBar(g.hwnd, true);
+    SetTimer(g.hwnd, kProAnimationTimerId, 30, nullptr);
+}
+
 // ------------------------------------------------------------- actions
 
 void ensureCaretVisible() {
@@ -238,12 +333,15 @@ void doAction(int action) {
         case ActPower: insertPower(cur); break;
         case ActSqrt: insertSqrt(cur); break;
         case ActBackspace: backspace(cur); break;
-        case ActEquals:
+        case ActEquals: {
+            bool proTrigger = isProModeTrigger(cur.root.get());
             if (g.workspace.commitCurrent(g.values)) {
                 if (g.workspace.hasSolvedValues()) g.values = g.workspace.solvedValues();
                 g.scrollToBottomPending = true;
+                if (proTrigger) activateProMode();
             }
             break;
+        }
         case ActClear:
             g.workspace.current() = Expression();
             g.allSelected = false;
@@ -255,7 +353,7 @@ void doAction(int action) {
         case ActToggleTheme:
             g.dark = !g.dark;
             saveDarkMode(g.dark);
-            setDarkTitleBar(g.hwnd, g.dark);
+            setDarkTitleBar(g.hwnd, g.proMode || g.dark);
             break;
         default: break;
     }
@@ -669,6 +767,292 @@ COLORREF shade(COLORREF c, int delta) {
     return RGB(ch(GetRValue(c)), ch(GetGValue(c)), ch(GetBValue(c)));
 }
 
+COLORREF blendColor(COLORREF from, COLORREF to, double amount) {
+    auto blend = [amount](int a, int b) {
+        return (BYTE)std::clamp((int)std::lround(a + (b - a) * amount), 0, 255);
+    };
+    return RGB(blend(GetRValue(from), GetRValue(to)),
+               blend(GetGValue(from), GetGValue(to)),
+               blend(GetBValue(from), GetBValue(to)));
+}
+
+Theme proTheme(Theme theme, double amount) {
+    Theme target = darkTheme();
+    target.background = RGB(0x09, 0x03, 0x06);
+    target.panelBackground = RGB(0x21, 0x06, 0x0C);
+    target.text = RGB(0xF7, 0xE8, 0xEB);
+    target.operatorColor = RGB(0xFF, 0x47, 0x62);
+    target.resultColor = RGB(0xFF, 0x4D, 0x69);
+    target.caret = RGB(0xFF, 0xB5, 0xC0);
+    target.placeholder = RGB(0x67, 0x2B, 0x38);
+    target.divider = RGB(0x6D, 0x13, 0x27);
+    target.accent = RGB(0xD9, 0x10, 0x32);
+    target.screenBackground = RGB(0x13, 0x04, 0x08);
+    target.screenText = RGB(0xFF, 0xE9, 0xED);
+    target.screenOperator = RGB(0xFF, 0x65, 0x7A);
+    target.screenResult = RGB(0xFF, 0x58, 0x75);
+    target.screenCaret = RGB(0xFF, 0xD7, 0xDD);
+    target.screenPlaceholder = RGB(0x6D, 0x36, 0x43);
+
+    theme.background = blendColor(theme.background, target.background, amount);
+    theme.panelBackground = blendColor(theme.panelBackground, target.panelBackground, amount);
+    theme.text = blendColor(theme.text, target.text, amount);
+    theme.operatorColor = blendColor(theme.operatorColor, target.operatorColor, amount);
+    theme.resultColor = blendColor(theme.resultColor, target.resultColor, amount);
+    theme.caret = blendColor(theme.caret, target.caret, amount);
+    theme.placeholder = blendColor(theme.placeholder, target.placeholder, amount);
+    theme.divider = blendColor(theme.divider, target.divider, amount);
+    theme.accent = blendColor(theme.accent, target.accent, amount);
+    theme.screenBackground = blendColor(theme.screenBackground, target.screenBackground, amount);
+    theme.screenText = blendColor(theme.screenText, target.screenText, amount);
+    theme.screenOperator = blendColor(theme.screenOperator, target.screenOperator, amount);
+    theme.screenResult = blendColor(theme.screenResult, target.screenResult, amount);
+    theme.screenCaret = blendColor(theme.screenCaret, target.screenCaret, amount);
+    theme.screenPlaceholder = blendColor(theme.screenPlaceholder, target.screenPlaceholder, amount);
+    theme.isDark = amount >= 0.5 || theme.isDark;
+    return theme;
+}
+
+int petBounceOffset() {
+    if (!g.proMode || g.petDragging) return 0;
+    return (int)std::lround(std::sin(GetTickCount() / 115.0) * 4.0);
+}
+
+RECT petBounds() {
+    int top = g.petY + petBounceOffset();
+    return { g.petX, top, g.petX + 54, top + 58 };
+}
+
+void clampPetToClient() {
+    RECT client{};
+    GetClientRect(g.hwnd, &client);
+    g.petX = std::clamp(g.petX, 0, std::max(0, (int)client.right - 54));
+    g.petY = std::clamp(g.petY, 0, std::max(0, (int)client.bottom - 58));
+}
+
+void drawPetShape(HDC hdc, const POINT* points, int count, COLORREF fill, COLORREF outline) {
+    HBRUSH brush = CreateSolidBrush(fill);
+    HPEN pen = CreatePen(PS_SOLID, 1, outline);
+    HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, brush);
+    HPEN oldPen = (HPEN)SelectObject(hdc, pen);
+    Polygon(hdc, points, count);
+    SelectObject(hdc, oldPen);
+    SelectObject(hdc, oldBrush);
+    DeleteObject(pen);
+    DeleteObject(brush);
+}
+
+void drawPetEllipse(HDC hdc, int left, int top, int right, int bottom,
+                    COLORREF fill, COLORREF outline) {
+    HBRUSH brush = CreateSolidBrush(fill);
+    HPEN pen = CreatePen(PS_SOLID, 1, outline);
+    HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, brush);
+    HPEN oldPen = (HPEN)SelectObject(hdc, pen);
+    Ellipse(hdc, left, top, right, bottom);
+    SelectObject(hdc, oldPen);
+    SelectObject(hdc, oldBrush);
+    DeleteObject(pen);
+    DeleteObject(brush);
+}
+
+void drawProPet(HDC hdc, int x, int y, POINT cursor) {
+    const COLORREF red = RGB(0xC9, 0x0B, 0x2B);
+    const COLORREF hotRed = RGB(0xFF, 0x24, 0x3D);
+    const COLORREF deepRed = RGB(0x50, 0x03, 0x13);
+    const COLORREF amber = RGB(0xFF, 0xC0, 0x35);
+    const COLORREF bone = RGB(0xF3, 0xD9, 0xC8);
+    const COLORREF black = RGB(0x0A, 0x02, 0x05);
+    int sway = (int)std::lround(std::sin(GetTickCount() / 90.0) * 3.0);
+    POINT tail[] = { { x + 34, y + 39 }, { x + 42, y + 36 + sway },
+                     { x + 45, y + 29 + sway }, { x + 51, y + 28 + sway } };
+    HPEN tailPen = CreatePen(PS_SOLID, 3, hotRed);
+    HPEN oldTailPen = (HPEN)SelectObject(hdc, tailPen);
+    Polyline(hdc, tail, 4);
+    SelectObject(hdc, oldTailPen);
+    DeleteObject(tailPen);
+    POINT tailTip[] = { { x + 47, y + 24 + sway }, { x + 54, y + 28 + sway },
+                        { x + 47, y + 34 + sway }, { x + 49, y + 29 + sway } };
+    drawPetShape(hdc, tailTip, 4, hotRed, deepRed);
+
+    POINT leftWing[] = { { x + 17, y + 32 }, { x + 2, y + 26 }, { x + 9, y + 38 },
+                         { x + 3, y + 44 }, { x + 18, y + 46 } };
+    POINT rightWing[] = { { x + 34, y + 31 }, { x + 49, y + 25 }, { x + 43, y + 38 },
+                          { x + 51, y + 44 }, { x + 33, y + 46 } };
+    drawPetShape(hdc, leftWing, 5, deepRed, black);
+    drawPetShape(hdc, rightWing, 5, deepRed, black);
+
+    POINT leftHorn[] = { { x + 12, y + 17 }, { x + 7, y - 1 }, { x + 22, y + 11 } };
+    POINT rightHorn[] = { { x + 31, y + 11 }, { x + 47, y - 2 }, { x + 40, y + 20 } };
+    drawPetShape(hdc, leftHorn, 3, deepRed, hotRed);
+    drawPetShape(hdc, rightHorn, 3, deepRed, hotRed);
+
+    POINT body[] = { { x + 15, y + 29 }, { x + 35, y + 29 }, { x + 39, y + 43 },
+                     { x + 32, y + 42 }, { x + 27, y + 56 }, { x + 23, y + 46 },
+                     { x + 17, y + 54 }, { x + 18, y + 43 }, { x + 12, y + 45 } };
+    drawPetShape(hdc, body, 9, deepRed, hotRed);
+
+    POINT head[] = { { x + 12, y + 16 }, { x + 8, y + 8 }, { x + 18, y + 11 },
+                     { x + 25, y + 9 }, { x + 33, y + 12 }, { x + 42, y + 5 },
+                     { x + 39, y + 18 }, { x + 41, y + 26 }, { x + 34, y + 34 },
+                     { x + 17, y + 34 }, { x + 10, y + 27 } };
+    drawPetShape(hdc, head, 11, red, black);
+
+    int gazeX = std::clamp(((int)cursor.x - (x + 25)) / 14, -2, 2);
+    int gazeY = std::clamp(((int)cursor.y - (y + 22)) / 18, -1, 1);
+    POINT leftEye[] = { { x + 14, y + 18 }, { x + 24, y + 16 }, { x + 20, y + 23 } };
+    POINT rightEye[] = { { x + 27, y + 16 }, { x + 37, y + 17 }, { x + 31, y + 23 } };
+    drawPetShape(hdc, leftEye, 3, amber, hotRed);
+    drawPetShape(hdc, rightEye, 3, amber, hotRed);
+    drawPetEllipse(hdc, x + 18 + gazeX, y + 18 + gazeY,
+                   x + 20 + gazeX, y + 22 + gazeY, black, black);
+    drawPetEllipse(hdc, x + 30 + gazeX, y + 18 + gazeY,
+                   x + 32 + gazeX, y + 22 + gazeY, black, black);
+
+    POINT leftBrow[] = { { x + 12, y + 15 }, { x + 25, y + 14 }, { x + 23, y + 17 } };
+    POINT rightBrow[] = { { x + 27, y + 14 }, { x + 41, y + 16 }, { x + 29, y + 17 } };
+    drawPetShape(hdc, leftBrow, 3, black, black);
+    drawPetShape(hdc, rightBrow, 3, black, black);
+
+    POINT mouth[] = { { x + 18, y + 25 }, { x + 35, y + 24 }, { x + 32, y + 32 },
+                      { x + 27, y + 30 }, { x + 23, y + 33 }, { x + 19, y + 30 } };
+    drawPetShape(hdc, mouth, 6, black, hotRed);
+    POINT fangLeft[] = { { x + 20, y + 25 }, { x + 24, y + 26 }, { x + 22, y + 30 } };
+    POINT fangRight[] = { { x + 30, y + 25 }, { x + 34, y + 25 }, { x + 32, y + 30 } };
+    POINT lowerFang[] = { { x + 24, y + 31 }, { x + 29, y + 30 }, { x + 27, y + 33 } };
+    drawPetShape(hdc, fangLeft, 3, bone, bone);
+    drawPetShape(hdc, fangRight, 3, bone, bone);
+    drawPetShape(hdc, lowerFang, 3, bone, bone);
+}
+
+void drawProExplosion(HDC hdc, RECT client, const Theme& theme) {
+    if (!g.explosionActive) return;
+    DWORD elapsed = GetTickCount() - g.explosionStarted;
+    if (g.explosionImage && g.explosionFrameCount > 0) {
+        DWORD frameDuration = 70;
+        DWORD animationDuration = g.explosionFrameCount * frameDuration;
+        if (elapsed >= animationDuration) {
+            g.explosionActive = false;
+            return;
+        }
+        UINT frame = elapsed / frameDuration;
+        constexpr UINT frameWidth = 498;
+        constexpr UINT frameHeight = 280;
+        constexpr UINT columns = 5;
+        UINT imageWidth = frameWidth;
+        UINT imageHeight = frameHeight;
+        int clientWidth = client.right - client.left;
+        int clientHeight = client.bottom - client.top;
+        double scale = std::max(clientWidth * 1.65 / imageWidth,
+                                clientHeight * 0.94 / imageHeight);
+        int drawWidth = (int)std::lround(imageWidth * scale);
+        int drawHeight = (int)std::lround(imageHeight * scale);
+        int centerX = client.left + clientWidth / 2;
+        int centerY = client.top + clientHeight / 2;
+        int sourceX = (frame % columns) * frameWidth;
+        int sourceY = (frame / columns) * frameHeight;
+        Gdiplus::Graphics graphics(hdc);
+        graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        Gdiplus::Rect destination(centerX - drawWidth / 2,
+                                  centerY - drawHeight / 2,
+                                  drawWidth, drawHeight);
+        Gdiplus::Status status = graphics.DrawImage(
+            g.explosionImage, destination, sourceX, sourceY, imageWidth, imageHeight,
+            Gdiplus::UnitPixel, nullptr);
+        if (status == Gdiplus::Ok) return;
+    }
+    if (elapsed >= 1050) {
+        g.explosionActive = false;
+        return;
+    }
+
+    int width = client.right - client.left;
+    int height = client.bottom - client.top;
+    int centerX = client.left + width / 2;
+    int centerY = client.top + height / 2;
+    int maxDimension = std::max(width, height);
+    double seconds = elapsed / 1000.0;
+
+    if (elapsed < 95) {
+        double flash = 0.82 * (1.0 - elapsed / 95.0);
+        HBRUSH flashBrush = CreateSolidBrush(
+            blendColor(theme.background, RGB(0xFF, 0xEF, 0xF2), flash));
+        FillRect(hdc, &client, flashBrush);
+        DeleteObject(flashBrush);
+    }
+
+    for (int ring = 0; ring < 3; ++ring) {
+        int ringAge = (int)elapsed - ring * 115;
+        if (ringAge < 0 || ringAge >= 760) continue;
+        double progress = ringAge / 760.0;
+        int radius = 18 + (int)(maxDimension * 0.78 * progress);
+        COLORREF color = blendColor(RGB(0xFF, 0xF3, 0xF4), theme.accent, progress);
+        HPEN pen = CreatePen(PS_SOLID, progress < 0.35 ? 4 : 2, color);
+        HPEN oldPen = (HPEN)SelectObject(hdc, pen);
+        HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        Ellipse(hdc, centerX - radius, centerY - radius,
+                centerX + radius, centerY + radius);
+        SelectObject(hdc, oldBrush);
+        SelectObject(hdc, oldPen);
+        DeleteObject(pen);
+    }
+
+    double rayProgress = std::clamp(elapsed / 560.0, 0.0, 1.0);
+    for (int ray = 0; ray < 22; ++ray) {
+        double angle = ray * 6.283185307179586 / 22.0;
+        double inner = maxDimension * (0.035 + rayProgress * 0.13);
+        double outer = maxDimension * (0.18 + rayProgress * 0.82);
+        int x1 = centerX + (int)(std::cos(angle) * inner);
+        int y1 = centerY + (int)(std::sin(angle) * inner);
+        int x2 = centerX + (int)(std::cos(angle) * outer);
+        int y2 = centerY + (int)(std::sin(angle) * outer);
+        COLORREF rayColor = (ray % 3 == 0) ? RGB(0xFF, 0xD9, 0xA0) :
+                            blendColor(RGB(0xFF, 0x56, 0x68), theme.accent, rayProgress);
+        HPEN pen = CreatePen(PS_SOLID, ray % 3 == 0 ? 2 : 1, rayColor);
+        HPEN oldPen = (HPEN)SelectObject(hdc, pen);
+        MoveToEx(hdc, x1, y1, nullptr);
+        LineTo(hdc, x2, y2);
+        SelectObject(hdc, oldPen);
+        DeleteObject(pen);
+    }
+
+    for (int spark = 0; spark < 96; ++spark) {
+        double angle = spark * 6.283185307179586 / 96.0 +
+                       std::sin(spark * 17.13) * 0.055;
+        double speed = 140.0 + (spark * 47 % 100) * 3.6;
+        double lifetime = 0.72 + (spark * 29 % 50) / 100.0;
+        if (seconds >= lifetime) continue;
+        double distance = speed * seconds;
+        int x2 = centerX + (int)(std::cos(angle) * distance);
+        int y2 = centerY + (int)(std::sin(angle) * distance + 180.0 * seconds * seconds);
+        int trail = 8 + spark % 15;
+        int x1 = x2 - (int)(std::cos(angle) * trail);
+        int y1 = y2 - (int)(std::sin(angle) * trail);
+        COLORREF sparkColor = spark % 4 == 0 ? RGB(0xFF, 0xF0, 0xC5) :
+                              (spark % 3 == 0 ? RGB(0xFF, 0x8B, 0x45) : RGB(0xFF, 0x2A, 0x48));
+        HPEN pen = CreatePen(PS_SOLID, spark % 5 == 0 ? 4 : 2, sparkColor);
+        HPEN oldPen = (HPEN)SelectObject(hdc, pen);
+        MoveToEx(hdc, x1, y1, nullptr);
+        LineTo(hdc, x2, y2);
+        SelectObject(hdc, oldPen);
+        DeleteObject(pen);
+
+        if (spark % 2 == 0) {
+            int shardLength = 7 + spark % 10;
+            int shardWidth = 3 + spark % 5;
+            double perpendicularX = -std::sin(angle);
+            double perpendicularY = std::cos(angle);
+            POINT shard[] = {
+                { x2, y2 },
+                { x2 - (int)(std::cos(angle) * shardLength + perpendicularX * shardWidth),
+                  y2 - (int)(std::sin(angle) * shardLength + perpendicularY * shardWidth) },
+                { x2 - (int)(std::cos(angle) * shardLength - perpendicularX * shardWidth),
+                  y2 - (int)(std::sin(angle) * shardLength - perpendicularY * shardWidth) }
+            };
+            drawPetShape(hdc, shard, 3, sparkColor, RGB(0xFF, 0xD6, 0xA1));
+        }
+    }
+}
+
 void paintButton(HDC hdc, const ButtonDef& b, const Theme& theme) {
     // Casio-style keycap palette: cream digit keys, dark slate function
     // keys, an orange operator column + "=" key, and a red AC key -- the
@@ -680,6 +1064,15 @@ void paintButton(HDC hdc, const ButtonDef& b, const Theme& theme) {
     else if (b.isOperator) { fill = theme.accent; fg = RGB(255, 255, 255); }
     else if (b.isFunction) { fill = theme.isDark ? RGB(0x3A, 0x3D, 0x45) : RGB(0x50, 0x54, 0x5C); fg = RGB(0xF2, 0xF2, 0xF2); }
     else { fill = theme.isDark ? RGB(0x4E, 0x51, 0x58) : RGB(0xF9, 0xF7, 0xF2); fg = theme.isDark ? RGB(0xF2, 0xF2, 0xF2) : RGB(0x24, 0x24, 0x24); }
+
+    double proProgress = proTransitionProgress();
+    if (g.proMode) {
+        COLORREF infernalFill = b.isDanger ? RGB(0xA6, 0x06, 0x22) :
+                                (b.isAccent || b.isOperator) ? RGB(0xDA, 0x0A, 0x31) :
+                                b.isFunction ? RGB(0x35, 0x06, 0x10) : RGB(0x25, 0x07, 0x0D);
+        fill = blendColor(fill, infernalFill, proProgress);
+        fg = blendColor(fg, RGB(0xFF, 0xE5, 0xE0), proProgress);
+    }
 
     int radius = 6;
 
@@ -703,6 +1096,54 @@ void paintButton(HDC hdc, const ButtonDef& b, const Theme& theme) {
     SelectObject(hdc, oldPen);
     DeleteObject(pen);
 
+    if (g.proMode && proProgress > 0.2) {
+        int saved = SaveDC(hdc);
+        HRGN keyClip = CreateRoundRectRgn(b.rect.left + 1, b.rect.top + 1,
+                                          b.rect.right, b.rect.bottom,
+                                          radius, radius);
+        SelectClipRgn(hdc, keyClip);
+        int keyWidth = (int)(b.rect.right - b.rect.left);
+        int keyHeight = (int)(b.rect.bottom - b.rect.top);
+        int veinCount = std::max(2, keyWidth / 15);
+        COLORREF veinColor = blendColor(fill, RGB(0x90, 0x08, 0x20), 0.82);
+        COLORREF emberColor = blendColor(fill, RGB(0xFF, 0x43, 0x32), 0.64);
+        HPEN veinPen = CreatePen(PS_SOLID, 1, veinColor);
+        HPEN emberPen = CreatePen(PS_SOLID, 1, emberColor);
+        for (int vein = 0; vein < veinCount; ++vein) {
+            int startX = (int)b.rect.left + 5 + (vein * 17) % std::max(1, keyWidth - 10);
+            int startY = (int)b.rect.top + 4 + (vein * 7) % std::max(1, keyHeight - 8);
+            HPEN activePen = vein % 3 == 0 ? emberPen : veinPen;
+            HPEN oldTexturePen = (HPEN)SelectObject(hdc, activePen);
+            MoveToEx(hdc, startX, startY, nullptr);
+            LineTo(hdc, startX + 4, startY + 4);
+            LineTo(hdc, startX + 1, startY + 9);
+            LineTo(hdc, startX + 6, startY + 14);
+            if (vein % 2 == 0) {
+                MoveToEx(hdc, startX + 2, startY + 7, nullptr);
+                LineTo(hdc, startX - 3, startY + 11);
+            }
+            SelectObject(hdc, oldTexturePen);
+        }
+        DeleteObject(veinPen);
+        DeleteObject(emberPen);
+
+        HBRUSH fleckBrush = CreateSolidBrush(RGB(0xFF, 0x71, 0x3E));
+        HPEN oldTexturePen = (HPEN)SelectObject(hdc, GetStockObject(NULL_PEN));
+        HBRUSH oldFleckBrush = (HBRUSH)SelectObject(hdc, fleckBrush);
+        for (int fleck = 0; fleck < 3; ++fleck) {
+            int px = (int)b.rect.left + 7 + (fleck * 31 + b.action * 3) %
+                     std::max(1, keyWidth - 12);
+            int py = (int)b.rect.top + 5 + (fleck * 13 + b.action * 7) %
+                     std::max(1, keyHeight - 10);
+            Ellipse(hdc, px, py, px + 2, py + 2);
+        }
+        SelectObject(hdc, oldFleckBrush);
+        SelectObject(hdc, oldTexturePen);
+        DeleteObject(fleckBrush);
+        RestoreDC(hdc, saved);
+        DeleteObject(keyClip);
+    }
+
     // Bevel highlight along the top edge for a subtle raised look.
     HPEN hi = CreatePen(PS_SOLID, 1, shade(fill, theme.isDark ? 25 : 40));
     HPEN oldHi = (HPEN)SelectObject(hdc, hi);
@@ -723,6 +1164,8 @@ void paintButton(HDC hdc, const ButtonDef& b, const Theme& theme) {
 
 void paint(HDC hdc, RECT client) {
     Theme theme = g.dark ? darkTheme() : lightTheme();
+    double proProgress = proTransitionProgress();
+    if (g.proMode) theme = proTheme(theme, proProgress);
 
     // A copy of the theme tuned for the LCD-style screen area (history +
     // editor): its own background/text/operator/result/caret colors, so the
@@ -776,14 +1219,16 @@ void paint(HDC hdc, RECT client) {
         SetTextColor(mem, theme.isDark ? RGB(0xF0, 0xF0, 0xF0) : RGB(0x2A, 0x2A, 0x2A));
         HFONT old = (HFONT)SelectObject(mem, g.uiFont);
         RECT r = g.topBarRect; r.left += 12;
-        DrawTextW(mem, L"Natural Calculator", -1, &r, DT_VCENTER | DT_SINGLELINE);
+        DrawTextW(mem, g.proMode ? L"Calc Pro Max" : L"Natural Calculator",
+              -1, &r, DT_VCENTER | DT_SINGLELINE);
         SelectObject(mem, old);
     }
     // Small slate pill buttons -- same family as the dark function keycaps
     // below, so the whole chrome reads as one coherent design instead of
     // a row of near-invisible white-on-white outlined boxes.
     auto drawPill = [&](RECT rect, const wchar_t* label) {
-        COLORREF fill = theme.isDark ? RGB(0x3A, 0x3D, 0x45) : RGB(0x50, 0x54, 0x5C);
+        COLORREF regularFill = theme.isDark ? RGB(0x3A, 0x3D, 0x45) : RGB(0x50, 0x54, 0x5C);
+        COLORREF fill = g.proMode ? blendColor(regularFill, theme.accent, proProgress) : regularFill;
         HBRUSH b = CreateSolidBrush(fill);
         HBRUSH ob = (HBRUSH)SelectObject(mem, b);
         HPEN nullPen = (HPEN)GetStockObject(NULL_PEN);
@@ -951,6 +1396,14 @@ void paint(HDC hdc, RECT client) {
         for (auto& btn : g.buttons) paintButton(mem, btn, theme);
     }
 
+    if (g.proMode && proProgress > 0.16) {
+        POINT cursor{};
+        GetCursorPos(&cursor);
+        ScreenToClient(g.hwnd, &cursor);
+        drawProPet(mem, g.petX, g.petY + petBounceOffset(), cursor);
+    }
+    drawProExplosion(mem, client, theme);
+
     BitBlt(hdc, 0, 0, client.right, client.bottom, mem, 0, 0, SRCCOPY);
     SelectObject(mem, oldBmp);
     DeleteObject(bmp);
@@ -963,6 +1416,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE:
             g.hwnd = hwnd;
+            loadProExplosionAsset();
             setDarkTitleBar(hwnd, g.dark);
             g.uiFont = CreateFontW(-18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                     DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
@@ -976,6 +1430,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_SIZE:
             recomputeLayout();
+            if (g.proMode) clampPetToClient();
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
 
@@ -1006,6 +1461,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (wParam == kCaretTimerId) {
                 g.caretVisible = !g.caretVisible;
                 InvalidateRect(hwnd, &g.editorRect, FALSE);
+            } else if (wParam == kProAnimationTimerId && g.proMode) {
+                clampPetToClient();
+                InvalidateRect(hwnd, nullptr, FALSE);
             }
             return 0;
 
@@ -1027,6 +1485,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_LBUTTONDOWN: {
             POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            RECT currentPetBounds = petBounds();
+            if (g.proMode && proTransitionProgress() > 0.16 && PtInRect(&currentPetBounds, pt)) {
+                g.petDragging = true;
+                g.petDragOffset = { pt.x - currentPetBounds.left, pt.y - currentPetBounds.top };
+                SetCapture(hwnd);
+                return 0;
+            }
             RECT toggleRect = themeToggleRect();
             RECT xRect = topActionRect(g.topBarRect.right - 68, 28);
             RECT yRect = topActionRect(g.topBarRect.right - 100, 28);
@@ -1073,6 +1538,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
 
         case WM_MOUSEMOVE:
+            if (g.petDragging) {
+                POINT point = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+                g.petX = (int)point.x - g.petDragOffset.x;
+                g.petY = (int)point.y - g.petDragOffset.y;
+                clampPetToClient();
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             if (g.editorSelecting) {
                 POINT point = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
                 if (PtInRect(&g.editorRect, point)) {
@@ -1094,6 +1567,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
 
         case WM_LBUTTONUP:
+            if (g.petDragging) {
+                g.petDragging = false;
+                ReleaseCapture();
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             if (g.editorSelecting) {
                 g.editorSelecting = false;
                 ReleaseCapture();
@@ -1305,6 +1784,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_DESTROY:
             KillTimer(hwnd, kCaretTimerId);
+            KillTimer(hwnd, kProAnimationTimerId);
+            releaseProExplosionAsset();
             if (g.appIcon) DestroyIcon(g.appIcon);
             if (g.uiFont) DeleteObject(g.uiFont);
             if (g.uiFontSmall) DeleteObject(g.uiFontSmall);
