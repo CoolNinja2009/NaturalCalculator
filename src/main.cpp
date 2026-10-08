@@ -53,11 +53,12 @@ enum Action {
     ActOpenParen, ActCloseParen, ActPower, ActSqrt,
     ActEquals, ActClear, ActClearAll, ActToggleTheme, ActBackspace,
     ActVariableX, ActVariableY, ActQuadratic,
-    // Scientific keys (Pro Max). Order matches SciFunction in expr_tree.h:
-    // ActSin + id maps to the SciFunction with the same id.
-    ActSin, ActCos, ActTan, ActAsin, ActAcos, ActAtan,
-    ActSinh, ActCosh, ActTanh, ActLn, ActLog, ActExp, ActAbs,
-    ActPi, ActE, ActToggleAngle
+    ActPermutation, ActCombination,
+    ActPi, ActE, ActPhi,
+    ActToggleAngle, ActToggleScientific, ActToggle2nd,
+    // Scientific functions matching SciFunction enum in expr_tree.h:
+    ActSciFirst,
+    ActSciLast = ActSciFirst + SciFunctionCount - 1
 };
 
 struct App {
@@ -82,6 +83,7 @@ struct App {
     EvaluationContext values;
     bool proMode = false;
     bool degrees = true;   // Pro Max angle unit: true = DEG, false = RAD
+    bool secondPage = false; // 2nd shift for scientific keypad
     DWORD proModeStarted = 0;
     DWORD explosionStarted = 0;
     bool explosionActive = false;
@@ -248,22 +250,45 @@ void layoutButtons(int areaLeft, int areaTop, int areaW, int areaH) {
 
     if (g.proMode) {
         // Scientific pad: three extra key columns to the right of the
-        // classic keypad, only in Calc Pro Max.
-        place(4, 1, 1, L"sin", ActSin, false, false, true);
-        place(5, 1, 1, L"asin", ActAsin, false, false, true);
-        place(6, 1, 1, L"sinh", ActSinh, false, false, true);
-        place(4, 2, 1, L"cos", ActCos, false, false, true);
-        place(5, 2, 1, L"acos", ActAcos, false, false, true);
-        place(6, 2, 1, L"cosh", ActCosh, false, false, true);
-        place(4, 3, 1, L"tan", ActTan, false, false, true);
-        place(5, 3, 1, L"atan", ActAtan, false, false, true);
-        place(6, 3, 1, L"tanh", ActTanh, false, false, true);
-        place(4, 4, 1, L"ln", ActLn, false, false, true);
-        place(5, 4, 1, L"log", ActLog, false, false, true);
-        place(6, 4, 1, L"exp", ActExp, false, false, true);
-        place(4, 5, 1, L"\u03C0", ActPi, false, false, true);
-        place(5, 5, 1, L"e", ActE, false, false, true);
-        place(6, 5, 1, L"|x|", ActAbs, false, false, true);
+        // classic keypad, only in Calc Pro Max / Scientific mode.
+        place(4, 0, 1, L"nPr", ActPermutation, false, false, true);
+        place(5, 0, 1, L"nCr", ActCombination, false, false, true);
+        place(6, 0, 1, g.secondPage ? L"1st" : L"2nd", ActToggle2nd, false, false, true);
+
+        auto sciAct = [](int id) -> Action { return (Action)((int)ActSciFirst + id); };
+        if (!g.secondPage) {
+            place(4, 1, 1, L"sin", sciAct(SciSin), false, false, true);
+            place(5, 1, 1, L"asin", sciAct(SciAsin), false, false, true);
+            place(6, 1, 1, L"sinh", sciAct(SciSinh), false, false, true);
+            place(4, 2, 1, L"cos", sciAct(SciCos), false, false, true);
+            place(5, 2, 1, L"acos", sciAct(SciAcos), false, false, true);
+            place(6, 2, 1, L"cosh", sciAct(SciCosh), false, false, true);
+            place(4, 3, 1, L"tan", sciAct(SciTan), false, false, true);
+            place(5, 3, 1, L"atan", sciAct(SciAtan), false, false, true);
+            place(6, 3, 1, L"tanh", sciAct(SciTanh), false, false, true);
+            place(4, 4, 1, L"ln", sciAct(SciLn), false, false, true);
+            place(5, 4, 1, L"log", sciAct(SciLog), false, false, true);
+            place(6, 4, 1, L"exp", sciAct(SciExp), false, false, true);
+            place(4, 5, 1, L"\u03C0", ActPi, false, false, true);
+            place(5, 5, 1, L"e", ActE, false, false, true);
+            place(6, 5, 1, L"|x|", sciAct(SciAbs), false, false, true);
+        } else {
+            place(4, 1, 1, L"sec", sciAct(SciSec), false, false, true);
+            place(5, 1, 1, L"asec", sciAct(SciAsec), false, false, true);
+            place(6, 1, 1, L"sech", sciAct(SciSech), false, false, true);
+            place(4, 2, 1, L"csc", sciAct(SciCsc), false, false, true);
+            place(5, 2, 1, L"acsc", sciAct(SciAcsc), false, false, true);
+            place(6, 2, 1, L"csch", sciAct(SciCsch), false, false, true);
+            place(4, 3, 1, L"cot", sciAct(SciCot), false, false, true);
+            place(5, 3, 1, L"acot", sciAct(SciAcot), false, false, true);
+            place(6, 3, 1, L"coth", sciAct(SciCoth), false, false, true);
+            place(4, 4, 1, L"log2", sciAct(SciLog2), false, false, true);
+            place(5, 4, 1, L"\u00B3\u221A", sciAct(SciCbrt), false, false, true);
+            place(6, 4, 1, L"\u0393", sciAct(SciGamma), false, false, true);
+            place(4, 5, 1, L"\u03C6", ActPhi, false, false, true);
+            place(5, 5, 1, L"n!", sciAct(SciFact), false, false, true);
+            place(6, 5, 1, L"rnd", sciAct(SciRound), false, false, true);
+        }
     }
 
     place(0, 6, g.proMode ? 7 : 4, L"=", ActEquals, false, true);
@@ -359,16 +384,33 @@ void doAction(int action) {
         case ActPower: insertPower(cur); break;
         case ActSqrt: insertSqrt(cur); break;
         case ActBackspace: backspace(cur); break;
-        case ActSin: case ActCos: case ActTan:
-        case ActAsin: case ActAcos: case ActAtan:
-        case ActSinh: case ActCosh: case ActTanh:
-        case ActLn: case ActLog: case ActExp: case ActAbs:
-            insertFunction(cur, action - ActSin); break;
+        case ActPermutation: insertPermutation(cur); break;
+        case ActCombination: insertCombination(cur); break;
         case ActPi: insertConstant(cur, 'p'); break;
         case ActE: insertConstant(cur, 'e'); break;
+        case ActPhi: insertConstant(cur, 'f'); break;
         case ActToggleAngle:
             g.degrees = !g.degrees;
             break;
+        case ActToggleScientific:
+            if (!g.proMode) {
+                activateProMode();
+            } else {
+                g.proMode = false;
+                RECT rc{};
+                GetClientRect(g.hwnd, &rc);
+                recomputeLayout(rc);
+                InvalidateRect(g.hwnd, nullptr, FALSE);
+            }
+            break;
+        case ActToggle2nd: {
+            g.secondPage = !g.secondPage;
+            RECT rc{};
+            GetClientRect(g.hwnd, &rc);
+            recomputeLayout(rc);
+            InvalidateRect(g.hwnd, &g.buttonAreaRect, FALSE);
+            break;
+        }
         case ActEquals: {
             normalizeNames(cur);   // resolve "sin(", "pi", "e"... before evaluating
             bool proTrigger = isProModeTrigger(cur.root.get());
@@ -395,7 +437,11 @@ void doAction(int action) {
             saveDarkMode(g.dark);
             setDarkTitleBar(g.hwnd, g.proMode || g.dark);
             break;
-        default: break;
+        default:
+            if (action >= ActSciFirst && action <= ActSciLast) {
+                insertFunction(cur, action - ActSciFirst);
+            }
+            break;
     }
     normalizeNames(cur);   // resolve any words left over from button edits
     ensureCaretVisible();
@@ -1278,12 +1324,15 @@ void paint(HDC hdc, RECT client) {
         RECT xr = topActionRect(g.topBarRect.right - 68, 28);
         RECT yr = topActionRect(g.topBarRect.right - 100, 28);
         RECT qr = topActionRect(g.topBarRect.right - 132, 76);
+        RECT sciRect = topActionRect(g.topBarRect.right - 212, 44);
         drawPill(xr, L"x");
         drawPill(yr, L"y");
         drawPill(qr, L"Quadratic");
-        if (g.proMode)
-            drawPill(topActionRect(g.topBarRect.right - 212, 44),
-                     g.degrees ? L"DEG" : L"RAD");
+        drawPill(sciRect, g.proMode ? L"Sci On" : L"Sci");
+        if (g.proMode) {
+            RECT angleRect = topActionRect(g.topBarRect.right - 260, 44);
+            drawPill(angleRect, g.degrees ? L"DEG" : L"RAD");
+        }
     }
     drawPill(themeToggleRect(), g.dark ? L"Light" : L"Dark");
     HPEN divPen = CreatePen(PS_SOLID, 1, theme.divider);
@@ -1532,11 +1581,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             RECT xRect = topActionRect(g.topBarRect.right - 68, 28);
             RECT yRect = topActionRect(g.topBarRect.right - 100, 28);
             RECT quadraticRect = topActionRect(g.topBarRect.right - 132, 76);
-            RECT angleRect = topActionRect(g.topBarRect.right - 212, 44);
+            RECT sciRect = topActionRect(g.topBarRect.right - 212, 44);
+            RECT angleRect = topActionRect(g.topBarRect.right - 260, 44);
             if (PtInRect(&toggleRect, pt)) { doAction(ActToggleTheme); return 0; }
             if (PtInRect(&xRect, pt)) { doAction(ActVariableX); return 0; }
             if (PtInRect(&yRect, pt)) { doAction(ActVariableY); return 0; }
             if (PtInRect(&quadraticRect, pt)) { solveQuadraticFromDialog(); return 0; }
+            if (PtInRect(&sciRect, pt)) { doAction(ActToggleScientific); return 0; }
             if (g.proMode && PtInRect(&angleRect, pt)) {
                 doAction(ActToggleAngle);
                 return 0;
@@ -1647,8 +1698,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     return 0;
                 } else if ((c >= L'0' && c <= L'9') || c == L'.' || c == L'+' || c == L'-' ||
                            c == L'*' || c == L'/' || c == L'(' || c == L')' || c == L'^' ||
-                           c == L'!' || c == L'=' || c == L'x' || c == L'X' || c == L'y' || c == L'Y' ||
-                           (g.proMode && ((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z')))) {
+                           c == L'!' || c == L'=' || c == L'%' ||
+                           ((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z'))) {
                     text.insert(text.begin() + position, (char)std::tolower((char)c));
                     ++position;
                 } else return 0;
@@ -1658,14 +1709,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
-            if (c == L'!' || c == L'=')
+            if (c == L'!' || c == L'=' || c == L'%')
                 g.undo.push_back(cloneExpression(g.workspace.current()));
             if (g.editorCaret != g.editorAnchor) {
                 if (c == 8) replaceEditorSelection("");
                 else if ((c >= L'0' && c <= L'9') || c == L'.' || c == L'+' || c == L'-' ||
                          c == L'*' || c == L'/' || c == L'(' || c == L')' || c == L'^' ||
-                         c == L'!' || c == L'=' || c == L'x' || c == L'X' || c == L'y' || c == L'Y' ||
-                         (g.proMode && ((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z')))) {
+                         c == L'!' || c == L'=' || c == L'%' ||
+                         ((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z'))) {
                     char replacement = (char)c;
                     if (replacement == '/') replacement = '/';
                     replaceEditorSelection(std::string(1, replacement));
@@ -1677,13 +1728,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (c == 8) { doAction(ActBackspace); return 0; }
             if (c == 13) { doAction(ActEquals); return 0; }
             if (c >= '0' && c <= '9') { doAction(ActDigit0 + (c - '0')); return 0; }
-            // Pro Mode: letters build words ("sin", "pi", "e", "x"...).
-            // They resolve into Function/Constant/Variable items on the next
-            // non-letter edit, so "e-x-p-(" types exp() while a lone "e"
-            // still becomes the constant.
-            if (g.proMode && ((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z'))) {
+            // Letters build words ("sin", "pi", "phi", "e", "x", "2p2", "2c2"...).
+            // They resolve into Function/Constant/Variable/Permutation/Combination
+            // items on normalizeNames().
+            if ((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z')) {
                 g.undo.push_back(cloneExpression(g.workspace.current()));
                 insertNameLetter(g.workspace.current(), (char)tolower((char)c));
+                normalizeNames(g.workspace.current());
                 ensureCaretVisible();
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
@@ -1698,9 +1749,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 case L')': doAction(ActCloseParen); return 0;
                 case L'^': doAction(ActPower); return 0;
                 case L'!': insertOperator(g.workspace.current(), '!'); ensureCaretVisible(); InvalidateRect(hwnd, nullptr, FALSE); return 0;
+                case L'%': insertOperator(g.workspace.current(), '%'); ensureCaretVisible(); InvalidateRect(hwnd, nullptr, FALSE); return 0;
                 case L'=': insertEquals(g.workspace.current()); ensureCaretVisible(); InvalidateRect(hwnd, nullptr, FALSE); return 0;
-                case L'x': case L'X': doAction(ActVariableX); return 0;
-                case L'y': case L'Y': doAction(ActVariableY); return 0;
                 default: return 0;
             }
         }

@@ -132,10 +132,42 @@ double factorial(double value) {
     return result;
 }
 
+double permutation(double nVal, double rVal) {
+    if (nVal < 0.0 || std::floor(nVal) != nVal || rVal < 0.0 || std::floor(rVal) != rVal)
+        throw std::runtime_error("Permutation needs non-negative integers");
+    if (rVal > nVal)
+        throw std::runtime_error("r cannot exceed n in nPr");
+    if (rVal == 0.0) return 1.0;
+    if (nVal > 170.0 && (nVal - rVal) < 170.0)
+        throw FactorialTooLargeError();
+    double result = 1.0;
+    for (double i = 0.0; i < rVal; ++i) {
+        result *= (nVal - i);
+        if (std::isinf(result) || result > 1.79e308) throw FactorialTooLargeError();
+    }
+    return result;
+}
+
+double combination(double nVal, double rVal) {
+    if (nVal < 0.0 || std::floor(nVal) != nVal || rVal < 0.0 || std::floor(rVal) != rVal)
+        throw std::runtime_error("Combination needs non-negative integers");
+    if (rVal > nVal)
+        throw std::runtime_error("r cannot exceed n in nCr");
+    if (rVal == 0.0 || rVal == nVal) return 1.0;
+    double k = std::min(rVal, nVal - rVal);
+    double result = 1.0;
+    for (double i = 1.0; i <= k; ++i) {
+        result = result * (nVal - (k - i)) / i;
+        if (std::isinf(result) || result > 1.79e308) throw FactorialTooLargeError();
+    }
+    return std::round(result);
+}
+
 // --- scientific functions (Pro Mode) ---------------------------------------
 
 constexpr double kSciPi = 3.14159265358979323846;
 constexpr double kSciE = 2.71828182845904523536;
+constexpr double kSciPhi = 1.61803398874989484820;
 constexpr double kLog10E = 0.43429448190325182765;   // log10(e)
 
 double angleToRadians(double value, bool degrees) {
@@ -159,6 +191,24 @@ double applySciFunction(int id, double x, bool degrees) {
                 throw std::runtime_error("tan is undefined here");
             return std::sin(angleToRadians(x, degrees)) / cosine;
         }
+        case SciSec: {
+            double cosine = std::cos(angleToRadians(x, degrees));
+            if (std::fabs(cosine) < 1e-15)
+                throw std::runtime_error("sec is undefined here");
+            return 1.0 / cosine;
+        }
+        case SciCsc: {
+            double sine = std::sin(angleToRadians(x, degrees));
+            if (std::fabs(sine) < 1e-15)
+                throw std::runtime_error("csc is undefined here");
+            return 1.0 / sine;
+        }
+        case SciCot: {
+            double sine = std::sin(angleToRadians(x, degrees));
+            if (std::fabs(sine) < 1e-15)
+                throw std::runtime_error("cot is undefined here");
+            return std::cos(angleToRadians(x, degrees)) / sine;
+        }
         case SciAsin:
             if (x < -1.0 || x > 1.0)
                 throw std::runtime_error("asin needs input in -1..1");
@@ -168,17 +218,77 @@ double applySciFunction(int id, double x, bool degrees) {
                 throw std::runtime_error("acos needs input in -1..1");
             return angleFromRadians(std::acos(x), degrees);
         case SciAtan: return angleFromRadians(std::atan(x), degrees);
+        case SciAsec:
+            if (std::fabs(x) < 1.0)
+                throw std::runtime_error("asec needs input outside (-1, 1)");
+            return angleFromRadians(std::acos(1.0 / x), degrees);
+        case SciAcsc:
+            if (std::fabs(x) < 1.0)
+                throw std::runtime_error("acsc needs input outside (-1, 1)");
+            return angleFromRadians(std::asin(1.0 / x), degrees);
+        case SciAcot:
+            if (x == 0.0) return angleFromRadians(kSciPi / 2.0, degrees);
+            return angleFromRadians(std::atan(1.0 / x), degrees);
         case SciSinh: return std::sinh(x);
         case SciCosh: return std::cosh(x);
         case SciTanh: return std::tanh(x);
+        case SciAsinh: return std::asinh(x);
+        case SciAcosh:
+            if (x < 1.0) throw std::runtime_error("acosh needs input >= 1");
+            return std::acosh(x);
+        case SciAtanh:
+            if (x <= -1.0 || x >= 1.0) throw std::runtime_error("atanh needs input in (-1, 1)");
+            return std::atanh(x);
+        case SciSech: return 1.0 / std::cosh(x);
+        case SciCsch:
+            if (x == 0.0) throw std::runtime_error("csch is undefined at 0");
+            return 1.0 / std::sinh(x);
+        case SciCoth:
+            if (x == 0.0) throw std::runtime_error("coth is undefined at 0");
+            return 1.0 / std::tanh(x);
+        case SciAsech:
+            if (x <= 0.0 || x > 1.0) throw std::runtime_error("asech needs input in (0, 1]");
+            return std::acosh(1.0 / x);
+        case SciAcsch:
+            if (x == 0.0) throw std::runtime_error("acsch is undefined at 0");
+            return std::asinh(1.0 / x);
+        case SciAcoth:
+            if (std::fabs(x) <= 1.0) throw std::runtime_error("acoth needs input outside [-1, 1]");
+            return std::atanh(1.0 / x);
         case SciLn:
             if (!(x > 0.0)) throw std::runtime_error("ln needs a positive number");
             return std::log(x);
         case SciLog:
             if (!(x > 0.0)) throw std::runtime_error("log needs a positive number");
             return std::log10(x);
+        case SciLog2:
+            if (!(x > 0.0)) throw std::runtime_error("log2 needs a positive number");
+            return std::log2(x);
         case SciExp: return std::exp(x);
+        case SciExpm1: return std::expm1(x);
+        case SciLog1p:
+            if (x <= -1.0) throw std::runtime_error("log1p needs input > -1");
+            return std::log1p(x);
+        case SciCbrt: return std::cbrt(x);
         case SciAbs: return std::fabs(x);
+        case SciFloor: return std::floor(x);
+        case SciCeil: return std::ceil(x);
+        case SciRound: return std::round(x);
+        case SciTrunc: return std::trunc(x);
+        case SciSgn: return (x > 0.0) ? 1.0 : ((x < 0.0) ? -1.0 : 0.0);
+        case SciGamma:
+            if (x <= 0.0 && std::floor(x) == x)
+                throw std::runtime_error("gamma is undefined at non-positive integers");
+            return std::tgamma(x);
+        case SciLgamma:
+            if (x <= 0.0 && std::floor(x) == x)
+                throw std::runtime_error("lgamma is undefined at non-positive integers");
+            return std::lgamma(x);
+        case SciErf: return std::erf(x);
+        case SciErfc: return std::erfc(x);
+        case SciFact: return factorial(x);
+        case SciDeg: return x * (180.0 / kSciPi);
+        case SciRad: return x * (kSciPi / 180.0);
     }
     throw std::runtime_error("Unknown function");
 }
@@ -250,7 +360,21 @@ struct RowParser {
             }
             case ItemType::Constant:
                 pos++;
-                return it->constantName == 'p' ? kSciPi : kSciE;
+                if (it->constantName == 'p') return kSciPi;
+                if (it->constantName == 'f') return kSciPhi;
+                return kSciE;
+            case ItemType::Permutation: {
+                pos++;
+                double n = evaluate(it->a.get(), context);
+                double r = evaluate(it->b.get(), context);
+                return permutation(n, r);
+            }
+            case ItemType::Combination: {
+                pos++;
+                double n = evaluate(it->a.get(), context);
+                double r = evaluate(it->b.get(), context);
+                return combination(n, r);
+            }
             case ItemType::Function: {
                 pos++;
                 int functionId = it->functionId;
@@ -293,8 +417,15 @@ struct RowParser {
                 v *= parseFactor();
                 continue;
             }
+            if (peekIsOperatorChar('%')) {
+                pos++;
+                double div = parseFactor();
+                if (div == 0.0) throw std::runtime_error("Division by zero");
+                v = std::fmod(v, div);
+                continue;
+            }
             // Implicit multiplication: next token exists and is not a
-            // flat operator (+, -, *) -> another atom starts here.
+            // flat operator (+, -, *, %) -> another atom starts here.
             const Item* nxt = peek();
             if (nxt && nxt->type != ItemType::Operator) {
                 v *= parseFactor();
@@ -505,11 +636,47 @@ BigValue bigFactorial(const BigValue& v) {
     return r;
 }
 
-// Scientific functions in log10 space. Only the ones that are numerically
-// meaningful there get real big answers (exp/ln/log/abs/sinh/cosh/tanh/atan);
-// ordinary trig needs honest argument reduction, so arguments whose magnitude
-// exceeds what a double can represent exactly (10^15) raise a clear error
-// rather than returning a plausible but wrong value.
+BigValue bigPermutation(const BigValue& n, const BigValue& r) {
+    double nVal = n.isZero ? 0.0 : (n.negative ? -1.0 : 1.0) * std::pow(10.0, n.log10Abs);
+    double rVal = r.isZero ? 0.0 : (r.negative ? -1.0 : 1.0) * std::pow(10.0, r.log10Abs);
+    if (!std::isfinite(nVal) || !std::isfinite(rVal) ||
+        nVal < 0.0 || !bigIsIntegral(nVal) || rVal < 0.0 || !bigIsIntegral(rVal)) {
+        throw std::runtime_error("Permutation needs non-negative integers");
+    }
+    nVal = std::round(nVal);
+    rVal = std::round(rVal);
+    if (rVal > nVal) throw std::runtime_error("r cannot exceed n in nPr");
+    if (rVal == 0.0) return bigFromDouble(1.0);
+    double log10P = (std::lgamma(nVal + 1.0) - std::lgamma(nVal - rVal + 1.0)) / std::log(10.0);
+    if (!std::isfinite(log10P)) throw std::runtime_error("Result is too large");
+    BigValue res;
+    res.isZero = false;
+    res.negative = false;
+    res.log10Abs = log10P;
+    return res;
+}
+
+BigValue bigCombination(const BigValue& n, const BigValue& r) {
+    double nVal = n.isZero ? 0.0 : (n.negative ? -1.0 : 1.0) * std::pow(10.0, n.log10Abs);
+    double rVal = r.isZero ? 0.0 : (r.negative ? -1.0 : 1.0) * std::pow(10.0, r.log10Abs);
+    if (!std::isfinite(nVal) || !std::isfinite(rVal) ||
+        nVal < 0.0 || !bigIsIntegral(nVal) || rVal < 0.0 || !bigIsIntegral(rVal)) {
+        throw std::runtime_error("Combination needs non-negative integers");
+    }
+    nVal = std::round(nVal);
+    rVal = std::round(rVal);
+    if (rVal > nVal) throw std::runtime_error("r cannot exceed n in nCr");
+    if (rVal == 0.0 || rVal == nVal) return bigFromDouble(1.0);
+    double log10C = (std::lgamma(nVal + 1.0) - std::lgamma(rVal + 1.0) - std::lgamma(nVal - rVal + 1.0)) / std::log(10.0);
+    if (!std::isfinite(log10C)) throw std::runtime_error("Result is too large");
+    BigValue res;
+    res.isZero = false;
+    res.negative = false;
+    res.log10Abs = log10C;
+    return res;
+}
+
+// Scientific functions in log10 space.
 BigValue applySciFunctionBig(int id, const BigValue& x, bool degrees) {
     if (id == SciAbs) {
         BigValue r = x;
@@ -528,13 +695,27 @@ BigValue applySciFunctionBig(int id, const BigValue& x, bool degrees) {
         r.log10Abs = log10Result;
         return r;
     }
-    if (id == SciLn || id == SciLog) {
+    if (id == SciLn || id == SciLog || id == SciLog2) {
         if (x.isZero || x.negative)
-            throw std::runtime_error(id == SciLn ? "ln needs a positive number"
-                                                 : "log needs a positive number");
-        double result = (id == SciLn) ? x.log10Abs / kLog10E : x.log10Abs;
+            throw std::runtime_error("Logarithm needs a positive number");
+        double result = (id == SciLn) ? x.log10Abs / kLog10E :
+                        (id == SciLog2 ? x.log10Abs / std::log10(2.0) : x.log10Abs);
         if (!std::isfinite(result)) throw std::runtime_error("Result is too large");
         return bigFromDouble(result);
+    }
+    if (id == SciCbrt) {
+        BigValue r = x;
+        r.log10Abs = x.log10Abs / 3.0;
+        return r;
+    }
+    if (id == SciSgn) {
+        if (x.isZero) return bigFromDouble(0.0);
+        return bigFromDouble(x.negative ? -1.0 : 1.0);
+    }
+    if (id == SciFloor || id == SciCeil || id == SciRound || id == SciTrunc) {
+        if (x.log10Abs > 15.0) return x; // already effectively an integer
+        double val = (x.negative ? -1.0 : 1.0) * std::pow(10.0, x.log10Abs);
+        return bigFromDouble(applySciFunction(id, val, degrees));
     }
     if (id == SciCosh || id == SciSinh) {
         if (x.isZero) return bigFromDouble(id == SciCosh ? 1.0 : 0.0);
@@ -544,7 +725,6 @@ BigValue applySciFunctionBig(int id, const BigValue& x, bool degrees) {
             double result = id == SciCosh ? std::cosh(value) : std::sinh(value);
             if (std::isfinite(result)) return bigFromDouble(result);
         }
-        // cosh(z) ~ sinh(|z|) ~ e^|z| / 2 once the double path overflows.
         double log10Result = magnitude * kLog10E - std::log10(2.0);
         if (!std::isfinite(log10Result)) throw std::runtime_error("Result is too large");
         BigValue r;
@@ -555,7 +735,7 @@ BigValue applySciFunctionBig(int id, const BigValue& x, bool degrees) {
     }
     if (id == SciTanh) {
         if (!x.isZero && x.log10Abs > 20.0)
-            return bigFromDouble(x.negative ? -1.0 : 1.0);   // tanh(+-huge) = +-1
+            return bigFromDouble(x.negative ? -1.0 : 1.0);
         double value = x.isZero ? 0.0
                                 : (x.negative ? -1.0 : 1.0) * std::pow(10.0, x.log10Abs);
         return bigFromDouble(std::tanh(value));
@@ -568,16 +748,20 @@ BigValue applySciFunctionBig(int id, const BigValue& x, bool degrees) {
         return bigFromDouble(applySciFunction(SciAtan, value, degrees));
     }
     if (id == SciAsin || id == SciAcos) {
-        if (!x.isZero && x.log10Abs > 0.0)   // |x| > 1
+        if (!x.isZero && x.log10Abs > 0.0)
             throw std::runtime_error(id == SciAsin ? "asin needs input in -1..1"
                                                    : "acos needs input in -1..1");
         double value = x.isZero ? 0.0
                                 : (x.negative ? -1.0 : 1.0) * std::pow(10.0, x.log10Abs);
         return bigFromDouble(applySciFunction(id, value, degrees));
     }
-    // sin / cos / tan: honest reduction only.
-    if (!x.isZero && x.log10Abs > 15.0)
-        throw std::runtime_error("Argument too large for trig");
+    // Trig / reciprocal trig / other: argument reduction limit
+    if (!x.isZero && x.log10Abs > 15.0) {
+        bool isTrig = (id == SciSin || id == SciCos || id == SciTan ||
+                       id == SciSec || id == SciCsc || id == SciCot);
+        throw std::runtime_error(isTrig ? "Argument too large for trig"
+                                        : "Argument too large for function");
+    }
     double value = x.isZero ? 0.0
                             : (x.negative ? -1.0 : 1.0) * std::pow(10.0, x.log10Abs);
     return bigFromDouble(applySciFunction(id, value, degrees));
@@ -664,7 +848,21 @@ struct BigParser {
                 return bigSqrt(bigEvaluate(it->a.get(), context));
             case ItemType::Constant:
                 pos++;
-                return bigFromDouble(it->constantName == 'p' ? kSciPi : kSciE);
+                if (it->constantName == 'p') return bigFromDouble(kSciPi);
+                if (it->constantName == 'f') return bigFromDouble(kSciPhi);
+                return bigFromDouble(kSciE);
+            case ItemType::Permutation: {
+                pos++;
+                BigValue n = bigEvaluate(it->a.get(), context);
+                BigValue r = bigEvaluate(it->b.get(), context);
+                return bigPermutation(n, r);
+            }
+            case ItemType::Combination: {
+                pos++;
+                BigValue n = bigEvaluate(it->a.get(), context);
+                BigValue r = bigEvaluate(it->b.get(), context);
+                return bigCombination(n, r);
+            }
             case ItemType::Function: {
                 pos++;
                 int functionId = it->functionId;
@@ -706,6 +904,15 @@ struct BigParser {
             if (peekIsOperatorChar('*')) {
                 pos++;
                 v = bigMul(v, parseFactor());
+                continue;
+            }
+            if (peekIsOperatorChar('%')) {
+                pos++;
+                BigValue divisor = parseFactor();
+                if (divisor.isZero) throw std::runtime_error("Division by zero");
+                double num = (v.negative ? -1.0 : 1.0) * std::pow(10.0, v.log10Abs);
+                double den = (divisor.negative ? -1.0 : 1.0) * std::pow(10.0, divisor.log10Abs);
+                v = bigFromDouble(std::fmod(num, den));
                 continue;
             }
             const Item* next = peek();
@@ -866,6 +1073,8 @@ struct PolynomialParser {
             case ItemType::Name:
             case ItemType::Constant:
             case ItemType::Function:
+            case ItemType::Permutation:
+            case ItemType::Combination:
                 return { { 0, 0, 0 }, false };
         }
         return { { 0, 0, 0 }, false };
@@ -987,6 +1196,8 @@ struct LinearParser {
             case ItemType::Name:
             case ItemType::Constant:
             case ItemType::Function:
+            case ItemType::Permutation:
+            case ItemType::Combination:
                 return { 0, 0, 0, false };
         }
         return { 0, 0, 0, false };

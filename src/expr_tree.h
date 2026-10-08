@@ -25,7 +25,7 @@
 enum class ItemType {
     Number,     // a run of digits and at most one '.'
     Variable,   // a named numeric variable (currently x or y)
-    Operator,   // + - * ! (leaf glyph; division never appears here, see Fraction)
+    Operator,   // + - * % ! (leaf glyph; division never appears here, see Fraction)
     Equals,     // equation separator
     CloseParen, // standalone ')' delimiter
     Fraction,   // a/b  -> child rows: numerator (a), denominator (b)
@@ -35,17 +35,35 @@ enum class ItemType {
     Name,       // a word being typed ("sin", "ex"...). Resolved by
                 // normalizeNames() into Function/Constant/Variable, or kept
                 // as-is (evaluates to "Unknown name")
-    Constant,   // pi ('p') or e ('e') -- leaf
-    Function    // sciFunction(id)(arg) -> child row: argument (a). b unused.
+    Constant,   // pi ('p'), e ('e'), phi ('f') -- leaf
+    Function,   // sciFunction(id)(arg) -> child row: argument (a). b unused.
+    Permutation,// nPr: a = n (superscript), b = r (subscript)
+    Combination // nCr: a = n (superscript), b = r (subscript)
 };
 
-// Scientific functions available in Calc Pro Max. The order here must match
-// the ActSin..ActAbs action order in main.cpp.
+// Scientific functions available in Calc Pro Max / Scientific mode.
 enum SciFunction {
+    // Trigonometric & Reciprocal
     SciSin, SciCos, SciTan,
     SciAsin, SciAcos, SciAtan,
+    SciSec, SciCsc, SciCot,
+    SciAsec, SciAcsc, SciAcot,
+    // Hyperbolic & Reciprocal
     SciSinh, SciCosh, SciTanh,
-    SciLn, SciLog, SciExp, SciAbs,
+    SciAsinh, SciAcosh, SciAtanh,
+    SciSech, SciCsch, SciCoth,
+    SciAsech, SciAcsch, SciAcoth,
+    // Logarithmic & Exponential
+    SciLn, SciLog, SciLog2,
+    SciExp, SciExpm1, SciLog1p,
+    // Roots
+    SciCbrt,
+    // Rounding, Integer, and Sign
+    SciAbs, SciFloor, SciCeil, SciRound, SciTrunc, SciSgn,
+    // Special
+    SciGamma, SciLgamma, SciErf, SciErfc, SciFact,
+    // Angle conversion
+    SciDeg, SciRad,
     SciFunctionCount
 };
 
@@ -149,9 +167,13 @@ void insertPower(Expression& expr);
 void insertSqrt(Expression& expr);
 
 // Scientific keys: insert an empty function call, cursor moves into the
-// argument; or insert the pi / e constant leaf.
+// argument; or insert the pi / e / phi constant leaf.
 void insertFunction(Expression& expr, int functionId);
-void insertConstant(Expression& expr, char which); // 'p' = pi, 'e' = e
+void insertConstant(Expression& expr, char which); // 'p' = pi, 'e' = e, 'f' = phi
+
+// Combinatorics: nPr / nCr. Wrap atom to the left into n, cursor moves to r.
+void insertPermutation(Expression& expr);
+void insertCombination(Expression& expr);
 
 // Pro Mode typing: append a (lowercase) letter to a trailing Name item, or
 // start a new one. Letters accumulate as a Name; the conversion into

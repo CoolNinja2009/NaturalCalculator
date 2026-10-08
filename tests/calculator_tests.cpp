@@ -610,6 +610,208 @@ static void testPowerEditing() {
     assert(expression.toPlainString() == "(2)^(2)");
 }
 
+static void testCombinatoricsTypingAndEvaluation() {
+    EvaluationContext ctx;
+    ctx.degrees = false;
+
+    // Direct text / auto-format parsing
+    Expression e1;
+    insertFromText(e1, "2p2");
+    assert(e1.root->items.size() == 1);
+    assert(e1.root->items[0]->type == ItemType::Permutation);
+    assert(e1.toPlainString() == "²P₂");
+    assertNear(evaluate(e1.root.get(), ctx), 2.0);
+
+    Expression e2;
+    insertFromText(e2, "2c2");
+    assert(e2.root->items.size() == 1);
+    assert(e2.root->items[0]->type == ItemType::Combination);
+    assert(e2.toPlainString() == "²C₂");
+    assertNear(evaluate(e2.root.get(), ctx), 1.0);
+
+    Expression e3;
+    insertFromText(e3, "5nPr3");
+    assert(e3.toPlainString() == "⁵P₃");
+    assertNear(evaluate(e3.root.get(), ctx), 60.0);
+
+    Expression e4;
+    insertFromText(e4, "5nCr3");
+    assert(e4.toPlainString() == "⁵C₃");
+    assertNear(evaluate(e4.root.get(), ctx), 10.0);
+
+    // Interactive simulated keystroke typing: "2", "p", "2"
+    Expression typedP;
+    insertDigit(typedP, '2');
+    insertNameLetter(typedP, 'p');
+    insertDigit(typedP, '2');
+    normalizeNames(typedP);
+    assert(typedP.root->items.size() == 1);
+    assert(typedP.root->items[0]->type == ItemType::Permutation);
+    assert(typedP.toPlainString() == "²P₂");
+    assertNear(evaluate(typedP.root.get(), ctx), 2.0);
+
+    // Interactive simulated keystroke typing: "5", "c", "3"
+    Expression typedC;
+    insertDigit(typedC, '5');
+    insertNameLetter(typedC, 'c');
+    insertDigit(typedC, '3');
+    normalizeNames(typedC);
+    assert(typedC.root->items.size() == 1);
+    assert(typedC.root->items[0]->type == ItemType::Combination);
+    assert(typedC.toPlainString() == "⁵C₃");
+    assertNear(evaluate(typedC.root.get(), ctx), 10.0);
+
+    // Round-trip plain string containing Unicode superscript & subscript
+    Expression unicodeP;
+    insertFromText(unicodeP, "²P₂");
+    assert(unicodeP.root->items[0]->type == ItemType::Permutation);
+    assertNear(evaluate(unicodeP.root.get(), ctx), 2.0);
+
+    Expression unicodeC;
+    insertFromText(unicodeC, "⁵C₃");
+    assert(unicodeC.root->items[0]->type == ItemType::Combination);
+    assertNear(evaluate(unicodeC.root.get(), ctx), 10.0);
+
+    // Domain errors: r > n
+    Expression badR;
+    insertFromText(badR, "3p5");
+    bool threw = false;
+    try { evaluate(badR.root.get(), ctx); }
+    catch (const std::exception& e) {
+        threw = (std::string(e.what()).find("exceed") != std::string::npos);
+    }
+    assert(threw);
+}
+
+static void testAllScientificFunctions() {
+    EvaluationContext rad;
+    rad.degrees = false;
+    EvaluationContext deg;
+    deg.degrees = true;
+
+    // Reciprocal trig
+    assertNear(evalText("sec(0)", rad), 1.0);
+    assertNear(evalText("csc(pi/2)", rad), 1.0);
+    assertNear(evalText("cot(pi/4)", rad), 1.0);
+
+    // Inverse reciprocal trig
+    assertNear(evalText("asec(1)", rad), 0.0);
+    assertNear(evalText("acsc(1)", rad), 3.141592653589793 / 2.0);
+    assertNear(evalText("acot(1)", rad), 3.141592653589793 / 4.0);
+
+    // Hyperbolic & inverse / reciprocal
+    assertNear(evalText("sinh(0)", rad), 0.0);
+    assertNear(evalText("cosh(0)", rad), 1.0);
+    assertNear(evalText("tanh(0)", rad), 0.0);
+    assertNear(evalText("sech(0)", rad), 1.0);
+    assertNear(evalText("csch(1)", rad), 1.0 / std::sinh(1.0));
+    assertNear(evalText("coth(1)", rad), 1.0 / std::tanh(1.0));
+    assertNear(evalText("asinh(0)", rad), 0.0);
+    assertNear(evalText("acosh(1)", rad), 0.0);
+    assertNear(evalText("atanh(0)", rad), 0.0);
+    assertNear(evalText("asech(1)", rad), 0.0);
+    assertNear(evalText("acsch(1)", rad), std::asinh(1.0));
+    assertNear(evalText("acoth(2)", rad), std::atanh(0.5));
+
+    // Logarithms and roots
+    assertNear(evalText("log2(8)", rad), 3.0);
+    assertNear(evalText("log1p(0)", rad), 0.0);
+    assertNear(evalText("cbrt(27)", rad), 3.0);
+    assertNear(evalText("cbrt(-8)", rad), -2.0);
+    assertNear(evalText("expm1(0)", rad), 0.0);
+
+    // Rounding & sign
+    assertNear(evalText("floor(3.7)", rad), 3.0);
+    assertNear(evalText("ceil(3.2)", rad), 4.0);
+    assertNear(evalText("round(3.5)", rad), 4.0);
+    assertNear(evalText("trunc(-3.7)", rad), -3.0);
+    assertNear(evalText("sgn(-5)", rad), -1.0);
+    assertNear(evalText("sgn(0)", rad), 0.0);
+    assertNear(evalText("sgn(5)", rad), 1.0);
+
+    // Special functions
+    assertNear(evalText("gamma(5)", rad), 24.0); // (5-1)! = 24
+    assertNear(evalText("lgamma(5)", rad), std::log(24.0));
+    assertNear(evalText("erf(0)", rad), 0.0);
+    assertNear(evalText("erfc(0)", rad), 1.0);
+    assertNear(evalText("fact(5)", rad), 120.0);
+
+    // Angle conversions
+    assertNear(evalText("deg(pi)", rad), 180.0);
+    assertNear(evalText("rad(180)", rad), 3.141592653589793);
+
+    // Constants
+    assertNear(evalText("phi", rad), 1.6180339887498948);
+    assertNear(evalText("pi", rad), 3.141592653589793);
+    assertNear(evalText("e", rad), 2.718281828459045);
+
+    // Modulo operator %
+    assertNear(evalText("10%3", rad), 1.0);
+    assertNear(evalText("7.5%2", rad), 1.5);
+    assertNear(evalText("14%5", rad), 4.0);
+}
+
+static void testBigCombinatoricsAndFunctions() {
+    EvaluationContext pro;
+    pro.bigNumbers = true;
+
+    // Permutation & combination in Pro / Big mode
+    Expression pBig;
+    insertFromText(pBig, "1000p2");
+    assert(evaluateProToString(pBig.root.get(), pro) == "999000");
+
+    Expression cBig;
+    insertFromText(cBig, "1000c2");
+    assert(evaluateProToString(cBig.root.get(), pro) == "499500");
+
+    // Huge combinatorics that overflow double (2000C1000 is ~ 10^600)
+    Expression cHuge;
+    insertFromText(cHuge, "2000c1000");
+    std::string resCHuge = evaluateProToString(cHuge.root.get(), pro);
+    assert(resCHuge.find("10^") != std::string::npos && (resCHuge.find("600") != std::string::npos || resCHuge.find("599") != std::string::npos || resCHuge.find("601") != std::string::npos));
+
+    // Huge scientific functions
+    Expression cbrtBig;
+    insertFromText(cbrtBig, "cbrt(10^600)");
+    assert(evaluateProToString(cbrtBig.root.get(), pro) == "10^200");
+
+    Expression log2Big;
+    insertFromText(log2Big, "log2(10^400)");
+    std::string resLog2 = evaluateProToString(log2Big.root.get(), pro);
+    assert(resLog2.find("1328.") == 0); // 400 * log2(10) ~ 1328.77
+
+    // Modulo in big mode
+    Expression modBig;
+    insertFromText(modBig, "100%7");
+    assert(evaluateProToString(modBig.root.get(), pro) == "2");
+}
+
+static void testCombinatoricsNavigationAndEditing() {
+    Expression expr;
+    insertDigit(expr, '5');
+    insertPermutation(expr);
+    insertDigit(expr, '3');
+    // Root has Permutation. Cursor is in b (subscript) at index 1.
+    assert(expr.toPlainString() == "⁵P₃");
+    // Move left into subscript
+    moveLeft(expr);
+    assert(expr.cursor.row == expr.root->items[0]->b.get());
+    assert(expr.cursor.index == 0);
+    // Move left out of subscript into superscript a
+    moveLeft(expr);
+    assert(expr.cursor.row == expr.root->items[0]->a.get());
+    assert(expr.cursor.index == 1);
+    // Move right into subscript
+    moveRight(expr);
+    assert(expr.cursor.row == expr.root->items[0]->b.get());
+    assert(expr.cursor.index == 0);
+    // Move down or up
+    moveUp(expr);
+    assert(expr.cursor.row == expr.root->items[0]->a.get());
+    moveDown(expr);
+    assert(expr.cursor.row == expr.root->items[0]->b.get());
+}
+
 int main() {
     testVariableEvaluation();
     testSingleVariableEquation();
@@ -625,9 +827,13 @@ int main() {
     testSciBigMode();
     testFactorials();
     testStandaloneClosingParen();
-        testCloseParenExitsNestedStructure();
-        testClickPlacesStructuralCursor();
+    testCloseParenExitsNestedStructure();
+    testClickPlacesStructuralCursor();
     testPowerEditing();
+    testCombinatoricsTypingAndEvaluation();
+    testAllScientificFunctions();
+    testBigCombinatoricsAndFunctions();
+    testCombinatoricsNavigationAndEditing();
     std::cout << "All calculator edge-case tests passed\n";
     return 0;
 }

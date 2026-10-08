@@ -23,13 +23,44 @@ const char* sciFunctionName(int id) {
         case SciAsin: return "asin";
         case SciAcos: return "acos";
         case SciAtan: return "atan";
+        case SciSec: return "sec";
+        case SciCsc: return "csc";
+        case SciCot: return "cot";
+        case SciAsec: return "asec";
+        case SciAcsc: return "acsc";
+        case SciAcot: return "acot";
         case SciSinh: return "sinh";
         case SciCosh: return "cosh";
         case SciTanh: return "tanh";
+        case SciAsinh: return "asinh";
+        case SciAcosh: return "acosh";
+        case SciAtanh: return "atanh";
+        case SciSech: return "sech";
+        case SciCsch: return "csch";
+        case SciCoth: return "coth";
+        case SciAsech: return "asech";
+        case SciAcsch: return "acsch";
+        case SciAcoth: return "acoth";
         case SciLn: return "ln";
         case SciLog: return "log";
+        case SciLog2: return "log2";
         case SciExp: return "exp";
+        case SciExpm1: return "expm1";
+        case SciLog1p: return "log1p";
+        case SciCbrt: return "cbrt";
         case SciAbs: return "abs";
+        case SciFloor: return "floor";
+        case SciCeil: return "ceil";
+        case SciRound: return "round";
+        case SciTrunc: return "trunc";
+        case SciSgn: return "sgn";
+        case SciGamma: return "gamma";
+        case SciLgamma: return "lgamma";
+        case SciErf: return "erf";
+        case SciErfc: return "erfc";
+        case SciFact: return "fact";
+        case SciDeg: return "deg";
+        case SciRad: return "rad";
     }
     return "?";
 }
@@ -38,10 +69,36 @@ bool findSciFunction(const std::string& lowerNameIn, int& id) {
     for (int f = 0; f < SciFunctionCount; ++f) {
         if (lowerNameIn == sciFunctionName(f)) { id = f; return true; }
     }
+    // Aliases
+    if (lowerNameIn == "arcsin") { id = SciAsin; return true; }
+    if (lowerNameIn == "arccos") { id = SciAcos; return true; }
+    if (lowerNameIn == "arctan") { id = SciAtan; return true; }
+    if (lowerNameIn == "cosec") { id = SciCsc; return true; }
+    if (lowerNameIn == "arcsec") { id = SciAsec; return true; }
+    if (lowerNameIn == "arccsc" || lowerNameIn == "arccosec") { id = SciAcsc; return true; }
+    if (lowerNameIn == "arccot") { id = SciAcot; return true; }
+    if (lowerNameIn == "arcsinh") { id = SciAsinh; return true; }
+    if (lowerNameIn == "arccosh") { id = SciAcosh; return true; }
+    if (lowerNameIn == "arctanh") { id = SciAtanh; return true; }
+    if (lowerNameIn == "arcsech") { id = SciAsech; return true; }
+    if (lowerNameIn == "arccsch") { id = SciAcsch; return true; }
+    if (lowerNameIn == "arccoth") { id = SciAcoth; return true; }
+    if (lowerNameIn == "log10") { id = SciLog; return true; }
+    if (lowerNameIn == "ceiling") { id = SciCeil; return true; }
+    if (lowerNameIn == "sign" || lowerNameIn == "signum") { id = SciSgn; return true; }
+    if (lowerNameIn == "lngamma") { id = SciLgamma; return true; }
+    if (lowerNameIn == "factorial") { id = SciFact; return true; }
+    if (lowerNameIn == "degrees" || lowerNameIn == "todeg") { id = SciDeg; return true; }
+    if (lowerNameIn == "radians" || lowerNameIn == "torad") { id = SciRad; return true; }
     return false;
 }
 
 bool rowIsEmpty(const Row* r) { return r == nullptr || r->items.empty(); }
+
+static bool isTwoRowStructure(ItemType t) {
+    return t == ItemType::Fraction || t == ItemType::Power ||
+           t == ItemType::Permutation || t == ItemType::Combination;
+}
 
 bool hasEquals(const Row* r) {
     if (!r) return false;
@@ -118,6 +175,46 @@ Expression::Expression() {
     cursor.index = 0;
 }
 
+static std::string toSuperscriptString(const std::string& text) {
+    std::string out;
+    for (char c : text) {
+        switch (c) {
+            case '0': out += "\xE2\x81\xB0"; break;
+            case '1': out += "\xC2\xB9"; break;
+            case '2': out += "\xC2\xB2"; break;
+            case '3': out += "\xC2\xB3"; break;
+            case '4': out += "\xE2\x81\xB4"; break;
+            case '5': out += "\xE2\x81\xB5"; break;
+            case '6': out += "\xE2\x81\xB6"; break;
+            case '7': out += "\xE2\x81\xB7"; break;
+            case '8': out += "\xE2\x81\xB8"; break;
+            case '9': out += "\xE2\x81\xB9"; break;
+            default: out += c; break;
+        }
+    }
+    return out;
+}
+
+static std::string toSubscriptString(const std::string& text) {
+    std::string out;
+    for (char c : text) {
+        if (c >= '0' && c <= '9') {
+            out += "\xE2\x82";
+            out += (char)(0x80 + (c - '0'));
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
+static bool isSimpleNumberRow(const Row* r, std::string& num) {
+    if (!r || r->items.size() != 1 || r->items[0]->type != ItemType::Number) return false;
+    num = r->items[0]->numText;
+    for (char c : num) if (c < '0' || c > '9') return false;
+    return !num.empty();
+}
+
 static void serializeRow(const Row* r, std::string& out);
 
 static void serializeItem(const Item* it, std::string& out) {
@@ -167,7 +264,9 @@ static void serializeItem(const Item* it, std::string& out) {
             out += it->nameText;
             break;
         case ItemType::Constant:
-            out += (it->constantName == 'p') ? "pi" : "e";
+            if (it->constantName == 'p') out += "pi";
+            else if (it->constantName == 'f') out += "phi";
+            else out += "e";
             break;
         case ItemType::Function:
             out += sciFunctionName(it->functionId);
@@ -175,6 +274,25 @@ static void serializeItem(const Item* it, std::string& out) {
             serializeRow(it->a.get(), out);
             out += ')';
             break;
+        case ItemType::Permutation:
+        case ItemType::Combination: {
+            char opLetter = (it->type == ItemType::Permutation) ? 'P' : 'C';
+            std::string nStr, rStr;
+            if (isSimpleNumberRow(it->a.get(), nStr) && isSimpleNumberRow(it->b.get(), rStr)) {
+                out += toSuperscriptString(nStr);
+                out += opLetter;
+                out += toSubscriptString(rStr);
+            } else {
+                out += '(';
+                serializeRow(it->a.get(), out);
+                out += ')';
+                out += opLetter;
+                out += '(';
+                serializeRow(it->b.get(), out);
+                out += ')';
+            }
+            break;
+        }
     }
 }
 
@@ -383,6 +501,68 @@ void insertPower(Expression& expr) {
     expr.cursor.index = 0;
 }
 
+void insertPermutation(Expression& expr) {
+    if (isBRow(expr.cursor.row) && expr.cursor.row->owner &&
+        (expr.cursor.row->owner->type == ItemType::Power ||
+         expr.cursor.row->owner->type == ItemType::Permutation ||
+         expr.cursor.row->owner->type == ItemType::Combination) &&
+        expr.cursor.index == (int)expr.cursor.row->items.size()) {
+        moveRight(expr);
+    }
+    Row* row = expr.cursor.row;
+    int insertPos = expr.cursor.index;
+
+    auto pItem = std::make_unique<Item>(ItemType::Permutation);
+    Item* pPtr = pItem.get();
+
+    std::unique_ptr<Item> consumed = consumeLeftAtom(expr);
+    insertPos = expr.cursor.index;
+
+    attachRow(pItem->a, pPtr, row);
+    attachRow(pItem->b, pPtr, row);
+    if (consumed) {
+        reparentItemChildren(consumed.get(), pItem->a.get());
+        pItem->a->items.push_back(std::move(consumed));
+    }
+
+    row->items.insert(row->items.begin() + insertPos, std::move(pItem));
+
+    // cursor -> start of subscript r
+    expr.cursor.row = pPtr->b.get();
+    expr.cursor.index = 0;
+}
+
+void insertCombination(Expression& expr) {
+    if (isBRow(expr.cursor.row) && expr.cursor.row->owner &&
+        (expr.cursor.row->owner->type == ItemType::Power ||
+         expr.cursor.row->owner->type == ItemType::Permutation ||
+         expr.cursor.row->owner->type == ItemType::Combination) &&
+        expr.cursor.index == (int)expr.cursor.row->items.size()) {
+        moveRight(expr);
+    }
+    Row* row = expr.cursor.row;
+    int insertPos = expr.cursor.index;
+
+    auto cItem = std::make_unique<Item>(ItemType::Combination);
+    Item* cPtr = cItem.get();
+
+    std::unique_ptr<Item> consumed = consumeLeftAtom(expr);
+    insertPos = expr.cursor.index;
+
+    attachRow(cItem->a, cPtr, row);
+    attachRow(cItem->b, cPtr, row);
+    if (consumed) {
+        reparentItemChildren(consumed.get(), cItem->a.get());
+        cItem->a->items.push_back(std::move(consumed));
+    }
+
+    row->items.insert(row->items.begin() + insertPos, std::move(cItem));
+
+    // cursor -> start of subscript r
+    expr.cursor.row = cPtr->b.get();
+    expr.cursor.index = 0;
+}
+
 void insertSqrt(Expression& expr) {
     Row* row = expr.cursor.row;
     int idx = expr.cursor.index;
@@ -468,6 +648,8 @@ void moveLeft(Expression& expr) {
                 return;
             case ItemType::Fraction:
             case ItemType::Power:
+            case ItemType::Permutation:
+            case ItemType::Combination:
                 // Entering a closed fraction/power from the right lands
                 // in its rightmost row -- the denominator/exponent --
                 // not the numerator/base. This mirrors how the caret
@@ -495,8 +677,7 @@ void moveLeft(Expression& expr) {
         // whole structure -- otherwise the numerator would be completely
         // unreachable by arrow keys once you'd arrowed into the
         // denominator.
-        if (isBRow(row) &&
-            (row->owner->type == ItemType::Fraction || row->owner->type == ItemType::Power)) {
+        if (isBRow(row) && isTwoRowStructure(row->owner->type)) {
             Row* a = row->owner->a.get();
             expr.cursor.row = a;
             expr.cursor.index = (int)a->items.size();
@@ -529,6 +710,8 @@ void moveRight(Expression& expr) {
                 return;
             case ItemType::Fraction:
             case ItemType::Power:
+            case ItemType::Permutation:
+            case ItemType::Combination:
             case ItemType::Paren:
             case ItemType::Sqrt:
             case ItemType::Function:
@@ -544,8 +727,7 @@ void moveRight(Expression& expr) {
         // start of its sibling denominator/exponent, instead of exiting
         // the whole structure -- otherwise the denominator would be
         // completely unreachable by arrow keys.
-        if (isARow(row) &&
-            (row->owner->type == ItemType::Fraction || row->owner->type == ItemType::Power)) {
+        if (isARow(row) && isTwoRowStructure(row->owner->type)) {
             Row* b = row->owner->b.get();
             expr.cursor.row = b;
             expr.cursor.index = 0;
@@ -583,8 +765,7 @@ bool moveUp(Expression& expr) {
 // Mirror of moveUp: returns true if the cursor moved.
 bool moveDown(Expression& expr) {
     Row* row = expr.cursor.row;
-    if (isARow(row) && row->owner &&
-        (row->owner->type == ItemType::Fraction || row->owner->type == ItemType::Power)) {
+    if (isARow(row) && row->owner && isTwoRowStructure(row->owner->type)) {
         Item* owner = row->owner;
         Row* target = owner->b.get();
         expr.cursor.row = target;
@@ -631,8 +812,7 @@ void backspace(Expression& expr) {
         // row is the item's primary row (numerator/base for Fraction/
         // Power, or the sole inner/radicand row for Paren/Sqrt), and the
         // cursor sits at its very start.
-        bool siblingHasContent = (ownerItem->type == ItemType::Fraction ||
-                                   ownerItem->type == ItemType::Power) &&
+        bool siblingHasContent = isTwoRowStructure(ownerItem->type) &&
                                   !rowIsEmpty(ownerItem->b.get());
 
         if (rowIsEmpty(row)) {
@@ -694,7 +874,7 @@ void backspace(Expression& expr) {
 
     // Structural neighbor.
     bool aEmpty = rowIsEmpty(target->a.get());
-    bool bEmpty = (target->type == ItemType::Fraction || target->type == ItemType::Power)
+    bool bEmpty = isTwoRowStructure(target->type)
                       ? rowIsEmpty(target->b.get())
                       : true;
     if (aEmpty && bEmpty) {
@@ -705,7 +885,7 @@ void backspace(Expression& expr) {
 
     // Non-empty structure: first backspace "enters" it (lands at the end
     // of its rightmost row) rather than deleting its contents outright.
-    Row* enter = (target->type == ItemType::Fraction || target->type == ItemType::Power)
+    Row* enter = isTwoRowStructure(target->type)
                      ? target->b.get()
                      : target->a.get();
     expr.cursor.row = enter;
@@ -740,8 +920,7 @@ void doDelete(Expression& expr) {
             return;
         }
 
-        if (isARow(row) &&
-            (ownerItem->type == ItemType::Fraction || ownerItem->type == ItemType::Power)) {
+        if (isARow(row) && isTwoRowStructure(ownerItem->type)) {
             // Delete at the very end of numerator/base steps forward into
             // the start of denominator/exponent.
             Row* b = ownerItem->b.get();
@@ -792,7 +971,7 @@ void doDelete(Expression& expr) {
     }
 
     bool aEmpty = rowIsEmpty(target->a.get());
-    bool bEmpty = (target->type == ItemType::Fraction || target->type == ItemType::Power)
+    bool bEmpty = isTwoRowStructure(target->type)
                       ? rowIsEmpty(target->b.get())
                       : true;
     if (aEmpty && bEmpty) {
@@ -824,7 +1003,7 @@ void insertFunction(Expression& expr, int functionId) {
 }
 
 void insertConstant(Expression& expr, char which) {
-    if (which != 'p' && which != 'e') return;
+    if (which != 'p' && which != 'e' && which != 'f') return;
     Row* row = expr.cursor.row;
     int idx = expr.cursor.index;
     auto item = std::make_unique<Item>(ItemType::Constant);
@@ -898,6 +1077,9 @@ static bool normalizeRowNames(Expression& expr, Row* row) {
         if (lower == "pi") {
             it->type = ItemType::Constant; it->constantName = 'p'; it->nameText.clear();
             changed = true;
+        } else if (lower == "phi") {
+            it->type = ItemType::Constant; it->constantName = 'f'; it->nameText.clear();
+            changed = true;
         } else if (lower == "e") {
             it->type = ItemType::Constant; it->constantName = 'e'; it->nameText.clear();
             changed = true;
@@ -907,6 +1089,45 @@ static bool normalizeRowNames(Expression& expr, Row* row) {
         } else if (lower == "y") {
             it->type = ItemType::Variable; it->variableName = 'y'; it->nameText.clear();
             changed = true;
+        }
+    }
+
+    // Permutation & Combination conversion: [Atom N] [Name "p"|"P"|"npr"|"c"|"C"|"ncr"] [Atom R]
+    for (size_t i = 0; i < row->items.size(); ++i) {
+        if (row->items[i]->type != ItemType::Name) continue;
+        const std::string lower = lowerName(row->items[i]->nameText);
+        bool isP = (lower == "p" || lower == "npr");
+        bool isC = (lower == "c" || lower == "ncr");
+        if ((isP || isC) && i > 0 && i + 1 < row->items.size()) {
+            Item* prev = row->items[i - 1].get();
+            Item* next = row->items[i + 1].get();
+            bool prevOk = prev && prev->type != ItemType::Operator && prev->type != ItemType::Equals && prev->type != ItemType::Name;
+            bool nextOk = next && next->type != ItemType::Operator && next->type != ItemType::Equals;
+            if (prevOk && nextOk) {
+                auto combItem = std::make_unique<Item>(isP ? ItemType::Permutation : ItemType::Combination);
+                Item* combPtr = combItem.get();
+                attachRow(combItem->a, combPtr, row);
+                attachRow(combItem->b, combPtr, row);
+                reparentItemChildren(prev, combItem->a.get());
+                combItem->a->items.push_back(std::move(row->items[i - 1]));
+                reparentItemChildren(next, combItem->b.get());
+                combItem->b->items.push_back(std::move(row->items[i + 1]));
+
+                if (expr.cursor.row == row) {
+                    if (expr.cursor.index == (int)(i + 1) || expr.cursor.index == (int)(i + 2)) {
+                        expr.cursor.row = combPtr->b.get();
+                        expr.cursor.index = (int)combPtr->b->items.size();
+                    } else if (expr.cursor.index > (int)(i + 1)) {
+                        expr.cursor.index -= 2;
+                    }
+                }
+                row->items[i - 1] = std::move(combItem);
+                row->items.erase(row->items.begin() + i + 1); // remove next
+                row->items.erase(row->items.begin() + i);     // remove Name
+                changed = true;
+                --i;
+                continue;
+            }
         }
     }
     return changed;
@@ -928,24 +1149,49 @@ void normalizeNames(Expression& expr) {
         expr.cursor.index = std::clamp(expr.cursor.index, 0, (int)expr.cursor.row->items.size());
 }
 
-// Longest function/constant name matching at run[k..]; returns match length
-// (0 = none). sqrt is matched here too even though it builds a Sqrt item.
-static size_t matchNameToken(const std::string& run, size_t k, int& functionId, bool& isSqrt,
-                             bool& isPi) {
-    functionId = -1; isSqrt = false; isPi = false;
+static bool startsWithCaseInsensitive(const std::string& text, size_t k, const char* prefix, size_t len) {
+    if (text.size() - k < len) return false;
+    for (size_t i = 0; i < len; ++i) {
+        if (lowerChar(text[k + i]) != lowerChar(prefix[i])) return false;
+    }
+    return true;
+}
+
+static size_t matchNameToken(const std::string& text, size_t k, int& functionId, bool& isSqrt,
+                             bool& isPi, bool& isPhi) {
+    functionId = -1; isSqrt = false; isPi = false; isPhi = false;
     size_t best = 0;
     for (int f = 0; f < SciFunctionCount; ++f) {
         const char* name = sciFunctionName(f);
-        size_t len = std::char_traits<char>::length(name);
-        if (len > best && run.size() - k >= len && run.compare(k, len, name) == 0) {
-            best = len; functionId = f; isSqrt = false; isPi = false;
+        size_t len = std::strlen(name);
+        if (len > best && startsWithCaseInsensitive(text, k, name, len)) {
+            best = len; functionId = f; isSqrt = false; isPi = false; isPhi = false;
         }
     }
-    if (4 > best && run.size() - k >= 4 && run.compare(k, 4, "sqrt") == 0) {
-        best = 4; functionId = -1; isSqrt = true; isPi = false;
+    static const struct { const char* alias; int id; } kAliases[] = {
+        { "arcsin", SciAsin }, { "arccos", SciAcos }, { "arctan", SciAtan },
+        { "cosec", SciCsc }, { "arcsec", SciAsec }, { "arccsc", SciAcsc }, { "arccosec", SciAcsc },
+        { "arccot", SciAcot }, { "arcsinh", SciAsinh }, { "arccosh", SciAcosh },
+        { "arctanh", SciAtanh }, { "arcsech", SciAsech }, { "arccsch", SciAcsch },
+        { "arccoth", SciAcoth }, { "log10", SciLog }, { "ceiling", SciCeil },
+        { "signum", SciSgn }, { "sign", SciSgn }, { "lngamma", SciLgamma },
+        { "factorial", SciFact }, { "degrees", SciDeg }, { "todeg", SciDeg },
+        { "radians", SciRad }, { "torad", SciRad }
+    };
+    for (const auto& a : kAliases) {
+        size_t len = std::strlen(a.alias);
+        if (len > best && startsWithCaseInsensitive(text, k, a.alias, len)) {
+            best = len; functionId = a.id; isSqrt = false; isPi = false; isPhi = false;
+        }
     }
-    if (2 > best && run.size() - k >= 2 && run.compare(k, 2, "pi") == 0) {
-        best = 2; functionId = -1; isSqrt = false; isPi = true;
+    if (4 > best && startsWithCaseInsensitive(text, k, "sqrt", 4)) {
+        best = 4; functionId = -1; isSqrt = true; isPi = false; isPhi = false;
+    }
+    if (2 > best && startsWithCaseInsensitive(text, k, "pi", 2)) {
+        best = 2; functionId = -1; isSqrt = false; isPi = true; isPhi = false;
+    }
+    if (3 > best && startsWithCaseInsensitive(text, k, "phi", 3)) {
+        best = 3; functionId = -1; isSqrt = false; isPi = false; isPhi = true;
     }
     return best;
 }
@@ -953,56 +1199,104 @@ static size_t matchNameToken(const std::string& run, size_t k, int& functionId, 
 void insertFromText(Expression& expr, const std::string& text) {
     size_t i = 0;
     while (i < text.size()) {
+        // UTF-8 superscript digits:
+        // ¹ (\xC2\xB9), ² (\xC2\xB2), ³ (\xC2\xB3)
+        if (i + 1 < text.size() && (unsigned char)text[i] == 0xC2) {
+            unsigned char b2 = (unsigned char)text[i + 1];
+            if (b2 == 0xB9) { insertDigit(expr, '1'); i += 2; continue; }
+            if (b2 == 0xB2) { insertDigit(expr, '2'); i += 2; continue; }
+            if (b2 == 0xB3) { insertDigit(expr, '3'); i += 2; continue; }
+        }
+        // ⁰ (\xE2\x81\xB0) through ⁹ (\xE2\x81\xB9)
+        if (i + 2 < text.size() && (unsigned char)text[i] == 0xE2 &&
+            (unsigned char)text[i + 1] == 0x81) {
+            unsigned char b3 = (unsigned char)text[i + 2];
+            if (b3 == 0xB0) { insertDigit(expr, '0'); i += 3; continue; }
+            if (b3 >= 0xB4 && b3 <= 0xB9) {
+                insertDigit(expr, (char)('4' + (b3 - 0xB4)));
+                i += 3;
+                continue;
+            }
+        }
+        // UTF-8 subscript digits: ₀ (\xE2\x82\x80) through ₉ (\xE2\x82\x89)
+        if (i + 2 < text.size() && (unsigned char)text[i] == 0xE2 &&
+            (unsigned char)text[i + 1] == 0x82) {
+            unsigned char b3 = (unsigned char)text[i + 2];
+            if (b3 >= 0x80 && b3 <= 0x89) {
+                insertDigit(expr, (char)('0' + (b3 - 0x80)));
+                i += 3;
+                continue;
+            }
+        }
+        // UTF-8 π (\xCF\x80) and φ (\xCF\x86)
+        if (i + 1 < text.size() && (unsigned char)text[i] == 0xCF) {
+            unsigned char b2 = (unsigned char)text[i + 1];
+            if (b2 == 0x80) { insertConstant(expr, 'p'); i += 2; continue; }
+            if (b2 == 0x86) { insertConstant(expr, 'f'); i += 2; continue; }
+        }
+
         char c = text[i];
         if ((c >= '0' && c <= '9') || c == '.') { insertDigit(expr, c); ++i; continue; }
-        if (c == '+' || c == '-' || c == '*' || c == '!') { insertOperator(expr, c); ++i; continue; }
+        if (c == '+' || c == '-' || c == '*' || c == '!' || c == '%') { insertOperator(expr, c); ++i; continue; }
         if (c == '/') { insertFraction(expr); ++i; continue; }
         if (c == '=') { insertEquals(expr); ++i; continue; }
         if (c == '(') { insertOpenParen(expr); ++i; continue; }
         if (c == ')') { insertCloseParen(expr); ++i; continue; }
         if (c == '^') { insertPower(expr); ++i; continue; }
 
-        if (lowerChar(c) >= 'a' && lowerChar(c) <= 'z') {
-            size_t j = i;
-            while (j < text.size() &&
-                   ((lowerChar(text[j]) >= 'a' && lowerChar(text[j]) <= 'z')))
-                ++j;
-            std::string run = lowerName(text.substr(i, j - i));
-            bool functionOpen = false;
-            size_t k = 0;
-            while (k < run.size()) {
-                int functionId = -1;
-                bool isSqrt = false, isPi = false;
-                size_t len = matchNameToken(run, k, functionId, isSqrt, isPi);
-                if (len > 0) {
-                    if (isPi) {
-                        insertConstant(expr, 'p');
-                    } else if (isSqrt) {
-                        insertSqrt(expr);
-                        functionOpen = true; // the '(' in the text is consumed
-                    } else {
-                        insertFunction(expr, functionId);
-                        functionOpen = true;
-                    }
-                    k += len;
-                    continue;
-                }
-                char letter = run[k];
-                if (letter == 'x' || letter == 'y') {
-                    insertVariable(expr, letter);
-                } else if (letter == 'e') {
-                    insertConstant(expr, 'e');
-                }
-                // anything else in an unrecognized word is dropped
-                ++k;
+        int functionId = -1;
+        bool isSqrt = false, isPi = false, isPhi = false;
+        size_t fnLen = matchNameToken(text, i, functionId, isSqrt, isPi, isPhi);
+        if (fnLen > 0) {
+            if (isPi) {
+                insertConstant(expr, 'p');
+            } else if (isPhi) {
+                insertConstant(expr, 'f');
+            } else if (isSqrt) {
+                insertSqrt(expr);
+                if (i + fnLen < text.size() && text[i + fnLen] == '(') fnLen++;
+            } else {
+                insertFunction(expr, functionId);
+                if (i + fnLen < text.size() && text[i + fnLen] == '(') fnLen++;
             }
-            // The '(' right after a word that opened a call belongs to it.
-            if (functionOpen && j < text.size() && text[j] == '(')
-                ++j;
-            i = j;
+            i += fnLen;
             continue;
         }
-        ++i; // unknown characters are dropped, as before
+
+        if (startsWithCaseInsensitive(text, i, "npr", 3)) {
+            insertPermutation(expr);
+            i += 3;
+            continue;
+        }
+        if (startsWithCaseInsensitive(text, i, "ncr", 3)) {
+            insertCombination(expr);
+            i += 3;
+            continue;
+        }
+
+        char lc = lowerChar(c);
+        if (lc == 'x' || lc == 'y') {
+            insertVariable(expr, lc);
+            ++i;
+            continue;
+        }
+        if (lc == 'e') {
+            insertConstant(expr, 'e');
+            ++i;
+            continue;
+        }
+        if (lc == 'p') {
+            insertPermutation(expr);
+            ++i;
+            continue;
+        }
+        if (lc == 'c') {
+            insertCombination(expr);
+            ++i;
+            continue;
+        }
+
+        ++i; // unknown character dropped
     }
     normalizeNames(expr);
 }

@@ -176,6 +176,7 @@ const wchar_t* opGlyph(char c) {
         case '+': return L" + ";
         case '-': return L" \u2212 ";
         case '*': return L" \u00D7 ";
+        case '%': return L" % ";
         case '!': return L"!";
         default: return L" ";
     }
@@ -302,7 +303,34 @@ Size measureItemImpl(HDC hdc, const Item* it, int depth) {
                 GetTextExtentPoint32W(hdc, L"\u03C0", 1, &sz);
                 SelectObject(hdc, old);
                 s.width = sz.cx;
+            } else if (it->constantName == 'f') {
+                HFONT f = fontForDepth(depth);
+                HFONT old = (HFONT)SelectObject(hdc, f);
+                SIZE sz{};
+                GetTextExtentPoint32W(hdc, L"\u03C6", 1, &sz);
+                SelectObject(hdc, old);
+                s.width = sz.cx;
             }
+            return s;
+        }
+        case ItemType::Permutation:
+        case ItemType::Combination: {
+            Size nSize = measureRowImpl(hdc, it->a.get(), depth + 1);
+            Size rSize = measureRowImpl(hdc, it->b.get(), depth + 1);
+            const wchar_t* glyph = (it->type == ItemType::Permutation) ? L"P" : L"C";
+            HFONT f = fontForDepth(depth);
+            HFONT old = (HFONT)SelectObject(hdc, f);
+            SIZE opSz{};
+            GetTextExtentPoint32W(hdc, glyph, 1, &opSz);
+            SelectObject(hdc, old);
+            TEXTMETRICW tm = textMetricsForDepth(hdc, depth);
+            int raise = (int)(tm.tmAscent * 0.45);
+            int drop = (int)(tm.tmDescent * 0.5) + scaledPx(3, depth);
+            int pad = scaledPx(1, depth);
+            Size s;
+            s.width = nSize.width + pad + opSz.cx + pad + rSize.width;
+            s.ascent = std::max((int)tm.tmAscent, raise + nSize.ascent);
+            s.descent = std::max((int)tm.tmDescent, drop + rSize.descent);
             return s;
         }
         case ItemType::Function: {
@@ -402,8 +430,32 @@ void drawItemImpl(HDC hdc, const Item* it, int depth, int x, int baselineY,
         }
         case ItemType::Constant:
             drawText(hdc, depth, x, baselineY,
-                     it->constantName == 'p' ? L"\u03C0" : L"e", theme.operatorColor);
+                     it->constantName == 'p' ? L"\u03C0" : (it->constantName == 'f' ? L"\u03C6" : L"e"), theme.operatorColor);
             return;
+        case ItemType::Permutation:
+        case ItemType::Combination: {
+            Size nSize = measureRowImpl(hdc, it->a.get(), depth + 1);
+            const wchar_t* glyph = (it->type == ItemType::Permutation) ? L"P" : L"C";
+            HFONT f = fontForDepth(depth);
+            HFONT old = (HFONT)SelectObject(hdc, f);
+            SIZE opSz{};
+            GetTextExtentPoint32W(hdc, glyph, 1, &opSz);
+            SelectObject(hdc, old);
+            TEXTMETRICW tm = textMetricsForDepth(hdc, depth);
+            int raise = (int)(tm.tmAscent * 0.45);
+            int drop = (int)(tm.tmDescent * 0.5) + scaledPx(3, depth);
+            int pad = scaledPx(1, depth);
+
+            // Draw superscript n
+            drawRowImpl(hdc, it->a.get(), depth + 1, x, baselineY - raise, theme, cursor, outCaret);
+            // Draw central P/C
+            int opX = x + nSize.width + pad;
+            drawText(hdc, depth, opX, baselineY, glyph, theme.operatorColor);
+            // Draw subscript r
+            int rX = opX + opSz.cx + pad;
+            drawRowImpl(hdc, it->b.get(), depth + 1, rX, baselineY + drop, theme, cursor, outCaret);
+            return;
+        }
         case ItemType::Function: {
             Size inner = measureRowImpl(hdc, it->a.get(), depth);
             int glyphW = measureParenWidth(hdc, depth, inner.height());
@@ -561,6 +613,27 @@ void findItemHit(HDC hdc, Row* parent, int index, Item* item, int depth,
             findRowHit(hdc, item->a.get(), depth, x, baselineY,
                        pointX, pointY, best);
             findRowHit(hdc, item->b.get(), depth + 1, expX, expBaseline,
+                       pointX, pointY, best);
+            return;
+        }
+        case ItemType::Permutation:
+        case ItemType::Combination: {
+            Size nSize = measureRowImpl(hdc, item->a.get(), depth + 1);
+            const wchar_t* glyph = (item->type == ItemType::Permutation) ? L"P" : L"C";
+            HFONT f = fontForDepth(depth);
+            HFONT old = (HFONT)SelectObject(hdc, f);
+            SIZE opSz{};
+            GetTextExtentPoint32W(hdc, glyph, 1, &opSz);
+            SelectObject(hdc, old);
+            TEXTMETRICW tm = textMetricsForDepth(hdc, depth);
+            int raise = (int)(tm.tmAscent * 0.45);
+            int drop = (int)(tm.tmDescent * 0.5) + scaledPx(3, depth);
+            int pad = scaledPx(1, depth);
+            int opX = x + nSize.width + pad;
+            int rX = opX + opSz.cx + pad;
+            findRowHit(hdc, item->a.get(), depth + 1, x, baselineY - raise,
+                       pointX, pointY, best);
+            findRowHit(hdc, item->b.get(), depth + 1, rX, baselineY + drop,
                        pointX, pointY, best);
             return;
         }
