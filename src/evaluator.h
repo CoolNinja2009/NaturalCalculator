@@ -31,6 +31,10 @@ struct EvaluationContext {
 	// whose factorial exceeds double range) are evaluated in base-10
 	// logarithm space and rendered as "m * 10^e" instead of erroring.
 	bool bigNumbers = false;
+	// Angle unit for trig input and inverse-trig output. Degrees is the
+	// default, matching the Casio/Windows-calculator convention this app
+	// follows; the Pro Max UI chip toggles it.
+	bool degrees = true;
 };
 
 // Evaluate the whole expression. Throws std::runtime_error on error.

@@ -150,6 +150,27 @@ Size measureVariable(HDC hdc, const Item* it, int depth) {
     return measureNumber(hdc, &display, depth);
 }
 
+Size measureNameText(HDC hdc, const std::string& text, int depth) {
+    HFONT f = fontForDepth(depth);
+    HFONT old = (HFONT)SelectObject(hdc, f);
+    SIZE sz{};
+    std::wstring w(text.begin(), text.end());
+    if (w.empty()) w = L"?";
+    GetTextExtentPoint32W(hdc, w.c_str(), (int)w.size(), &sz);
+    SelectObject(hdc, old);
+    TEXTMETRICW tm = textMetricsForDepth(hdc, depth);
+    return { sz.cx, tm.tmAscent, tm.tmDescent };
+}
+
+std::wstring functionNameGlyph(const Item* it) {
+    const char* name = sciFunctionName(it->functionId);
+    return std::wstring(name, name + std::char_traits<char>::length(name));
+}
+
+Size measureFunctionName(HDC hdc, const Item* it, int depth) {
+    return measureNameText(hdc, sciFunctionName(it->functionId), depth);
+}
+
 const wchar_t* opGlyph(char c) {
     switch (c) {
         case '+': return L" + ";
@@ -269,6 +290,33 @@ Size measureItemImpl(HDC hdc, const Item* it, int depth) {
             s.descent = inner.descent;
             return s;
         }
+        case ItemType::Name:
+            return measureNameText(hdc, it->nameText, depth);
+        case ItemType::Constant: {
+            Size s = measureNameText(hdc, "e", depth);
+            if (it->constantName == 'p') {
+                // pi renders as the Greek glyph; same metrics, wider glyph.
+                HFONT f = fontForDepth(depth);
+                HFONT old = (HFONT)SelectObject(hdc, f);
+                SIZE sz{};
+                GetTextExtentPoint32W(hdc, L"\u03C0", 1, &sz);
+                SelectObject(hdc, old);
+                s.width = sz.cx;
+            }
+            return s;
+        }
+        case ItemType::Function: {
+            // "sin" + tall paren-wrapped argument, like a Paren with a name.
+            Size inner = measureRowImpl(hdc, it->a.get(), depth);
+            int glyphW = measureParenWidth(hdc, depth, inner.height());
+            Size name = measureFunctionName(hdc, it, depth);
+            int gap = scaledPx(2, depth);
+            Size s;
+            s.width = name.width + gap + inner.width + 2 * glyphW;
+            s.ascent = std::max(inner.ascent + scaledPx(2, depth), name.ascent);
+            s.descent = std::max(inner.descent + scaledPx(2, depth), name.descent);
+            return s;
+        }
     }
     return Size{};
 }
@@ -345,6 +393,35 @@ void drawItemImpl(HDC hdc, const Item* it, int depth, int x, int baselineY,
             return;
         case ItemType::Operator: {
             drawText(hdc, depth, x, baselineY, opGlyph(it->opChar), theme.operatorColor);
+            return;
+        }
+        case ItemType::Name: {
+            std::wstring w(it->nameText.begin(), it->nameText.end());
+            drawText(hdc, depth, x, baselineY, w.empty() ? std::wstring(L"?") : w, theme.text);
+            return;
+        }
+        case ItemType::Constant:
+            drawText(hdc, depth, x, baselineY,
+                     it->constantName == 'p' ? L"\u03C0" : L"e", theme.operatorColor);
+            return;
+        case ItemType::Function: {
+            Size inner = measureRowImpl(hdc, it->a.get(), depth);
+            int glyphW = measureParenWidth(hdc, depth, inner.height());
+            Size name = measureFunctionName(hdc, it, depth);
+            int gap = scaledPx(2, depth);
+            drawText(hdc, depth, x, baselineY, functionNameGlyph(it), theme.operatorColor);
+            int px = x + name.width + gap;
+            HFONT parenFont = createParenFont(depth, inner.height());
+            HFONT oldFont = (HFONT)SelectObject(hdc, parenFont);
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, theme.text);
+            TEXTMETRICW metrics{};
+            GetTextMetricsW(hdc, &metrics);
+            TextOutW(hdc, px, baselineY - metrics.tmAscent, L"(", 1);
+            drawRowImpl(hdc, it->a.get(), depth, px + glyphW, baselineY, theme, cursor, outCaret);
+            TextOutW(hdc, px + glyphW + inner.width, baselineY - metrics.tmAscent, L")", 1);
+            SelectObject(hdc, oldFont);
+            DeleteObject(parenFont);
             return;
         }
         case ItemType::Fraction: {
@@ -510,6 +587,17 @@ void findItemHit(HDC hdc, Row* parent, int index, Item* item, int depth,
                        pointX, pointY, best);
             return;
         }
+        case ItemType::Function: {
+            Size inner = measureRowImpl(hdc, item->a.get(), depth);
+            int glyphW = measureParenWidth(hdc, depth, inner.height());
+            Size name = measureFunctionName(hdc, item, depth);
+            int gap = scaledPx(2, depth);
+            findRowHit(hdc, item->a.get(), depth, x + name.width + gap + glyphW,
+                       baselineY, pointX, pointY, best);
+            return;
+        }
+        case ItemType::Name:
+        case ItemType::Constant:
         case ItemType::Variable:
         case ItemType::Operator:
         case ItemType::Equals:

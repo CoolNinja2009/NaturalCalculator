@@ -52,7 +52,12 @@ enum Action {
     ActDot, ActPlus, ActMinus, ActMul, ActFrac,
     ActOpenParen, ActCloseParen, ActPower, ActSqrt,
     ActEquals, ActClear, ActClearAll, ActToggleTheme, ActBackspace,
-    ActVariableX, ActVariableY, ActQuadratic
+    ActVariableX, ActVariableY, ActQuadratic,
+    // Scientific keys (Pro Max). Order matches SciFunction in expr_tree.h:
+    // ActSin + id maps to the SciFunction with the same id.
+    ActSin, ActCos, ActTan, ActAsin, ActAcos, ActAtan,
+    ActSinh, ActCosh, ActTanh, ActLn, ActLog, ActExp, ActAbs,
+    ActPi, ActE, ActToggleAngle
 };
 
 struct App {
@@ -76,6 +81,7 @@ struct App {
     int editorTextCursor = -1;
     EvaluationContext values;
     bool proMode = false;
+    bool degrees = true;   // Pro Max angle unit: true = DEG, false = RAD
     DWORD proModeStarted = 0;
     DWORD explosionStarted = 0;
     bool explosionActive = false;
@@ -187,7 +193,7 @@ void releaseProExplosionAsset() {
 
 void layoutButtons(int areaLeft, int areaTop, int areaW, int areaH) {
     g.buttons.clear();
-    const int cols = 4;
+    const int cols = g.proMode ? 7 : 4;   // Pro Max adds 3 scientific columns
     const int rows = 7; // last row is the wide "=" button spanning all cols
     int gap = 6;
     int cellW = std::max(1, (areaW - gap * (cols + 1)) / cols);
@@ -240,7 +246,27 @@ void layoutButtons(int areaLeft, int areaTop, int areaW, int areaH) {
     place(2, 5, 1, L".", ActDot);
     place(3, 5, 1, L"+", ActPlus, true);
 
-    place(0, 6, 4, L"=", ActEquals, false, true);
+    if (g.proMode) {
+        // Scientific pad: three extra key columns to the right of the
+        // classic keypad, only in Calc Pro Max.
+        place(4, 1, 1, L"sin", ActSin, false, false, true);
+        place(5, 1, 1, L"asin", ActAsin, false, false, true);
+        place(6, 1, 1, L"sinh", ActSinh, false, false, true);
+        place(4, 2, 1, L"cos", ActCos, false, false, true);
+        place(5, 2, 1, L"acos", ActAcos, false, false, true);
+        place(6, 2, 1, L"cosh", ActCosh, false, false, true);
+        place(4, 3, 1, L"tan", ActTan, false, false, true);
+        place(5, 3, 1, L"atan", ActAtan, false, false, true);
+        place(6, 3, 1, L"tanh", ActTanh, false, false, true);
+        place(4, 4, 1, L"ln", ActLn, false, false, true);
+        place(5, 4, 1, L"log", ActLog, false, false, true);
+        place(6, 4, 1, L"exp", ActExp, false, false, true);
+        place(4, 5, 1, L"\u03C0", ActPi, false, false, true);
+        place(5, 5, 1, L"e", ActE, false, false, true);
+        place(6, 5, 1, L"|x|", ActAbs, false, false, true);
+    }
+
+    place(0, 6, g.proMode ? 7 : 4, L"=", ActEquals, false, true);
 }
 
 void recomputeLayout(const RECT& rc) {
@@ -299,7 +325,7 @@ void ensureCaretVisible() {
 }
 
 void doAction(int action) {
-    if (action != ActToggleTheme && action != ActEquals)
+    if (action != ActToggleTheme && action != ActToggleAngle && action != ActEquals)
         g.undo.push_back(cloneExpression(g.workspace.current()));
     bool editsExpression = action != ActToggleTheme && action != ActEquals;
     if ((g.allSelected || g.rangeSelected) && editsExpression) {
@@ -333,10 +359,22 @@ void doAction(int action) {
         case ActPower: insertPower(cur); break;
         case ActSqrt: insertSqrt(cur); break;
         case ActBackspace: backspace(cur); break;
+        case ActSin: case ActCos: case ActTan:
+        case ActAsin: case ActAcos: case ActAtan:
+        case ActSinh: case ActCosh: case ActTanh:
+        case ActLn: case ActLog: case ActExp: case ActAbs:
+            insertFunction(cur, action - ActSin); break;
+        case ActPi: insertConstant(cur, 'p'); break;
+        case ActE: insertConstant(cur, 'e'); break;
+        case ActToggleAngle:
+            g.degrees = !g.degrees;
+            break;
         case ActEquals: {
+            normalizeNames(cur);   // resolve "sin(", "pi", "e"... before evaluating
             bool proTrigger = isProModeTrigger(cur.root.get());
             EvaluationContext context = g.values;
             context.bigNumbers = g.proMode;   // super-large results only in Pro Mode
+            context.degrees = g.degrees;
             if (g.workspace.commitCurrent(context)) {
                 if (g.workspace.hasSolvedValues()) g.values = g.workspace.solvedValues();
                 g.scrollToBottomPending = true;
@@ -359,6 +397,7 @@ void doAction(int action) {
             break;
         default: break;
     }
+    normalizeNames(cur);   // resolve any words left over from button edits
     ensureCaretVisible();
     InvalidateRect(g.hwnd, nullptr, FALSE);
 }
@@ -437,18 +476,10 @@ void editorCursorAtPoint(POINT point) {
 }
 
 void insertPlainText(Expression& expression, const std::string& text) {
-    for (char character : text) {
-        if (character >= '0' && character <= '9') insertDigit(expression, character);
-        else if (character == 'x' || character == 'y') insertVariable(expression, character);
-        else if (character == '.') insertDigit(expression, character);
-        else if (character == '+' || character == '-' || character == '*' || character == '!')
-            insertOperator(expression, character);
-        else if (character == '/') insertFraction(expression);
-        else if (character == '=') insertEquals(expression);
-        else if (character == '(') insertOpenParen(expression);
-        else if (character == ')') insertCloseParen(expression);
-        else if (character == '^') insertPower(expression);
-    }
+    // Delegates to the tree-layer text builder, which additionally
+    // understands function names ("sin(30)"), constants ("pi", "e") and
+    // "sqrt(" -- shared by paste, selection-replace and the text editor.
+    insertFromText(expression, text);
 }
 
 void replaceEditorSelection(const std::string& replacement) {
@@ -1250,6 +1281,9 @@ void paint(HDC hdc, RECT client) {
         drawPill(xr, L"x");
         drawPill(yr, L"y");
         drawPill(qr, L"Quadratic");
+        if (g.proMode)
+            drawPill(topActionRect(g.topBarRect.right - 212, 44),
+                     g.degrees ? L"DEG" : L"RAD");
     }
     drawPill(themeToggleRect(), g.dark ? L"Light" : L"Dark");
     HPEN divPen = CreatePen(PS_SOLID, 1, theme.divider);
@@ -1438,7 +1472,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_GETMINMAXINFO: {
             MINMAXINFO* mmi = (MINMAXINFO*)lParam;
-            mmi->ptMinTrackSize.x = kMinWidth;
+            mmi->ptMinTrackSize.x = g.proMode ? 560 : kMinWidth;
             mmi->ptMinTrackSize.y = kMinHeight;
             return 0;
         }
@@ -1498,10 +1532,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             RECT xRect = topActionRect(g.topBarRect.right - 68, 28);
             RECT yRect = topActionRect(g.topBarRect.right - 100, 28);
             RECT quadraticRect = topActionRect(g.topBarRect.right - 132, 76);
+            RECT angleRect = topActionRect(g.topBarRect.right - 212, 44);
             if (PtInRect(&toggleRect, pt)) { doAction(ActToggleTheme); return 0; }
             if (PtInRect(&xRect, pt)) { doAction(ActVariableX); return 0; }
             if (PtInRect(&yRect, pt)) { doAction(ActVariableY); return 0; }
             if (PtInRect(&quadraticRect, pt)) { solveQuadraticFromDialog(); return 0; }
+            if (g.proMode && PtInRect(&angleRect, pt)) {
+                doAction(ActToggleAngle);
+                return 0;
+            }
             if (PtInRect(&g.editorRect, pt)) {
                 g.editorSelecting = true;
                 g.editorAnchor = editorCharacterAtPoint(pt);
@@ -1608,7 +1647,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     return 0;
                 } else if ((c >= L'0' && c <= L'9') || c == L'.' || c == L'+' || c == L'-' ||
                            c == L'*' || c == L'/' || c == L'(' || c == L')' || c == L'^' ||
-                           c == L'!' || c == L'=' || c == L'x' || c == L'X' || c == L'y' || c == L'Y') {
+                           c == L'!' || c == L'=' || c == L'x' || c == L'X' || c == L'y' || c == L'Y' ||
+                           (g.proMode && ((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z')))) {
                     text.insert(text.begin() + position, (char)std::tolower((char)c));
                     ++position;
                 } else return 0;
@@ -1624,7 +1664,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (c == 8) replaceEditorSelection("");
                 else if ((c >= L'0' && c <= L'9') || c == L'.' || c == L'+' || c == L'-' ||
                          c == L'*' || c == L'/' || c == L'(' || c == L')' || c == L'^' ||
-                         c == L'!' || c == L'=' || c == L'x' || c == L'X' || c == L'y' || c == L'Y') {
+                         c == L'!' || c == L'=' || c == L'x' || c == L'X' || c == L'y' || c == L'Y' ||
+                         (g.proMode && ((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z')))) {
                     char replacement = (char)c;
                     if (replacement == '/') replacement = '/';
                     replaceEditorSelection(std::string(1, replacement));
@@ -1636,6 +1677,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (c == 8) { doAction(ActBackspace); return 0; }
             if (c == 13) { doAction(ActEquals); return 0; }
             if (c >= '0' && c <= '9') { doAction(ActDigit0 + (c - '0')); return 0; }
+            // Pro Mode: letters build words ("sin", "pi", "e", "x"...).
+            // They resolve into Function/Constant/Variable items on the next
+            // non-letter edit, so "e-x-p-(" types exp() while a lone "e"
+            // still becomes the constant.
+            if (g.proMode && ((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z'))) {
+                g.undo.push_back(cloneExpression(g.workspace.current()));
+                insertNameLetter(g.workspace.current(), (char)tolower((char)c));
+                ensureCaretVisible();
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             switch (c) {
                 case L'.': doAction(ActDot); return 0;
                 case L'+': doAction(ActPlus); return 0;

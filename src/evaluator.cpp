@@ -15,6 +15,9 @@ bool sameItem(const Item* left, const Item* right) {
     if (left->type == ItemType::Number) return left->numText == right->numText;
     if (left->type == ItemType::Variable) return left->variableName == right->variableName;
     if (left->type == ItemType::Operator) return left->opChar == right->opChar;
+    if (left->type == ItemType::Name) return left->nameText == right->nameText;
+    if (left->type == ItemType::Constant) return left->constantName == right->constantName;
+    if (left->type == ItemType::Function) return left->functionId == right->functionId;
     if (left->type == ItemType::Equals) return true;
     return sameRow(left->a.get(), right->a.get()) && sameRow(left->b.get(), right->b.get());
 }
@@ -129,6 +132,57 @@ double factorial(double value) {
     return result;
 }
 
+// --- scientific functions (Pro Mode) ---------------------------------------
+
+constexpr double kSciPi = 3.14159265358979323846;
+constexpr double kSciE = 2.71828182845904523536;
+constexpr double kLog10E = 0.43429448190325182765;   // log10(e)
+
+double angleToRadians(double value, bool degrees) {
+    return degrees ? value * (kSciPi / 180.0) : value;
+}
+
+double angleFromRadians(double value, bool degrees) {
+    return degrees ? value * (180.0 / kSciPi) : value;
+}
+
+// Plain double-precision evaluation of a scientific function, with explicit
+// domain errors. Overflow (e.g. exp(1000)) yields +-inf, which the Pro Mode
+// wrapper detects and re-runs in log10 space instead of reporting.
+double applySciFunction(int id, double x, bool degrees) {
+    switch (id) {
+        case SciSin: return std::sin(angleToRadians(x, degrees));
+        case SciCos: return std::cos(angleToRadians(x, degrees));
+        case SciTan: {
+            double cosine = std::cos(angleToRadians(x, degrees));
+            if (std::fabs(cosine) < 1e-15)
+                throw std::runtime_error("tan is undefined here");
+            return std::sin(angleToRadians(x, degrees)) / cosine;
+        }
+        case SciAsin:
+            if (x < -1.0 || x > 1.0)
+                throw std::runtime_error("asin needs input in -1..1");
+            return angleFromRadians(std::asin(x), degrees);
+        case SciAcos:
+            if (x < -1.0 || x > 1.0)
+                throw std::runtime_error("acos needs input in -1..1");
+            return angleFromRadians(std::acos(x), degrees);
+        case SciAtan: return angleFromRadians(std::atan(x), degrees);
+        case SciSinh: return std::sinh(x);
+        case SciCosh: return std::cosh(x);
+        case SciTanh: return std::tanh(x);
+        case SciLn:
+            if (!(x > 0.0)) throw std::runtime_error("ln needs a positive number");
+            return std::log(x);
+        case SciLog:
+            if (!(x > 0.0)) throw std::runtime_error("log needs a positive number");
+            return std::log10(x);
+        case SciExp: return std::exp(x);
+        case SciAbs: return std::fabs(x);
+    }
+    throw std::runtime_error("Unknown function");
+}
+
 struct RowParser {
     const std::vector<std::unique_ptr<Item>>& items;
     const EvaluationContext& context;
@@ -194,6 +248,17 @@ struct RowParser {
                 if (v < 0.0) throw std::runtime_error("Root of negative number");
                 return std::sqrt(v);
             }
+            case ItemType::Constant:
+                pos++;
+                return it->constantName == 'p' ? kSciPi : kSciE;
+            case ItemType::Function: {
+                pos++;
+                int functionId = it->functionId;
+                double arg = evaluate(it->a.get(), context);
+                return applySciFunction(functionId, arg, context.degrees);
+            }
+            case ItemType::Name:
+                throw std::runtime_error("Unknown name");
             case ItemType::Operator:
                 throw std::runtime_error("Unexpected operator");
             case ItemType::Equals:
@@ -440,6 +505,84 @@ BigValue bigFactorial(const BigValue& v) {
     return r;
 }
 
+// Scientific functions in log10 space. Only the ones that are numerically
+// meaningful there get real big answers (exp/ln/log/abs/sinh/cosh/tanh/atan);
+// ordinary trig needs honest argument reduction, so arguments whose magnitude
+// exceeds what a double can represent exactly (10^15) raise a clear error
+// rather than returning a plausible but wrong value.
+BigValue applySciFunctionBig(int id, const BigValue& x, bool degrees) {
+    if (id == SciAbs) {
+        BigValue r = x;
+        r.negative = false;
+        return r;
+    }
+    if (id == SciExp) {
+        if (x.isZero) return bigFromDouble(1.0);
+        double argument = std::pow(10.0, x.log10Abs);
+        if (x.negative) argument = -argument;
+        if (!std::isfinite(argument)) throw std::runtime_error("Result is too large");
+        double log10Result = argument * kLog10E;
+        if (!std::isfinite(log10Result)) throw std::runtime_error("Result is too large");
+        BigValue r;
+        r.isZero = false;
+        r.log10Abs = log10Result;
+        return r;
+    }
+    if (id == SciLn || id == SciLog) {
+        if (x.isZero || x.negative)
+            throw std::runtime_error(id == SciLn ? "ln needs a positive number"
+                                                 : "log needs a positive number");
+        double result = (id == SciLn) ? x.log10Abs / kLog10E : x.log10Abs;
+        if (!std::isfinite(result)) throw std::runtime_error("Result is too large");
+        return bigFromDouble(result);
+    }
+    if (id == SciCosh || id == SciSinh) {
+        if (x.isZero) return bigFromDouble(id == SciCosh ? 1.0 : 0.0);
+        double magnitude = std::pow(10.0, x.log10Abs);
+        if (std::isfinite(magnitude) && magnitude <= 700.0) {
+            double value = x.negative ? -magnitude : magnitude;
+            double result = id == SciCosh ? std::cosh(value) : std::sinh(value);
+            if (std::isfinite(result)) return bigFromDouble(result);
+        }
+        // cosh(z) ~ sinh(|z|) ~ e^|z| / 2 once the double path overflows.
+        double log10Result = magnitude * kLog10E - std::log10(2.0);
+        if (!std::isfinite(log10Result)) throw std::runtime_error("Result is too large");
+        BigValue r;
+        r.isZero = false;
+        r.negative = (id == SciSinh) && x.negative;
+        r.log10Abs = log10Result;
+        return r;
+    }
+    if (id == SciTanh) {
+        if (!x.isZero && x.log10Abs > 20.0)
+            return bigFromDouble(x.negative ? -1.0 : 1.0);   // tanh(+-huge) = +-1
+        double value = x.isZero ? 0.0
+                                : (x.negative ? -1.0 : 1.0) * std::pow(10.0, x.log10Abs);
+        return bigFromDouble(std::tanh(value));
+    }
+    if (id == SciAtan) {
+        if (!x.isZero && x.log10Abs > 15.0)
+            return bigFromDouble(x.negative ? -kSciPi / 2.0 : kSciPi / 2.0);
+        double value = x.isZero ? 0.0
+                                : (x.negative ? -1.0 : 1.0) * std::pow(10.0, x.log10Abs);
+        return bigFromDouble(applySciFunction(SciAtan, value, degrees));
+    }
+    if (id == SciAsin || id == SciAcos) {
+        if (!x.isZero && x.log10Abs > 0.0)   // |x| > 1
+            throw std::runtime_error(id == SciAsin ? "asin needs input in -1..1"
+                                                   : "acos needs input in -1..1");
+        double value = x.isZero ? 0.0
+                                : (x.negative ? -1.0 : 1.0) * std::pow(10.0, x.log10Abs);
+        return bigFromDouble(applySciFunction(id, value, degrees));
+    }
+    // sin / cos / tan: honest reduction only.
+    if (!x.isZero && x.log10Abs > 15.0)
+        throw std::runtime_error("Argument too large for trig");
+    double value = x.isZero ? 0.0
+                            : (x.negative ? -1.0 : 1.0) * std::pow(10.0, x.log10Abs);
+    return bigFromDouble(applySciFunction(id, value, degrees));
+}
+
 BigValue bigEvaluate(const Row* root, const EvaluationContext& context);
 
 // Mirrors RowParser exactly, but every value lives in the log10 domain.
@@ -519,6 +662,17 @@ struct BigParser {
             case ItemType::Sqrt:
                 pos++;
                 return bigSqrt(bigEvaluate(it->a.get(), context));
+            case ItemType::Constant:
+                pos++;
+                return bigFromDouble(it->constantName == 'p' ? kSciPi : kSciE);
+            case ItemType::Function: {
+                pos++;
+                int functionId = it->functionId;
+                BigValue arg = bigEvaluate(it->a.get(), context);
+                return applySciFunctionBig(functionId, arg, context.degrees);
+            }
+            case ItemType::Name:
+                throw std::runtime_error("Unknown name");
             case ItemType::Operator:
                 throw std::runtime_error("Unexpected operator");
             case ItemType::Equals:
@@ -709,6 +863,9 @@ struct PolynomialParser {
             case ItemType::Equals:
             case ItemType::CloseParen:
             case ItemType::Sqrt:
+            case ItemType::Name:
+            case ItemType::Constant:
+            case ItemType::Function:
                 return { { 0, 0, 0 }, false };
         }
         return { { 0, 0, 0 }, false };
@@ -827,6 +984,9 @@ struct LinearParser {
             case ItemType::Operator:
             case ItemType::Equals:
             case ItemType::CloseParen:
+            case ItemType::Name:
+            case ItemType::Constant:
+            case ItemType::Function:
                 return { 0, 0, 0, false };
         }
         return { 0, 0, 0, false };
@@ -917,6 +1077,18 @@ std::string evaluateProToString(const Row* root, const EvaluationContext& contex
     try {
         double value = evaluate(root, context);
         bigNeeded = !std::isfinite(value);
+        // A plain 0 can still hide a real tiny value that underflowed the
+        // double path (exp(-1000) and friends); Pro Mode reruns the whole
+        // expression in log10 space and keeps that answer when it is
+        // genuinely non-zero.
+        if (!bigNeeded && value == 0.0) {
+            try {
+                BigValue big = bigEvaluate(root, context);
+                if (!big.isZero) return formatBigValue(big);
+            } catch (const std::exception&) {
+                // log10 path does not apply here; keep the plain result.
+            }
+        }
     } catch (const FactorialTooLargeError&) {
         bigNeeded = true;
     }
@@ -976,25 +1148,141 @@ bool solveTwoVariableSystem(const Row* first, const Row* second,
     };
 
     Linear left1, right1, left2, right2;
-    if (!equation(first, left1, right1) || !equation(second, left2, right2)) {
-        message = "Use two linear equations with one '=' each";
+    const bool firstIsLinear = equation(first, left1, right1);
+    const bool secondIsLinear = equation(second, left2, right2);
+    if (firstIsLinear && secondIsLinear) {
+        double a1 = left1.x - right1.x;
+        double b1 = left1.y - right1.y;
+        double c1 = right1.constant - left1.constant;
+        double a2 = left2.x - right2.x;
+        double b2 = left2.y - right2.y;
+        double c2 = right2.constant - left2.constant;
+        double determinant = a1 * b2 - a2 * b1;
+        if (std::fabs(determinant) < 1e-12) {
+            message = "No unique solution";
+            return false;
+        }
+        x = (c1 * b2 - c2 * b1) / determinant;
+        y = (a1 * c2 - a2 * c1) / determinant;
+        message.clear();
+        return true;
+    }
+
+    auto containsVariables = [](const Row* row, bool& hasX, bool& hasY, auto&& self) -> void {
+        if (!row) return;
+        for (const auto& item : row->items) {
+            if (item->type == ItemType::Variable) {
+                hasX = hasX || item->variableName == 'x';
+                hasY = hasY || item->variableName == 'y';
+            }
+            self(item->a.get(), hasX, hasY, self);
+            self(item->b.get(), hasX, hasY, self);
+        }
+    };
+    bool hasX = false, hasY = false;
+    containsVariables(first, hasX, hasY, containsVariables);
+    containsVariables(second, hasX, hasY, containsVariables);
+    if (!hasX || !hasY || !first || !second) {
+        message = "Use two equations involving x and y";
         return false;
     }
-    double a1 = left1.x - right1.x;
-    double b1 = left1.y - right1.y;
-    double c1 = right1.constant - left1.constant;
-    double a2 = left2.x - right2.x;
-    double b2 = left2.y - right2.y;
-    double c2 = right2.constant - left2.constant;
-    double determinant = a1 * b2 - a2 * b1;
-    if (std::fabs(determinant) < 1e-12) {
-        message = "No unique solution";
-        return false;
+
+    auto equationResidual = [](const Row* row, double xValue, double yValue, double& output) {
+        if (!row) return false;
+        size_t equals = row->items.size();
+        for (size_t i = 0; i < row->items.size(); ++i) {
+            if (row->items[i]->type == ItemType::Equals) {
+                if (equals != row->items.size()) return false;
+                equals = i;
+            }
+        }
+        if (equals == 0 || equals + 1 >= row->items.size()) return false;
+        EvaluationContext trial;
+        trial.x = xValue;
+        trial.y = yValue;
+        try {
+            RowParser left(row, trial, 0, equals);
+            RowParser right(row, trial, equals + 1, row->items.size());
+            output = left.parseRow() - right.parseRow();
+            return std::isfinite(output);
+        } catch (const std::exception&) {
+            return false;
+        }
+    };
+
+    constexpr double seeds[] = { -1000.0, -100.0, -10.0, -1.0, -0.1, 0.1, 1.0, 10.0, 100.0, 1000.0 };
+    constexpr double tolerance = 1e-8;
+    auto residualNorm = [](double firstValue, double secondValue) {
+        return std::max(std::fabs(firstValue), std::fabs(secondValue));
+    };
+    for (double seedX : seeds) {
+        for (double seedY : seeds) {
+            double candidateX = seedX;
+            double candidateY = seedY;
+            for (int iteration = 0; iteration < 100; ++iteration) {
+                double firstValue = 0.0, secondValue = 0.0;
+                if (!equationResidual(first, candidateX, candidateY, firstValue) ||
+                    !equationResidual(second, candidateX, candidateY, secondValue))
+                    break;
+                if (residualNorm(firstValue, secondValue) < tolerance) {
+                    x = candidateX;
+                    y = candidateY;
+                    message.clear();
+                    return true;
+                }
+
+                double stepX = 1e-5 * std::max(1.0, std::fabs(candidateX));
+                double stepY = 1e-5 * std::max(1.0, std::fabs(candidateY));
+                double firstXPlus = 0.0, firstXMinus = 0.0, secondXPlus = 0.0, secondXMinus = 0.0;
+                double firstYPlus = 0.0, firstYMinus = 0.0, secondYPlus = 0.0, secondYMinus = 0.0;
+                if (!equationResidual(first, candidateX + stepX, candidateY, firstXPlus) ||
+                    !equationResidual(first, candidateX - stepX, candidateY, firstXMinus) ||
+                    !equationResidual(second, candidateX + stepX, candidateY, secondXPlus) ||
+                    !equationResidual(second, candidateX - stepX, candidateY, secondXMinus) ||
+                    !equationResidual(first, candidateX, candidateY + stepY, firstYPlus) ||
+                    !equationResidual(first, candidateX, candidateY - stepY, firstYMinus) ||
+                    !equationResidual(second, candidateX, candidateY + stepY, secondYPlus) ||
+                    !equationResidual(second, candidateX, candidateY - stepY, secondYMinus))
+                    break;
+
+                double j11 = (firstXPlus - firstXMinus) / (2.0 * stepX);
+                double j21 = (secondXPlus - secondXMinus) / (2.0 * stepX);
+                double j12 = (firstYPlus - firstYMinus) / (2.0 * stepY);
+                double j22 = (secondYPlus - secondYMinus) / (2.0 * stepY);
+                double determinant = j11 * j22 - j12 * j21;
+                double determinantScale = std::max(1.0, std::fabs(j11 * j22) + std::fabs(j12 * j21));
+                if (!std::isfinite(determinant) || std::fabs(determinant) < 1e-14 * determinantScale)
+                    break;
+
+                double deltaX = (-firstValue * j22 + j12 * secondValue) / determinant;
+                double deltaY = (j21 * firstValue - j11 * secondValue) / determinant;
+                if (!std::isfinite(deltaX) || !std::isfinite(deltaY))
+                    break;
+
+                double currentNorm = residualNorm(firstValue, secondValue);
+                bool improved = false;
+                for (double amount = 1.0; amount >= 1.0 / 1024.0; amount *= 0.5) {
+                    double nextX = candidateX + amount * deltaX;
+                    double nextY = candidateY + amount * deltaY;
+                    if (std::fabs(nextX) > 1e6 || std::fabs(nextY) > 1e6)
+                        continue;
+                    double nextFirst = 0.0, nextSecond = 0.0;
+                    if (equationResidual(first, nextX, nextY, nextFirst) &&
+                        equationResidual(second, nextX, nextY, nextSecond) &&
+                        residualNorm(nextFirst, nextSecond) < currentNorm) {
+                        candidateX = nextX;
+                        candidateY = nextY;
+                        improved = true;
+                        break;
+                    }
+                }
+                if (!improved) break;
+            }
+        }
     }
-    x = (c1 * b2 - c2 * b1) / determinant;
-    y = (a1 * c2 - a2 * c1) / determinant;
-    message.clear();
-    return true;
+
+    message = "No unique solution";
+    return false;
 }
 
 bool solveSingleVariableEquation(const Row* equation, char& variable,

@@ -26,7 +26,21 @@ static Expression expressionFrom(const char* text) {
 }
 
 static void assertNear(double actual, double expected) {
+    if (!(std::fabs(actual - expected) < 1e-9))
+        std::cerr << "assertNear failed: actual=" << actual << " expected=" << expected << "\n";
     assert(std::fabs(actual - expected) < 1e-9);
+}
+
+static double evalText(const char* text, const EvaluationContext& context) {
+    Expression expression;
+    insertFromText(expression, text);
+    return evaluate(expression.root.get(), context);
+}
+
+static std::string evalTextString(const char* text, const EvaluationContext& context) {
+    Expression expression;
+    insertFromText(expression, text);
+    return evaluateToString(expression.root.get(), context);
 }
 
 static void testVariableEvaluation() {
@@ -61,6 +75,22 @@ static void testSystems() {
 
     Expression malformed = expressionFrom("x+y");
     assert(!solveTwoVariableSystem(malformed.root.get(), second.root.get(), x, y, message));
+
+    Expression nonlinearFirst;
+    insertFromText(nonlinearFirst, "sqrt(3233+x/2)=y-45");
+    Expression nonlinearSecond;
+    insertFromText(nonlinearSecond, "xy=4");
+    Workspace nonlinearWorkspace;
+    nonlinearWorkspace.current() = std::move(nonlinearFirst);
+    assert(nonlinearWorkspace.commitCurrent());
+    nonlinearWorkspace.current() = std::move(nonlinearSecond);
+    assert(nonlinearWorkspace.commitCurrent());
+    assert(nonlinearWorkspace.history()[nonlinearWorkspace.history().size() - 2]->result ==
+           "Solved as part of the system");
+    assert(nonlinearWorkspace.history().back()->result.find("x = ") == 0);
+    assertNear(nonlinearWorkspace.solvedValues().x * nonlinearWorkspace.solvedValues().y, 4.0);
+    assertNear(std::sqrt(3233.0 + nonlinearWorkspace.solvedValues().x / 2.0),
+               nonlinearWorkspace.solvedValues().y - 45.0);
 }
 
 static void testQuadratics() {
@@ -377,6 +407,198 @@ static void testProModeBigNumbers() {
     assert(!proWorkspace.history().back()->isError);
 }
 
+static void testSciFunctions() {
+    EvaluationContext deg;              // degrees = true by default
+    EvaluationContext rad;
+    rad.degrees = false;
+
+    // Trig input honours the angle unit.
+    assertNear(evalText("sin(30)", deg), 0.5);
+    assertNear(evalText("cos(60)", deg), 0.5);
+    assertNear(evalText("tan(45)", deg), 1.0);
+    assertNear(evalText("sin(30)", rad), -0.9880316240928618);
+    assertNear(evalText("sin(pi/2)", rad), 1.0);
+    assertNear(evalText("sin(pi/2)", deg), 0.02741213349327057); // sin of 1.5708deg
+
+    // Inverse trig returns angles in the active unit.
+    assertNear(evalText("asin(0.5)", deg), 30.0);
+    assertNear(evalText("acos(0.5)", deg), 60.0);
+    assertNear(evalText("atan(1)", deg), 45.0);
+    assertNear(evalText("asin(0.5)", rad), 0.5235987755982989);
+
+    // Hyperbolic functions are angle-independent.
+    assertNear(evalText("sinh(1)", deg), 1.1752011936438014);
+    assertNear(evalText("cosh(0)", deg), 1.0);
+    assertNear(evalText("tanh(0)", deg), 0.0);
+    assertNear(evalText("sinh(1)", rad), evalText("sinh(1)", deg));
+
+    // Logs, exp, abs, constants.
+    assertNear(evalText("ln(e)", deg), 1.0);
+    assertNear(evalText("log(100)", deg), 2.0);
+    assertNear(evalText("exp(0)", deg), 1.0);
+    assertNear(evalText("exp(1)", deg), 2.718281828459045);
+    assertNear(evalText("abs(0-3)", deg), 3.0);
+    assertNear(evalText("pi", deg), 3.141592653589793);
+    assertNear(evalText("e", deg), 2.718281828459045);
+    assertNear(evalText("2pi", deg), 6.283185307179586);
+    assertNear(evalText("pi^2", deg), 9.869604401089358);
+
+    // Nesting and precedence alongside the structural operators.
+    assertNear(evalText("sqrt(9)+log(100)", deg), 5.0);
+    assertNear(evalText("2^3", deg), 8.0);
+    assertNear(evalText("sin(30)+cos(60)", deg), 1.0);
+    assertNear(evalText("sin(30)cos(60)", deg), 0.25);
+    assertNear(evalText("2sin(30)", deg), 1.0);
+
+    // Domain errors surface as error text, never as numeric garbage.
+    assert(evalTextString("ln(0)", deg) == "ln needs a positive number");
+    assert(evalTextString("ln(0-2)", deg) == "ln needs a positive number");
+    assert(evalTextString("log(0)", deg) == "log needs a positive number");
+    assert(evalTextString("asin(2)", deg) == "asin needs input in -1..1");
+    assert(evalTextString("acos(2)", rad) == "acos needs input in -1..1");
+    assert(evalTextString("tan(90)", deg) == "tan is undefined here");
+    assert(evalTextString("sqrt(0-1)", deg) == "Root of negative number");
+    assert(evalTextString("1/0", deg) == "Division by zero");
+
+    // A word that never resolves stays a name and reports itself.
+    Expression unresolved;
+    insertNameLetter(unresolved, 's');
+    insertNameLetter(unresolved, 'i');
+    insertNameLetter(unresolved, 'n');
+    normalizeNames(unresolved);   // no paren follows: still a Name
+    assert(evaluateToString(unresolved.root.get(), deg) == "Unknown name");
+}
+
+static void testSciTypingAndText() {
+    EvaluationContext deg;
+
+    // Letter-by-letter typing resolves on the next non-letter edit.
+    Expression typed;
+    insertNameLetter(typed, 's');
+    insertNameLetter(typed, 'i');
+    insertNameLetter(typed, 'n');
+    insertOpenParen(typed);
+    normalizeNames(typed);   // doAction() performs this after button edits
+    insertDigit(typed, '3');
+    insertDigit(typed, '0');
+    assert(typed.root->items[0]->type == ItemType::Function);
+    assert(typed.root->items[0]->functionId == SciSin);
+    assertNear(evaluate(typed.root.get(), deg), 0.5);
+
+    // "exp(" keeps the leading e from becoming a constant mid-word.
+    Expression expTyped;
+    insertNameLetter(expTyped, 'e');
+    insertNameLetter(expTyped, 'x');
+    insertNameLetter(expTyped, 'p');
+    insertOpenParen(expTyped);
+    normalizeNames(expTyped);
+    insertDigit(expTyped, '1');
+    assert(expTyped.root->items[0]->type == ItemType::Function);
+    assertNear(evaluate(expTyped.root.get(), deg), 2.718281828459045);
+
+    // A lone "e" becomes the constant once a non-letter follows.
+    Expression eTyped;
+    insertNameLetter(eTyped, 'e');
+    insertOperator(eTyped, '+');
+    normalizeNames(eTyped);
+    insertDigit(eTyped, '1');
+    assert(eTyped.root->items[0]->type == ItemType::Constant);
+    assertNear(evaluate(eTyped.root.get(), deg), 3.718281828459045);
+
+    // x / y still resolve to variables through the same pipeline.
+    Expression xTyped;
+    insertNameLetter(xTyped, 'x');
+    insertOperator(xTyped, '+');
+    normalizeNames(xTyped);
+    insertDigit(xTyped, '2');
+    EvaluationContext withX;
+    withX.x = 5.0;
+    assert(xTyped.root->items[0]->type == ItemType::Variable);
+    assertNear(evaluate(xTyped.root.get(), withX), 7.0);
+
+    // Serialization survives a copy/paste round-trip.
+    Expression roundTrip;
+    insertFromText(roundTrip, "sin(pi/4)+2^3");
+    std::string plain = roundTrip.toPlainString();
+    assert(plain.find("sin(") != std::string::npos);
+    assert(plain.find("pi") != std::string::npos);
+    Expression reparsed;
+    insertFromText(reparsed, plain);
+    EvaluationContext rad;
+    rad.degrees = false;
+    assertNear(evaluate(reparsed.root.get(), rad),
+               0.7071067811865476 + 8.0);
+
+    // Case-insensitive text entry.
+    assertNear(evalText("SIN(30)", deg), 0.5);
+    assertNear(evalText("Log(100)", deg), 2.0);
+
+    // Unrecognized words drop out, like any unrecognized character.
+    assertNear(evalText("3q7", deg), 37.0);
+}
+
+static void testSciBigMode() {
+    EvaluationContext pro;
+    pro.bigNumbers = true;
+    EvaluationContext rad;
+    rad.bigNumbers = true;
+    rad.degrees = false;
+
+    // exp overflows a double and reruns in log10 space.
+    Expression expBig;
+    insertFromText(expBig, "exp(1000)");
+    std::string expResult = evaluateProToString(expBig.root.get(), pro);
+    assert(expResult.find("* 10^434") != std::string::npos);
+
+    // exp of a huge negative gives a real tiny value, not zero.
+    Expression expTiny;
+    insertFromText(expTiny, "exp(0-1000)");
+    std::string tinyResult = evaluateProToString(expTiny.root.get(), pro);
+    assert(tinyResult.find("10^") != std::string::npos);
+    assert(tinyResult.find("-435") != std::string::npos);
+
+    // Logs of values beyond double range stay exact.
+    Expression lnBig;
+    insertFromText(lnBig, "ln(10^1000)");
+    assert(evaluateProToString(lnBig.root.get(), pro).find("2302.585") == 0);
+    Expression logBig;
+    insertFromText(logBig, "log(10^100)");
+    assert(evaluateProToString(logBig.root.get(), pro) == "100");
+
+    // Hyperbolics extend into the huge regime.
+    Expression coshBig;
+    insertFromText(coshBig, "cosh(10^100)");
+    // log10(cosh(10^100)) = 10^100*log10(e) - log10(2)
+    assert(evaluateProToString(coshBig.root.get(), pro).find("10^4342944819032519") == 0);
+    Expression tanhBig;
+    insertFromText(tanhBig, "tanh(10^50)");
+    assert(evaluateProToString(tanhBig.root.get(), pro) == "1");
+
+    // Trig argument reduction beyond double precision is an honest error.
+    Expression sinBig;
+    insertFromText(sinBig, "sin(10^400)");
+    bool threw = false;
+    try { evaluateProToString(sinBig.root.get(), pro); }
+    catch (const std::exception& error) {
+        threw = std::string(error.what()) == "Argument too large for trig";
+    }
+    assert(threw);
+
+    // abs keeps the magnitude of a huge negative.
+    Expression absBig;
+    insertFromText(absBig, "abs(0-10^400)");
+    assert(evaluateProToString(absBig.root.get(), pro) == "10^400");
+
+    // End-to-end through the workspace with the angle unit attached.
+    Workspace workspace;
+    insertFromText(workspace.current(), "sin(30)");
+    EvaluationContext degPro;
+    degPro.bigNumbers = true;
+    assert(workspace.commitCurrent(degPro));
+    assert(workspace.history().back()->result == "0.5");
+    assert(!workspace.history().back()->isError);
+}
+
 static void testPowerEditing() {
     Expression expression;
     insertDigit(expression, '2');
@@ -398,6 +620,9 @@ int main() {
     testGeneralEquations();
     testProModeTriggerCalculation();
     testProModeBigNumbers();
+    testSciFunctions();
+    testSciTypingAndText();
+    testSciBigMode();
     testFactorials();
     testStandaloneClosingParen();
         testCloseParenExitsNestedStructure();

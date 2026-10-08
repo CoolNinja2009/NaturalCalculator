@@ -123,6 +123,19 @@ copy it anywhere and run it.
 - Press Delete twice quickly to reset saved `x` and `y` values while keeping
   the current expression and calculation history.
 - Type `x` or `y` directly, or use the matching buttons in the top bar.
+- Once Calc Pro Max is active, a full scientific keypad appears: `sin`,
+  `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`, `ln`, `log`,
+  `exp`, `abs`, plus `π` and `e` constants and a DEG/RAD toggle in the top
+  bar (visible mode, click to switch). The same functions can also be typed
+  as words in any case — `sin(30)`, `Log(100)`, `exp(2)`, `pi/2` — and pasted
+  text resolves them the same way. Unrecognised words report `Unknown name`.
+- Domain errors are honest: `tan(90)` in DEG, `asin(2)`, `ln(0)` and friends
+  report what went wrong instead of returning garbage. In log-space Pro Mode,
+  `exp(-1000)` still returns a real tiny value (`5.08 * 10^-435`), and trig
+  on arguments too large for honest reduction (beyond 10^15) reports
+  `Argument too large for trig` rather than a plausible wrong number.
+- Typing or pasting `)` while the cursor is inside a `sin(...)` call or a
+  `√(...)` steps out of it, like a Casio natural-display calculator.
 
 **With MSVC** (not wired into the Makefile, but the source has no
 MinGW-specific dependencies): create a new empty C++ Windows app project,

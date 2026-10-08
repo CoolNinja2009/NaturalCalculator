@@ -107,24 +107,47 @@ bool Workspace::commitCurrent(const EvaluationContext& context) {
     }
 
     history_.push_back(std::move(entry));
-    if (history_.size() >= 2 &&
-        isLinearEquation(history_[history_.size() - 2]->expr->root.get()) &&
-        isLinearEquation(history_.back()->expr->root.get()) &&
-        hasEquals(history_[history_.size() - 2]->expr->root.get()) &&
-        hasEquals(history_.back()->expr->root.get())) {
-        double x = 0.0, y = 0.0;
-        std::string message;
-        if (solveTwoVariableSystem(history_[history_.size() - 2]->expr->root.get(),
-                                   history_.back()->expr->root.get(), x, y, message)) {
-            char result[128];
-            std::snprintf(result, sizeof(result), "x = %.10g, y = %.10g", x, y);
-            history_.back()->result = result;
-            history_.back()->isError = false;
-            solvedValues_ = { x, y };
-            hasSolvedValues_ = true;
-        } else {
-            history_.back()->result = message;
-            history_.back()->isError = true;
+    if (history_.size() >= 2) {
+        const Row* prev = history_[history_.size() - 2]->expr->root.get();
+        const Row* current = history_.back()->expr->root.get();
+        char assignedVariable = 0;
+        double assignedValue = 0.0;
+        std::string assignmentMessage;
+        bool previousIsAssignment =
+            solveVariableAssignment(prev, solvedValues_, assignedVariable, assignedValue, assignmentMessage);
+        bool currentIsAssignment =
+            solveVariableAssignment(current, solvedValues_, assignedVariable, assignedValue, assignmentMessage);
+        auto collectVariablesInRow = [](const Row* row, bool& hasX, bool& hasY, auto&& self) -> void {
+            if (!row) return;
+            for (const auto& item : row->items) {
+                if (item->type == ItemType::Variable) {
+                    hasX = hasX || item->variableName == 'x';
+                    hasY = hasY || item->variableName == 'y';
+                }
+                self(item->a.get(), hasX, hasY, self);
+                self(item->b.get(), hasX, hasY, self);
+            }
+        };
+        bool hasX = false, hasY = false;
+        collectVariablesInRow(prev, hasX, hasY, collectVariablesInRow);
+        collectVariablesInRow(current, hasX, hasY, collectVariablesInRow);
+        if (hasEquals(prev) && hasEquals(current) &&
+            !previousIsAssignment && !currentIsAssignment && hasX && hasY) {
+            double x = 0.0, y = 0.0;
+            std::string message;
+            if (solveTwoVariableSystem(prev, current, x, y, message)) {
+                char result[128];
+                std::snprintf(result, sizeof(result), "x = %.10g, y = %.10g", x, y);
+                history_[history_.size() - 2]->result = "Solved as part of the system";
+                history_[history_.size() - 2]->isError = false;
+                history_.back()->result = result;
+                history_.back()->isError = false;
+                solvedValues_ = { x, y };
+                hasSolvedValues_ = true;
+            } else {
+                history_.back()->result = message;
+                history_.back()->isError = true;
+            }
         }
     }
     current_ = std::make_unique<Expression>();

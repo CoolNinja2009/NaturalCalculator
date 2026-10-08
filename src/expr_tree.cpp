@@ -2,8 +2,44 @@
 #include "expr_tree.h"
 #include <cassert>
 #include <algorithm>
+#include <cstring>
+#include <functional>
 
 // ---------------------------------------------------------------- helpers
+
+static char lowerChar(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c; }
+
+static std::string lowerName(const std::string& text) {
+    std::string out;
+    for (char c : text) out += lowerChar(c);
+    return out;
+}
+
+const char* sciFunctionName(int id) {
+    switch (id) {
+        case SciSin: return "sin";
+        case SciCos: return "cos";
+        case SciTan: return "tan";
+        case SciAsin: return "asin";
+        case SciAcos: return "acos";
+        case SciAtan: return "atan";
+        case SciSinh: return "sinh";
+        case SciCosh: return "cosh";
+        case SciTanh: return "tanh";
+        case SciLn: return "ln";
+        case SciLog: return "log";
+        case SciExp: return "exp";
+        case SciAbs: return "abs";
+    }
+    return "?";
+}
+
+bool findSciFunction(const std::string& lowerNameIn, int& id) {
+    for (int f = 0; f < SciFunctionCount; ++f) {
+        if (lowerNameIn == sciFunctionName(f)) { id = f; return true; }
+    }
+    return false;
+}
 
 bool rowIsEmpty(const Row* r) { return r == nullptr || r->items.empty(); }
 
@@ -127,6 +163,18 @@ static void serializeItem(const Item* it, std::string& out) {
             serializeRow(it->a.get(), out);
             out += ')';
             break;
+        case ItemType::Name:
+            out += it->nameText;
+            break;
+        case ItemType::Constant:
+            out += (it->constantName == 'p') ? "pi" : "e";
+            break;
+        case ItemType::Function:
+            out += sciFunctionName(it->functionId);
+            out += '(';
+            serializeRow(it->a.get(), out);
+            out += ')';
+            break;
     }
 }
 
@@ -173,6 +221,9 @@ static std::unique_ptr<Row> cloneRow(const Row* source, Item* owner, Row* parent
         item->numText = sourceItem->numText;
         item->opChar = sourceItem->opChar;
         item->variableName = sourceItem->variableName;
+        item->nameText = sourceItem->nameText;
+        item->constantName = sourceItem->constantName;
+        item->functionId = sourceItem->functionId;
         Item* itemPtr = item.get();
         if (sourceItem->a) item->a = cloneRow(sourceItem->a.get(), itemPtr, copy.get());
         if (sourceItem->b) item->b = cloneRow(sourceItem->b.get(), itemPtr, copy.get());
@@ -370,13 +421,21 @@ void insertCloseParen(Expression& expr) {
     // bare ')' character here would draw as a small flat glyph instead of
     // the tall stretched bracket a real Paren renders, which is exactly
     // the "mismatched bracket" look this avoids.
+    //
+    // Function and Sqrt argument rows count too: their ')' is part of the
+    // call itself ("sin(30)"), so a ')' typed or pasted while the cursor
+    // is inside the argument steps out of the call rather than littering
+    // the argument row with an unmatched glyph.
     Row* insertionRow = expr.cursor.row;
     int insertionIndex = expr.cursor.index;
     Row* row = insertionRow;
     while (row && row->owner) {
         int k = ownerIndexInParentRow(row);
         if (k < 0) break;
-        if (row->owner->type == ItemType::Paren && row->owner->a.get() == row) {
+        if (row->owner->a.get() == row &&
+            (row->owner->type == ItemType::Paren ||
+             row->owner->type == ItemType::Function ||
+             row->owner->type == ItemType::Sqrt)) {
             expr.cursor.row = row->ownerParentRow;
             expr.cursor.index = k + 1;
             return;
@@ -400,6 +459,8 @@ void moveLeft(Expression& expr) {
         switch (prev->type) {
             case ItemType::Number:
             case ItemType::Variable:
+            case ItemType::Name:
+            case ItemType::Constant:
             case ItemType::Equals:
             case ItemType::CloseParen:
             case ItemType::Operator:
@@ -418,6 +479,7 @@ void moveLeft(Expression& expr) {
                 return;
             case ItemType::Paren:
             case ItemType::Sqrt:
+            case ItemType::Function:
                 // These have only one child row, so entering from either
                 // side lands in the same place: its end.
                 expr.cursor.row = prev->a.get();
@@ -458,6 +520,8 @@ void moveRight(Expression& expr) {
         switch (next->type) {
             case ItemType::Number:
             case ItemType::Variable:
+            case ItemType::Name:
+            case ItemType::Constant:
             case ItemType::Equals:
             case ItemType::CloseParen:
             case ItemType::Operator:
@@ -467,6 +531,7 @@ void moveRight(Expression& expr) {
             case ItemType::Power:
             case ItemType::Paren:
             case ItemType::Sqrt:
+            case ItemType::Function:
                 expr.cursor.row = next->a.get();
                 expr.cursor.index = 0;
                 return;
@@ -605,6 +670,16 @@ void backspace(Expression& expr) {
         }
         return;
     }
+    if (target->type == ItemType::Name) {
+        // Deleting into a word erases its last letter, like a number run.
+        if (target->nameText.size() > 1) {
+            target->nameText.pop_back();
+        } else {
+            row->items.erase(row->items.begin() + (idx - 1));
+            expr.cursor.index = idx - 1;
+        }
+        return;
+    }
     if (target->type == ItemType::Variable) {
         row->items.erase(row->items.begin() + (idx - 1));
         expr.cursor.index = idx - 1;
@@ -698,6 +773,14 @@ void doDelete(Expression& expr) {
         }
         return;
     }
+    if (target->type == ItemType::Name) {
+        if (target->nameText.size() > 1) {
+            target->nameText.erase(target->nameText.begin());
+        } else {
+            row->items.erase(row->items.begin() + idx);
+        }
+        return;
+    }
     if (target->type == ItemType::Variable) {
         row->items.erase(row->items.begin() + idx);
         return;
@@ -721,4 +804,205 @@ void doDelete(Expression& expr) {
     // deleting its contents outright.
     expr.cursor.row = target->a.get();
     expr.cursor.index = 0;
+}
+
+// ------------------------------------------------------- scientific items
+
+void insertFunction(Expression& expr, int functionId) {
+    if (functionId < 0 || functionId >= SciFunctionCount) return;
+    Row* row = expr.cursor.row;
+    int idx = expr.cursor.index;
+
+    auto item = std::make_unique<Item>(ItemType::Function);
+    item->functionId = functionId;
+    Item* ptr = item.get();
+    attachRow(item->a, ptr, row);
+
+    row->items.insert(row->items.begin() + idx, std::move(item));
+    expr.cursor.row = ptr->a.get();
+    expr.cursor.index = 0;
+}
+
+void insertConstant(Expression& expr, char which) {
+    if (which != 'p' && which != 'e') return;
+    Row* row = expr.cursor.row;
+    int idx = expr.cursor.index;
+    auto item = std::make_unique<Item>(ItemType::Constant);
+    item->constantName = which;
+    row->items.insert(row->items.begin() + idx, std::move(item));
+    expr.cursor.index = idx + 1;
+}
+
+void insertNameLetter(Expression& expr, char letter) {
+    letter = lowerChar(letter);
+    if (letter < 'a' || letter > 'z') return;
+    Row* row = expr.cursor.row;
+    int idx = expr.cursor.index;
+
+    if (idx > 0 && row->items[idx - 1]->type == ItemType::Name) {
+        row->items[idx - 1]->nameText += letter;
+        return; // cursor stays right after the word
+    }
+    auto item = std::make_unique<Item>(ItemType::Name);
+    item->nameText = std::string(1, letter);
+    row->items.insert(row->items.begin() + idx, std::move(item));
+    expr.cursor.index = idx + 1;
+}
+
+// Resolve one row's Name items. Returns true if any conversion happened.
+static bool normalizeRowNames(Expression& expr, Row* row) {
+    if (!row) return false;
+    bool changed = false;
+
+    // Merge adjacent Name items ("s" + "in" -> "sin").
+    for (size_t i = 0; i + 1 < row->items.size();) {
+        if (row->items[i]->type == ItemType::Name &&
+            row->items[i + 1]->type == ItemType::Name) {
+            row->items[i]->nameText += row->items[i + 1]->nameText;
+            row->items.erase(row->items.begin() + i + 1);
+            if (expr.cursor.row == row && expr.cursor.index > (int)i)
+                expr.cursor.index = std::max((int)i, expr.cursor.index - 1);
+            changed = true;
+        } else {
+            ++i;
+        }
+    }
+
+    for (size_t i = 0; i < row->items.size(); ++i) {
+        Item* it = row->items[i].get();
+        if (it->type != ItemType::Name) continue;
+        const std::string lower = lowerName(it->nameText);
+
+        // "sin(" (Name followed directly by a Paren) becomes a real call:
+        // the paren's inner row is adopted as the argument.
+        Item* next = (i + 1 < row->items.size()) ? row->items[i + 1].get() : nullptr;
+        if (next && next->type == ItemType::Paren) {
+            int functionId = -1;
+            bool isSqrt = (lower == "sqrt");
+            if (isSqrt || findSciFunction(lower, functionId)) {
+                auto replacement = std::make_unique<Item>(
+                    isSqrt ? ItemType::Sqrt : ItemType::Function);
+                if (!isSqrt) replacement->functionId = functionId;
+                Item* repPtr = replacement.get();
+                repPtr->a = std::move(next->a);
+                repPtr->a->owner = repPtr; // ownerParentRow is unchanged
+                row->items[i] = std::move(replacement);
+                row->items.erase(row->items.begin() + i + 1);
+                if (expr.cursor.row == row && expr.cursor.index > (int)i + 1)
+                    expr.cursor.index--;
+                changed = true;
+                continue;
+            }
+        }
+        // Standalone words resolve to constants / variables.
+        if (lower == "pi") {
+            it->type = ItemType::Constant; it->constantName = 'p'; it->nameText.clear();
+            changed = true;
+        } else if (lower == "e") {
+            it->type = ItemType::Constant; it->constantName = 'e'; it->nameText.clear();
+            changed = true;
+        } else if (lower == "x") {
+            it->type = ItemType::Variable; it->variableName = 'x'; it->nameText.clear();
+            changed = true;
+        } else if (lower == "y") {
+            it->type = ItemType::Variable; it->variableName = 'y'; it->nameText.clear();
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+void normalizeNames(Expression& expr) {
+    // Depth-first over every row (children first: conversions at this level
+    // move rows around, but normalized subtrees are untouched by that).
+    std::function<void(Row*)> walk = [&](Row* row) {
+        if (!row) return;
+        for (auto& it : row->items) {
+            if (it->a) walk(it->a.get());
+            if (it->b) walk(it->b.get());
+        }
+        normalizeRowNames(expr, row);
+    };
+    walk(expr.root.get());
+    if (expr.cursor.row)
+        expr.cursor.index = std::clamp(expr.cursor.index, 0, (int)expr.cursor.row->items.size());
+}
+
+// Longest function/constant name matching at run[k..]; returns match length
+// (0 = none). sqrt is matched here too even though it builds a Sqrt item.
+static size_t matchNameToken(const std::string& run, size_t k, int& functionId, bool& isSqrt,
+                             bool& isPi) {
+    functionId = -1; isSqrt = false; isPi = false;
+    size_t best = 0;
+    for (int f = 0; f < SciFunctionCount; ++f) {
+        const char* name = sciFunctionName(f);
+        size_t len = std::char_traits<char>::length(name);
+        if (len > best && run.size() - k >= len && run.compare(k, len, name) == 0) {
+            best = len; functionId = f; isSqrt = false; isPi = false;
+        }
+    }
+    if (4 > best && run.size() - k >= 4 && run.compare(k, 4, "sqrt") == 0) {
+        best = 4; functionId = -1; isSqrt = true; isPi = false;
+    }
+    if (2 > best && run.size() - k >= 2 && run.compare(k, 2, "pi") == 0) {
+        best = 2; functionId = -1; isSqrt = false; isPi = true;
+    }
+    return best;
+}
+
+void insertFromText(Expression& expr, const std::string& text) {
+    size_t i = 0;
+    while (i < text.size()) {
+        char c = text[i];
+        if ((c >= '0' && c <= '9') || c == '.') { insertDigit(expr, c); ++i; continue; }
+        if (c == '+' || c == '-' || c == '*' || c == '!') { insertOperator(expr, c); ++i; continue; }
+        if (c == '/') { insertFraction(expr); ++i; continue; }
+        if (c == '=') { insertEquals(expr); ++i; continue; }
+        if (c == '(') { insertOpenParen(expr); ++i; continue; }
+        if (c == ')') { insertCloseParen(expr); ++i; continue; }
+        if (c == '^') { insertPower(expr); ++i; continue; }
+
+        if (lowerChar(c) >= 'a' && lowerChar(c) <= 'z') {
+            size_t j = i;
+            while (j < text.size() &&
+                   ((lowerChar(text[j]) >= 'a' && lowerChar(text[j]) <= 'z')))
+                ++j;
+            std::string run = lowerName(text.substr(i, j - i));
+            bool functionOpen = false;
+            size_t k = 0;
+            while (k < run.size()) {
+                int functionId = -1;
+                bool isSqrt = false, isPi = false;
+                size_t len = matchNameToken(run, k, functionId, isSqrt, isPi);
+                if (len > 0) {
+                    if (isPi) {
+                        insertConstant(expr, 'p');
+                    } else if (isSqrt) {
+                        insertSqrt(expr);
+                        functionOpen = true; // the '(' in the text is consumed
+                    } else {
+                        insertFunction(expr, functionId);
+                        functionOpen = true;
+                    }
+                    k += len;
+                    continue;
+                }
+                char letter = run[k];
+                if (letter == 'x' || letter == 'y') {
+                    insertVariable(expr, letter);
+                } else if (letter == 'e') {
+                    insertConstant(expr, 'e');
+                }
+                // anything else in an unrecognized word is dropped
+                ++k;
+            }
+            // The '(' right after a word that opened a call belongs to it.
+            if (functionOpen && j < text.size() && text[j] == '(')
+                ++j;
+            i = j;
+            continue;
+        }
+        ++i; // unknown characters are dropped, as before
+    }
+    normalizeNames(expr);
 }

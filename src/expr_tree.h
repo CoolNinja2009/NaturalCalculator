@@ -31,8 +31,26 @@ enum class ItemType {
     Fraction,   // a/b  -> child rows: numerator (a), denominator (b)
     Paren,      // (a)  -> child row: inner (a).  b unused.
     Power,      // a^b  -> child rows: base (a), exponent (b)
-    Sqrt        // sqrt(a) -> child row: radicand (a). b unused.
+    Sqrt,       // sqrt(a) -> child row: radicand (a). b unused.
+    Name,       // a word being typed ("sin", "ex"...). Resolved by
+                // normalizeNames() into Function/Constant/Variable, or kept
+                // as-is (evaluates to "Unknown name")
+    Constant,   // pi ('p') or e ('e') -- leaf
+    Function    // sciFunction(id)(arg) -> child row: argument (a). b unused.
 };
+
+// Scientific functions available in Calc Pro Max. The order here must match
+// the ActSin..ActAbs action order in main.cpp.
+enum SciFunction {
+    SciSin, SciCos, SciTan,
+    SciAsin, SciAcos, SciAtan,
+    SciSinh, SciCosh, SciTanh,
+    SciLn, SciLog, SciExp, SciAbs,
+    SciFunctionCount
+};
+
+const char* sciFunctionName(int id);   // "sin", "cos", ... (lowercase)
+bool findSciFunction(const std::string& lowerName, int& id);
 
 struct Row;
 
@@ -47,6 +65,15 @@ struct Item {
 
     // Operator
     char opChar = 0;       // '+', '-', '*'
+
+    // Name
+    std::string nameText;  // word as typed, e.g. "sin"
+
+    // Constant
+    char constantName = 0; // 'p' = pi, 'e' = e
+
+    // Function
+    int functionId = -1;   // SciFunction enum value
 
     // Structural children. Meaning depends on `type`:
     //   Fraction: a = numerator,   b = denominator
@@ -120,6 +147,28 @@ void insertPower(Expression& expr);
 
 // sqrt button: insert an empty Sqrt at the cursor, cursor moves inside.
 void insertSqrt(Expression& expr);
+
+// Scientific keys: insert an empty function call, cursor moves into the
+// argument; or insert the pi / e constant leaf.
+void insertFunction(Expression& expr, int functionId);
+void insertConstant(Expression& expr, char which); // 'p' = pi, 'e' = e
+
+// Pro Mode typing: append a (lowercase) letter to a trailing Name item, or
+// start a new one. Letters accumulate as a Name; the conversion into
+// Function/Constant/Variable happens in normalizeNames() on the next
+// non-letter edit, which is what makes typing "e-x-p-(" resolve to exp()
+// while a lone "e" still becomes the constant.
+void insertNameLetter(Expression& expr, char letter);
+
+// Resolve every Name item in the tree: merge adjacent Names, convert
+// Name+Paren ("sin(") into Function/Sqrt calls, and turn standalone
+// "pi"/"e"/"x"/"y" words into constants/variables. Keeps the cursor sane.
+void normalizeNames(Expression& expr);
+
+// Build a tree from calculator text (digits, operators, function names,
+// constants). Used for pasting, selection-replacement, and the text-mode
+// editor; understands "sin(30)", "pi", "e", "sqrt(9)", case-insensitively.
+void insertFromText(Expression& expr, const std::string& text);
 
 // '(' key: insert an empty Paren at the cursor, cursor moves inside.
 void insertOpenParen(Expression& expr);
