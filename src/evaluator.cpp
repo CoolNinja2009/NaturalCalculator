@@ -1,10 +1,91 @@
 // evaluator.cpp
 #include "evaluator.h"
+#include "symbolic.h"
 #include <cmath>
 #include <cstdio>
 #include <stdexcept>
 #include <algorithm>
 #include <vector>
+#include <numeric>
+#include <functional>
+
+bool MathSet::contains(const std::string& s) const {
+    return std::find(elements.begin(), elements.end(), s) != elements.end();
+}
+
+void MathSet::add(const std::string& s) {
+    if (!contains(s)) elements.push_back(s);
+}
+
+std::string MathSet::toString() const {
+    if (elements.empty()) return "{}";
+    std::string res = "{";
+    for (size_t i = 0; i < elements.size(); ++i) {
+        if (i > 0) res += ", ";
+        res += elements[i];
+    }
+    res += "}";
+    return res;
+}
+
+MathSet setUnion(const MathSet& a, const MathSet& b) {
+    MathSet res = a;
+    for (const auto& elem : b.elements) res.add(elem);
+    return res;
+}
+
+MathSet setIntersection(const MathSet& a, const MathSet& b) {
+    MathSet res;
+    for (const auto& elem : a.elements) {
+        if (b.contains(elem)) res.add(elem);
+    }
+    return res;
+}
+
+MathSet setProduct(const MathSet& a, const MathSet& b) {
+    MathSet res;
+    for (const auto& x : a.elements) {
+        for (const auto& y : b.elements) {
+            res.add("(" + x + ", " + y + ")");
+        }
+    }
+    return res;
+}
+
+MathSet setDelta(const MathSet& a, const MathSet& b) {
+    MathSet res;
+    for (const auto& elem : a.elements) {
+        if (!b.contains(elem)) res.add(elem);
+    }
+    for (const auto& elem : b.elements) {
+        if (!a.contains(elem)) res.add(elem);
+    }
+    return res;
+}
+
+std::string Matrix::toString() const {
+    if (rows == 0 || cols == 0) return "[]";
+    std::string s = "[";
+    for (size_t r = 0; r < rows; ++r) {
+        if (rows > 1) s += "[";
+        for (size_t c = 0; c < cols; ++c) {
+            double val = at(r, c);
+            if (std::fabs(val) < 1e-12) val = 0.0;
+            char buf[64];
+            if (std::floor(val) == val && std::fabs(val) < 1e15) {
+                std::snprintf(buf, sizeof(buf), "%.0f", val);
+            } else {
+                std::snprintf(buf, sizeof(buf), "%.6g", val);
+            }
+            s += buf;
+            if (c + 1 < cols) s += ", ";
+        }
+        if (rows > 1) s += "]";
+        if (r + 1 < rows) s += ", ";
+    }
+    s += "]";
+    return s;
+}
 
 namespace {
 
@@ -19,7 +100,9 @@ bool sameItem(const Item* left, const Item* right) {
     if (left->type == ItemType::Constant) return left->constantName == right->constantName;
     if (left->type == ItemType::Function) return left->functionId == right->functionId;
     if (left->type == ItemType::Equals) return true;
-    return sameRow(left->a.get(), right->a.get()) && sameRow(left->b.get(), right->b.get());
+    return sameRow(left->a.get(), right->a.get()) &&
+           sameRow(left->b.get(), right->b.get()) &&
+           sameRow(left->c.get(), right->c.get());
 }
 
 bool sameRow(const Row* left, const Row* right) {
@@ -57,6 +140,8 @@ void collectVariables(const Row* row, bool& hasX, bool& hasY) {
         }
         collectVariables(item->a.get(), hasX, hasY);
         collectVariables(item->b.get(), hasX, hasY);
+        collectVariables(item->c.get(), hasX, hasY);
+        collectVariables(item->d.get(), hasX, hasY);
     }
 }
 
@@ -178,6 +263,494 @@ double angleFromRadians(double value, bool degrees) {
     return degrees ? value * (180.0 / kSciPi) : value;
 }
 
+// --- Matrix Algorithms & Helpers -------------------------------------------
+
+Matrix matrixAdd(const Matrix& a, const Matrix& b) {
+    if (a.rows != b.rows || a.cols != b.cols)
+        throw std::runtime_error("Matrix dimensions must match for addition");
+    Matrix r(a.rows, a.cols);
+    for (size_t i = 0; i < a.data.size(); ++i) r.data[i] = a.data[i] + b.data[i];
+    return r;
+}
+
+Matrix matrixSub(const Matrix& a, const Matrix& b) {
+    if (a.rows != b.rows || a.cols != b.cols)
+        throw std::runtime_error("Matrix dimensions must match for subtraction");
+    Matrix r(a.rows, a.cols);
+    for (size_t i = 0; i < a.data.size(); ++i) r.data[i] = a.data[i] - b.data[i];
+    return r;
+}
+
+Matrix matrixMul(const Matrix& a, const Matrix& b) {
+    if (a.cols != b.rows)
+        throw std::runtime_error("Matrix dimensions incompatible for multiplication");
+    Matrix r(a.rows, b.cols);
+    for (size_t i = 0; i < a.rows; ++i) {
+        for (size_t k = 0; k < a.cols; ++k) {
+            double aik = a.at(i, k);
+            if (std::fabs(aik) < 1e-15) continue;
+            for (size_t j = 0; j < b.cols; ++j) {
+                r.at(i, j) += aik * b.at(k, j);
+            }
+        }
+    }
+    return r;
+}
+
+Matrix matrixScalarMul(const Matrix& a, double k) {
+    Matrix r(a.rows, a.cols);
+    for (size_t i = 0; i < a.data.size(); ++i) r.data[i] = a.data[i] * k;
+    return r;
+}
+
+Matrix matrixEye(size_t n) {
+    if (n == 0) throw std::runtime_error("Matrix dimension must be positive");
+    Matrix r(n, n);
+    for (size_t i = 0; i < n; ++i) r.at(i, i) = 1.0;
+    return r;
+}
+
+Matrix matrixZeros(size_t r, size_t c) {
+    if (r == 0 || c == 0) throw std::runtime_error("Matrix dimensions must be positive");
+    return Matrix(r, c);
+}
+
+Matrix matrixOnes(size_t r, size_t c) {
+    if (r == 0 || c == 0) throw std::runtime_error("Matrix dimensions must be positive");
+    Matrix m(r, c);
+    std::fill(m.data.begin(), m.data.end(), 1.0);
+    return m;
+}
+
+Matrix matrixTranspose(const Matrix& a) {
+    Matrix r(a.cols, a.rows);
+    for (size_t i = 0; i < a.rows; ++i) {
+        for (size_t j = 0; j < a.cols; ++j) {
+            r.at(j, i) = a.at(i, j);
+        }
+    }
+    return r;
+}
+
+double matrixTrace(const Matrix& a) {
+    if (!a.isSquare()) throw std::runtime_error("trace requires a square matrix");
+    double tr = 0.0;
+    for (size_t i = 0; i < a.rows; ++i) tr += a.at(i, i);
+    return tr;
+}
+
+double matrixDet(Matrix a) {
+    if (!a.isSquare()) throw std::runtime_error("det requires a square matrix");
+    size_t n = a.rows;
+    double det = 1.0;
+    for (size_t i = 0; i < n; ++i) {
+        size_t pivot = i;
+        for (size_t j = i + 1; j < n; ++j) {
+            if (std::fabs(a.at(j, i)) > std::fabs(a.at(pivot, i))) pivot = j;
+        }
+        if (std::fabs(a.at(pivot, i)) < 1e-12) return 0.0;
+        if (pivot != i) {
+            for (size_t k = 0; k < n; ++k) std::swap(a.at(i, k), a.at(pivot, k));
+            det = -det;
+        }
+        det *= a.at(i, i);
+        for (size_t j = i + 1; j < n; ++j) {
+            double factor = a.at(j, i) / a.at(i, i);
+            for (size_t k = i; k < n; ++k) a.at(j, k) -= factor * a.at(i, k);
+        }
+    }
+    return std::fabs(det) < 1e-12 ? 0.0 : det;
+}
+
+Matrix matrixInv(Matrix a) {
+    if (!a.isSquare()) throw std::runtime_error("inv requires a square matrix");
+    size_t n = a.rows;
+    Matrix inv = matrixEye(n);
+    for (size_t i = 0; i < n; ++i) {
+        size_t pivot = i;
+        for (size_t j = i + 1; j < n; ++j) {
+            if (std::fabs(a.at(j, i)) > std::fabs(a.at(pivot, i))) pivot = j;
+        }
+        if (std::fabs(a.at(pivot, i)) < 1e-12)
+            throw std::runtime_error("Matrix is singular (non-invertible)");
+        if (pivot != i) {
+            for (size_t k = 0; k < n; ++k) {
+                std::swap(a.at(i, k), a.at(pivot, k));
+                std::swap(inv.at(i, k), inv.at(pivot, k));
+            }
+        }
+        double div = a.at(i, i);
+        for (size_t k = 0; k < n; ++k) {
+            a.at(i, k) /= div;
+            inv.at(i, k) /= div;
+        }
+        for (size_t j = 0; j < n; ++j) {
+            if (j != i) {
+                double factor = a.at(j, i);
+                for (size_t k = 0; k < n; ++k) {
+                    a.at(j, k) -= factor * a.at(i, k);
+                    inv.at(j, k) -= factor * inv.at(i, k);
+                }
+            }
+        }
+    }
+    return inv;
+}
+
+double matrixRank(Matrix a) {
+    size_t m = a.rows;
+    size_t n = a.cols;
+    size_t rank = 0;
+    for (size_t col = 0; col < n && rank < m; ++col) {
+        size_t pivot = rank;
+        for (size_t r = rank + 1; r < m; ++r) {
+            if (std::fabs(a.at(r, col)) > std::fabs(a.at(pivot, col))) pivot = r;
+        }
+        if (std::fabs(a.at(pivot, col)) < 1e-12) continue;
+        if (pivot != rank) {
+            for (size_t k = 0; k < n; ++k) std::swap(a.at(rank, k), a.at(pivot, k));
+        }
+        double div = a.at(rank, col);
+        for (size_t k = col; k < n; ++k) a.at(rank, k) /= div;
+        for (size_t r = 0; r < m; ++r) {
+            if (r != rank && std::fabs(a.at(r, col)) > 1e-12) {
+                double factor = a.at(r, col);
+                for (size_t k = col; k < n; ++k) a.at(r, k) -= factor * a.at(rank, k);
+            }
+        }
+        ++rank;
+    }
+    return (double)rank;
+}
+
+Matrix matrixRref(Matrix a) {
+    size_t m = a.rows;
+    size_t n = a.cols;
+    size_t lead = 0;
+    for (size_t r = 0; r < m && lead < n; ++r) {
+        size_t i = r;
+        while (std::fabs(a.at(i, lead)) < 1e-12) {
+            ++i;
+            if (i == m) {
+                i = r;
+                ++lead;
+                if (lead == n) return a;
+            }
+        }
+        if (i != r) {
+            for (size_t k = 0; k < n; ++k) std::swap(a.at(r, k), a.at(i, k));
+        }
+        double div = a.at(r, lead);
+        if (std::fabs(div) > 1e-12) {
+            for (size_t k = 0; k < n; ++k) a.at(r, k) /= div;
+        }
+        for (size_t j = 0; j < m; ++j) {
+            if (j != r) {
+                double factor = a.at(j, lead);
+                for (size_t k = 0; k < n; ++k) a.at(j, k) -= factor * a.at(r, k);
+            }
+        }
+        ++lead;
+    }
+    for (size_t i = 0; i < a.data.size(); ++i) {
+        if (std::fabs(a.data[i]) < 1e-12) a.data[i] = 0.0;
+    }
+    return a;
+}
+
+double vectorDot(const Matrix& u, const Matrix& v) {
+    if (u.data.size() != v.data.size() || u.data.empty())
+        throw std::runtime_error("dot requires vectors of equal non-zero dimension");
+    double d = 0.0;
+    for (size_t i = 0; i < u.data.size(); ++i) d += u.data[i] * v.data[i];
+    return d;
+}
+
+Matrix vectorCross(const Matrix& u, const Matrix& v) {
+    if (u.data.size() != 3 || v.data.size() != 3)
+        throw std::runtime_error("cross requires 3-dimensional vectors");
+    Matrix r(1, 3);
+    r.at(0, 0) = u.data[1] * v.data[2] - u.data[2] * v.data[1];
+    r.at(0, 1) = u.data[2] * v.data[0] - u.data[0] * v.data[2];
+    r.at(0, 2) = u.data[0] * v.data[1] - u.data[1] * v.data[0];
+    return r;
+}
+
+double matrixNorm(const Matrix& a) {
+    double sum = 0.0;
+    for (double x : a.data) sum += x * x;
+    return std::sqrt(sum);
+}
+
+// --- Calculus Solvers ------------------------------------------------------
+
+static double adaptiveSimpsonRec(const std::function<double(double)>& f,
+                                 double a, double b, double fa, double fb, double fc,
+                                 double whole, double tol, int depth) {
+    double c = (a + b) / 2.0;
+    double d = (a + c) / 2.0;
+    double e = (c + b) / 2.0;
+    double fd = f(d);
+    double fe = f(e);
+    double left = (c - a) / 6.0 * (fa + 4.0 * fd + fc);
+    double right = (b - c) / 6.0 * (fc + 4.0 * fe + fb);
+    double delta = left + right - whole;
+    if (depth <= 0 || std::fabs(delta) <= 15.0 * tol) {
+        return left + right + delta / 15.0;
+    }
+    return adaptiveSimpsonRec(f, a, c, fa, fc, fd, left, tol / 2.0, depth - 1) +
+           adaptiveSimpsonRec(f, c, b, fc, fb, fe, right, tol / 2.0, depth - 1);
+}
+
+static double numericalIntegrate(const std::function<double(double)>& f, double a, double b) {
+    if (a == b) return 0.0;
+    double c = (a + b) / 2.0;
+    double fa = f(a);
+    double fb = f(b);
+    double fc = f(c);
+    double whole = (b - a) / 6.0 * (fa + 4.0 * fc + fb);
+    return adaptiveSimpsonRec(f, a, b, fa, fb, fc, whole, 1e-9, 20);
+}
+
+static double numericalDiff(const std::function<double(double)>& f, double x0) {
+    double h = 1e-5 * std::max(1.0, std::fabs(x0));
+    double fp2 = f(x0 + 2.0 * h);
+    double fp1 = f(x0 + h);
+    double fm1 = f(x0 - h);
+    double fm2 = f(x0 - 2.0 * h);
+    return (-fp2 + 8.0 * fp1 - 8.0 * fm1 + fm2) / (12.0 * h);
+}
+
+static double numericalLimit(const std::function<double(double)>& f, double c, int dir = 0) {
+    double steps[] = { 1e-3, 1e-5, 1e-7, 1e-9 };
+    double lastVal = 0.0;
+    bool found = false;
+    for (double h : steps) {
+        try {
+            if (dir > 0) {
+                double right = f(c + h);
+                if (std::isfinite(right)) { lastVal = right; found = true; }
+            } else if (dir < 0) {
+                double left = f(c - h);
+                if (std::isfinite(left)) { lastVal = left; found = true; }
+            } else {
+                double right = f(c + h);
+                double left = f(c - h);
+                if (std::isfinite(right) && std::isfinite(left)) {
+                    lastVal = (right + left) / 2.0;
+                    found = true;
+                } else if (std::isfinite(right)) {
+                    lastVal = right; found = true;
+                } else if (std::isfinite(left)) {
+                    lastVal = left; found = true;
+                }
+            }
+        } catch (...) {}
+    }
+    if (found) return lastVal;
+    return f(c);
+}
+
+// --- Special & Number Theory Algorithms ------------------------------------
+
+static double besselJ0(double x) {
+    double ax = std::fabs(x);
+    if (ax < 8.0) {
+        double y = x * x;
+        double ans1 = 57568490574.0 + y * (-13362590354.0 + y * (651619640.7
+                      + y * (-11214424.18 + y * (77392.33017 + y * (-184.9052456)))));
+        double ans2 = 57568490574.0 + y * (1029532985.0 + y * (9494680.718
+                      + y * (59272.64853 + y * (267.8532712 + y * 1.0))));
+        return ans1 / ans2;
+    } else {
+        double z = 8.0 / ax;
+        double y = z * z;
+        double xx = ax - 0.785398164;
+        double p0 = 1.0 + y * (-0.1098628627e-2 + y * (0.2734510407e-4
+                    + y * (-0.2073370639e-5 + y * 0.2093887211e-6)));
+        double q0 = -0.1562499995e-1 + y * (0.1430488765e-3
+                    + y * (-0.6911147651e-5 + y * (0.7621095161e-6 - y * 0.934945152e-7)));
+        return std::sqrt(0.636619772 / ax) * (p0 * std::cos(xx) - z * q0 * std::sin(xx));
+    }
+}
+
+static double besselJ1(double x) {
+    double ax = std::fabs(x);
+    if (ax < 8.0) {
+        double y = x * x;
+        double ans1 = x * (72362614232.0 + y * (-7895059235.0 + y * (242396853.1
+                      + y * (-2972635.139 + y * (15704.48260 + y * (-30.16036606))))));
+        double ans2 = 144725228464.0 + y * (2300535178.0 + y * (18583304.74
+                      + y * (99447.43394 + y * (376.9991397 + y * 1.0))));
+        return ans1 / ans2;
+    } else {
+        double z = 8.0 / ax;
+        double y = z * z;
+        double xx = ax - 2.356194491;
+        double p1 = 1.0 + y * (0.183105e-2 + y * (-0.3516396496e-4
+                    + y * (0.2217540007e-5 - y * 0.2093887211e-6)));
+        double q1 = 0.04687499995 + y * (-0.2002690873e-3
+                    + y * (0.8449199096e-5 + y * (-0.8836181e-6 + y * 0.1016669e-6)));
+        double ans = std::sqrt(0.636619772 / ax) * (p1 * std::cos(xx) - z * q1 * std::sin(xx));
+        return (x < 0.0) ? -ans : ans;
+    }
+}
+
+static double besselY0(double x) {
+    if (x <= 0.0) throw std::runtime_error("bessely0 needs positive input");
+    if (x < 8.0) {
+        double j0 = besselJ0(x);
+        double y = x * x;
+        double ans1 = -2957821389.0 + y * (7062834065.0 + y * (-512359803.6
+                      + y * (10879881.29 + y * (-86327.92757 + y * 228.4622733))));
+        double ans2 = 40076544269.0 + y * (745249964.8 + y * (7189466.438
+                      + y * (47447.26470 + y * (226.1030244 + y * 1.0))));
+        return (ans1 / ans2) + 0.636619772 * j0 * std::log(x);
+    } else {
+        double z = 8.0 / x;
+        double y = z * z;
+        double xx = x - 0.785398164;
+        double p0 = 1.0 + y * (-0.1098628627e-2 + y * (0.2734510407e-4
+                    + y * (-0.2073370639e-5 + y * 0.2093887211e-6)));
+        double q0 = -0.1562499995e-1 + y * (0.1430488765e-3
+                    + y * (-0.6911147651e-5 + y * (0.7621095161e-6 - y * 0.934945152e-7)));
+        return std::sqrt(0.636619772 / x) * (p0 * std::sin(xx) + z * q0 * std::cos(xx));
+    }
+}
+
+static double besselY1(double x) {
+    if (x <= 0.0) throw std::runtime_error("bessely1 needs positive input");
+    if (x < 8.0) {
+        double j1 = besselJ1(x);
+        double y = x * x;
+        double ans1 = x * (-4900604943.0 + y * (1275274390.0 + y * (-51534381.39
+                      + y * (734926.4532 + y * (-4237.922814 + y * 8.511934407)))));
+        double ans2 = 2499580570.0 + y * (424441966.4 + y * (3733650.367
+                      + y * (22459.04002 + y * (102.0426058 + y * 1.0))));
+        return (ans1 / ans2) + 0.636619772 * (j1 * std::log(x) - 1.0 / x);
+    } else {
+        double z = 8.0 / x;
+        double y = z * z;
+        double xx = x - 2.356194491;
+        double p1 = 1.0 + y * (0.183105e-2 + y * (-0.3516396496e-4
+                    + y * (0.2217540007e-5 - y * 0.2093887211e-6)));
+        double q1 = 0.04687499995 + y * (-0.2002690873e-3
+                    + y * (0.8449199096e-5 + y * (-0.8836181e-6 + y * 0.1016669e-6)));
+        return std::sqrt(0.636619772 / x) * (p1 * std::sin(xx) + z * q1 * std::cos(xx));
+    }
+}
+
+static double lambertW0(double x) {
+    if (x < -0.3678794411714423215955)
+        throw std::runtime_error("lambertw needs input >= -1/e");
+    if (std::fabs(x) < 1e-15) return x;
+    double w = (x < 1.0) ? (x / (1.0 + x / (1.0 + x * 0.5)))
+                         : (std::log(x) - std::log(std::log(x)));
+    for (int iter = 0; iter < 20; ++iter) {
+        double ew = std::exp(w);
+        double f = w * ew - x;
+        double fp = ew * (w + 1.0);
+        double fpp = ew * (w + 2.0);
+        double step = f / (fp - (f * fpp) / (2.0 * fp));
+        w -= step;
+        if (std::fabs(step) < 1e-15) break;
+    }
+    return w;
+}
+
+static double riemannZeta(double s) {
+    if (s == 1.0) throw std::runtime_error("zeta is undefined at 1");
+    if (s == 0.0) return -0.5;
+    if (s == -1.0) return -1.0 / 12.0;
+    if (s == 2.0) return (kSciPi * kSciPi) / 6.0;
+    if (s == 4.0) return (kSciPi * kSciPi * kSciPi * kSciPi) / 90.0;
+    if (s > 1.0) {
+        double sum = 0.0;
+        int N = 40;
+        for (int k = 1; k <= N; ++k) sum += std::pow(k, -s);
+        double term1 = std::pow(N, 1.0 - s) / (s - 1.0);
+        double term2 = 0.5 * std::pow(N, -s);
+        double term3 = (s / 12.0) * std::pow(N, -s - 1.0);
+        return sum + term1 + term2 - term3;
+    }
+    double reflection = std::pow(2.0, s) * std::pow(kSciPi, s - 1.0) *
+                        std::sin(kSciPi * s / 2.0) * std::tgamma(1.0 - s) * riemannZeta(1.0 - s);
+    return reflection;
+}
+
+static double isNumberPrime(double x) {
+    if (x <= 1.0 || std::floor(x) != x) return 0.0;
+    long long n = (long long)x;
+    if (n == 2 || n == 3) return 1.0;
+    if (n % 2 == 0 || n % 3 == 0) return 0.0;
+    for (long long i = 5; i * i <= n; i += 6) {
+        if (n % i == 0 || n % (i + 2) == 0) return 0.0;
+    }
+    return 1.0;
+}
+
+static double calcGcd(double a, double b) {
+    long long ia = std::llround(std::fabs(a));
+    long long ib = std::llround(std::fabs(b));
+    return (double)std::gcd(ia, ib);
+}
+
+static double calcLcm(double a, double b) {
+    long long ia = std::llround(std::fabs(a));
+    long long ib = std::llround(std::fabs(b));
+    if (ia == 0 || ib == 0) return 0.0;
+    return (double)std::lcm(ia, ib);
+}
+
+static std::vector<std::pair<size_t, size_t>> getArgSlices(const Row* row, size_t start = 0, size_t finish = static_cast<size_t>(-1)) {
+    std::vector<std::pair<size_t, size_t>> slices;
+    if (!row || row->items.empty()) return slices;
+    if (finish == static_cast<size_t>(-1)) finish = row->items.size();
+    size_t s = start;
+    for (size_t i = start; i < finish; ++i) {
+        if (row->items[i]->type == ItemType::Operator && row->items[i]->opChar == ',') {
+            slices.emplace_back(s, i);
+            s = i + 1;
+        }
+    }
+    slices.emplace_back(s, finish);
+    return slices;
+}
+
+static std::vector<std::pair<size_t, size_t>> getSemicolonSlices(const Row* row) {
+    std::vector<std::pair<size_t, size_t>> slices;
+    if (!row || row->items.empty()) return slices;
+    size_t s = 0;
+    for (size_t i = 0; i < row->items.size(); ++i) {
+        if (row->items[i]->type == ItemType::Operator && row->items[i]->opChar == ';') {
+            slices.emplace_back(s, i);
+            s = i + 1;
+        }
+    }
+    slices.emplace_back(s, row->items.size());
+    return slices;
+}
+
+EvalValue evalValueAdd(const EvalValue& a, const EvalValue& b) {
+    if (a.isNumber() && b.isNumber()) return EvalValue(a.num + b.num);
+    if (a.isMatrix() && b.isMatrix()) return EvalValue(matrixAdd(a.mat, b.mat));
+    throw std::runtime_error("Cannot add scalar and matrix directly");
+}
+
+EvalValue evalValueSub(const EvalValue& a, const EvalValue& b) {
+    if (a.isNumber() && b.isNumber()) return EvalValue(a.num - b.num);
+    if (a.isMatrix() && b.isMatrix()) return EvalValue(matrixSub(a.mat, b.mat));
+    throw std::runtime_error("Cannot subtract scalar and matrix directly");
+}
+
+EvalValue evalValueMul(const EvalValue& a, const EvalValue& b) {
+    if (a.isNumber() && b.isNumber()) return EvalValue(a.num * b.num);
+    if (a.isNumber() && b.isMatrix()) return EvalValue(matrixScalarMul(b.mat, a.num));
+    if (a.isMatrix() && b.isNumber()) return EvalValue(matrixScalarMul(a.mat, b.num));
+    if (a.isMatrix() && b.isMatrix()) return EvalValue(matrixMul(a.mat, b.mat));
+    throw std::runtime_error("Invalid operands for multiplication");
+}
+
 // Plain double-precision evaluation of a scientific function, with explicit
 // domain errors. Overflow (e.g. exp(1000)) yields +-inf, which the Pro Mode
 // wrapper detects and re-runs in log10 space instead of reporting.
@@ -289,8 +862,43 @@ double applySciFunction(int id, double x, bool degrees) {
         case SciFact: return factorial(x);
         case SciDeg: return x * (180.0 / kSciPi);
         case SciRad: return x * (kSciPi / 180.0);
+        case SciSinc: return (std::fabs(x) < 1e-15) ? 1.0 : (std::sin(x) / x);
+        case SciBesselJ0: return besselJ0(x);
+        case SciBesselJ1: return besselJ1(x);
+        case SciBesselY0: return besselY0(x);
+        case SciBesselY1: return besselY1(x);
+        case SciLambertW: return lambertW0(x);
+        case SciZeta: return riemannZeta(x);
+        case SciIsPrime: return isNumberPrime(x);
+        case SciDet:
+        case SciTrace:
+        case SciRank:
+        case SciNorm:
+            return x;
+        case SciEye:
+            return 1.0;
+        default:
+            break;
     }
     throw std::runtime_error("Unknown function");
+}
+
+static std::unique_ptr<Item> copyItem(const Item* source) {
+    if (!source) return nullptr;
+    auto it = std::make_unique<Item>(source->type);
+    it->numText = source->numText;
+    it->opChar = source->opChar;
+    it->variableName = source->variableName;
+    it->nameText = source->nameText;
+    it->constantName = source->constantName;
+    it->functionId = source->functionId;
+    it->isBracket = source->isBracket;
+    it->isBrace = source->isBrace;
+    if (source->a) it->a = cloneRow(source->a.get());
+    if (source->b) it->b = cloneRow(source->b.get());
+    if (source->c) it->c = cloneRow(source->c.get());
+    if (source->d) it->d = cloneRow(source->d.get());
+    return it;
 }
 
 struct RowParser {
@@ -312,7 +920,48 @@ struct RowParser {
         return it && it->type == ItemType::Operator && it->opChar == c;
     }
 
-    double parseAtom() {
+    MathSet parseSetFromRow(const Row* row) {
+        MathSet s;
+        if (!row || row->items.empty()) return s;
+        auto slices = getArgSlices(row);
+        for (auto& sl : slices) {
+            if (sl.first >= sl.second) continue;
+            if (sl.second == sl.first + 1) {
+                const Item* it = row->items[sl.first].get();
+                if (it->type == ItemType::Variable) {
+                    s.add(std::string(1, it->variableName));
+                    continue;
+                }
+                if (it->type == ItemType::Name) {
+                    s.add(it->nameText);
+                    continue;
+                }
+            }
+            try {
+                RowParser cellParser(row, context, sl.first, sl.second);
+                EvalValue val = cellParser.parseRowValue();
+                if (val.isSymbolic()) s.add(val.text);
+                else if (val.isSet()) s.add(val.setVal.toString());
+                else if (val.isNumber()) {
+                    double num = val.num;
+                    char buf[64];
+                    if (std::floor(num) == num && std::fabs(num) < 1e12) {
+                        std::snprintf(buf, sizeof(buf), "%.0f", num);
+                    } else {
+                        std::snprintf(buf, sizeof(buf), "%.6g", num);
+                    }
+                    s.add(buf);
+                } else {
+                    s.add(rowRangeToPlainString(row, (int)sl.first, (int)sl.second));
+                }
+            } catch (...) {
+                s.add(rowRangeToPlainString(row, (int)sl.first, (int)sl.second));
+            }
+        }
+        return s;
+    }
+
+    EvalValue parseAtomValue() {
         if (atEnd())
             throw std::runtime_error("Incomplete expression");
         const Item* it = items[pos].get();
@@ -325,61 +974,654 @@ struct RowParser {
                 if (numberText.empty() || numberText == ".")
                     throw std::runtime_error("Invalid number");
                 try {
-                    return std::stod(numberText);
+                    return EvalValue(std::stod(numberText));
                 } catch (...) {
                     throw std::runtime_error("Invalid number");
                 }
             }
             case ItemType::Variable:
                 pos++;
-                if (it->variableName == 'x') return context.x;
-                if (it->variableName == 'y') return context.y;
+                if (it->variableName == 'x') return EvalValue(context.x);
+                if (it->variableName == 'y') return EvalValue(context.y);
                 throw std::runtime_error("Unknown variable");
             case ItemType::Fraction: {
                 pos++;
-                double n = evaluate(it->a.get(), context);
-                double d = evaluate(it->b.get(), context);
-                if (d == 0.0) throw std::runtime_error("Division by zero");
-                return n / d;
+                EvalValue n = evaluateValue(it->a.get(), context);
+                EvalValue d = evaluateValue(it->b.get(), context);
+                if (n.isNumber() && d.isNumber()) {
+                    if (d.num == 0.0) throw std::runtime_error("Division by zero");
+                    return EvalValue(n.num / d.num);
+                }
+                if (n.isMatrix() && d.isNumber()) {
+                    if (d.num == 0.0) throw std::runtime_error("Division by zero");
+                    return EvalValue(matrixScalarMul(n.mat, 1.0 / d.num));
+                }
+                if (n.isMatrix() && d.isMatrix()) {
+                    return EvalValue(matrixMul(n.mat, matrixInv(d.mat)));
+                }
+                if (n.isNumber() && d.isMatrix()) {
+                    return EvalValue(matrixScalarMul(matrixInv(d.mat), n.num));
+                }
+                throw std::runtime_error("Invalid fraction");
             }
             case ItemType::Paren: {
                 pos++;
-                return evaluate(it->a.get(), context);
+                if (it->isBrace) {
+                    return EvalValue(parseSetFromRow(it->a.get()));
+                }
+                if (it->isBracket) {
+                    const Row* inner = it->a.get();
+                    if (!inner || inner->items.empty()) return EvalValue(Matrix(0, 0));
+                    bool hasNestedBrackets = false;
+                    for (const auto& child : inner->items) {
+                        if (child->type == ItemType::Paren && child->isBracket) {
+                            hasNestedBrackets = true;
+                            break;
+                        }
+                    }
+                    if (hasNestedBrackets) {
+                        std::vector<std::vector<double>> rowsData;
+                        for (const auto& child : inner->items) {
+                            if (child->type == ItemType::Paren && child->isBracket) {
+                                std::vector<double> rowElements;
+                                auto slices = getArgSlices(child->a.get());
+                                for (auto& sl : slices) {
+                                    RowParser cellParser(child->a.get(), context, sl.first, sl.second);
+                                    rowElements.push_back(cellParser.parseRowValue().asNumber());
+                                }
+                                rowsData.push_back(rowElements);
+                            }
+                        }
+                        if (rowsData.empty()) return EvalValue(Matrix(0, 0));
+                        size_t numRows = rowsData.size();
+                        size_t numCols = rowsData[0].size();
+                        for (size_t r = 1; r < numRows; ++r) {
+                            if (rowsData[r].size() != numCols)
+                                throw std::runtime_error("Matrix rows must have equal lengths");
+                        }
+                        Matrix m(numRows, numCols);
+                        for (size_t r = 0; r < numRows; ++r)
+                            for (size_t c = 0; c < numCols; ++c)
+                                m.at(r, c) = rowsData[r][c];
+                        return EvalValue(m);
+                    }
+                    auto rowSlices = getSemicolonSlices(inner);
+                    if (rowSlices.size() > 1) {
+                        std::vector<std::vector<double>> rowsData;
+                        for (auto& rsl : rowSlices) {
+                            std::vector<double> rowElements;
+                            auto colSlices = getArgSlices(inner, rsl.first, rsl.second);
+                            for (auto& csl : colSlices) {
+                                RowParser cellParser(inner, context, csl.first, csl.second);
+                                rowElements.push_back(cellParser.parseRowValue().asNumber());
+                            }
+                            rowsData.push_back(rowElements);
+                        }
+                        size_t numRows = rowsData.size();
+                        size_t numCols = rowsData.empty() ? 0 : rowsData[0].size();
+                        for (size_t r = 1; r < numRows; ++r) {
+                            if (rowsData[r].size() != numCols)
+                                throw std::runtime_error("Matrix rows must have equal lengths");
+                        }
+                        Matrix m(numRows, numCols);
+                        for (size_t r = 0; r < numRows; ++r)
+                            for (size_t c = 0; c < numCols; ++c)
+                                m.at(r, c) = rowsData[r][c];
+                        return EvalValue(m);
+                    }
+                    auto colSlices = getArgSlices(inner);
+                    if (colSlices.size() > 1) {
+                        Matrix m(1, colSlices.size());
+                        for (size_t c = 0; c < colSlices.size(); ++c) {
+                            RowParser cellParser(inner, context, colSlices[c].first, colSlices[c].second);
+                            m.at(0, c) = cellParser.parseRowValue().asNumber();
+                        }
+                        return EvalValue(m);
+                    }
+                    RowParser cellParser(inner, context, 0, inner->items.size());
+                    EvalValue singleVal = cellParser.parseRowValue();
+                    if (singleVal.isMatrix()) return singleVal;
+                    Matrix m(1, 1);
+                    m.at(0, 0) = singleVal.asNumber();
+                    return EvalValue(m);
+                }
+                return evaluateValue(it->a.get(), context);
             }
             case ItemType::Power: {
                 pos++;
-                double base = evaluate(it->a.get(), context);
-                double exp = evaluate(it->b.get(), context);
-                return std::pow(base, exp);
+                EvalValue base = evaluateValue(it->a.get(), context);
+                EvalValue exp = evaluateValue(it->b.get(), context);
+                if (base.isNumber() && exp.isNumber()) {
+                    return EvalValue(std::pow(base.num, exp.num));
+                }
+                if (base.isMatrix() && exp.isNumber()) {
+                    double p = exp.num;
+                    if (p == -1.0) return EvalValue(matrixInv(base.mat));
+                    if (p >= 0.0 && std::floor(p) == p) {
+                        int ip = static_cast<int>(p);
+                        if (!base.mat.isSquare()) throw std::runtime_error("Matrix power requires square matrix");
+                        Matrix res = matrixEye(base.mat.rows);
+                        Matrix cur = base.mat;
+                        while (ip > 0) {
+                            if (ip & 1) res = matrixMul(res, cur);
+                            cur = matrixMul(cur, cur);
+                            ip >>= 1;
+                        }
+                        return EvalValue(res);
+                    }
+                    throw std::runtime_error("Matrix power requires integer exponent or -1");
+                }
+                throw std::runtime_error("Invalid power operation");
             }
             case ItemType::Sqrt: {
                 pos++;
-                double v = evaluate(it->a.get(), context);
-                if (v < 0.0) throw std::runtime_error("Root of negative number");
-                return std::sqrt(v);
+                EvalValue val = evaluateValue(it->a.get(), context);
+                if (val.isNumber()) {
+                    if (val.num < 0.0) throw std::runtime_error("Root of negative number");
+                    return EvalValue(std::sqrt(val.num));
+                }
+                Matrix res = val.mat;
+                for (double& d : res.data) {
+                    if (d < 0.0) throw std::runtime_error("Root of negative number");
+                    d = std::sqrt(d);
+                }
+                return EvalValue(res);
             }
             case ItemType::Constant:
                 pos++;
-                if (it->constantName == 'p') return kSciPi;
-                if (it->constantName == 'f') return kSciPhi;
-                return kSciE;
+                if (it->constantName == 'p') return EvalValue(kSciPi);
+                if (it->constantName == 'f') return EvalValue(kSciPhi);
+                return EvalValue(kSciE);
             case ItemType::Permutation: {
                 pos++;
-                double n = evaluate(it->a.get(), context);
-                double r = evaluate(it->b.get(), context);
-                return permutation(n, r);
+                double n = evaluateValue(it->a.get(), context).asNumber();
+                double r = evaluateValue(it->b.get(), context).asNumber();
+                return EvalValue(permutation(n, r));
             }
             case ItemType::Combination: {
                 pos++;
-                double n = evaluate(it->a.get(), context);
-                double r = evaluate(it->b.get(), context);
-                return combination(n, r);
+                double n = evaluateValue(it->a.get(), context).asNumber();
+                double r = evaluateValue(it->b.get(), context).asNumber();
+                return EvalValue(combination(n, r));
+            }
+            case ItemType::Integral: {
+                pos++;
+                const Row* integrand = it->a.get();
+                const Row* lower = it->b.get();
+                const Row* upper = it->c.get();
+                char var = it->variableName ? it->variableName : 'x';
+                bool lowerEmpty = rowIsEmpty(lower);
+                bool upperEmpty = rowIsEmpty(upper);
+
+                if (lowerEmpty && upperEmpty) {
+                    std::string res = symbolicIntegrate(integrand, var, true);
+                    return EvalValue(res);
+                } else {
+                    double aVal = lowerEmpty ? 0.0 : evaluateValue(lower, context).asNumber();
+                    double bVal = upperEmpty ? 0.0 : evaluateValue(upper, context).asNumber();
+                    return EvalValue(evalDefiniteIntegral(integrand, aVal, bVal, var, context));
+                }
+            }
+            case ItemType::Derivative: {
+                pos++;
+                const Row* exprRow = it->a.get();
+                const Row* evalPt = it->b.get();
+                char var = it->variableName ? it->variableName : 'x';
+                bool ptEmpty = rowIsEmpty(evalPt);
+
+                if (ptEmpty) {
+                    std::string res = symbolicDifferentiate(exprRow, var);
+                    return EvalValue(res);
+                } else {
+                    double x0 = evaluateValue(evalPt, context).asNumber();
+                    return EvalValue(evalDerivativeAtPoint(exprRow, x0, var, context));
+                }
             }
             case ItemType::Function: {
                 pos++;
                 int functionId = it->functionId;
-                double arg = evaluate(it->a.get(), context);
-                return applySciFunction(functionId, arg, context.degrees);
+                const Row* argRow = it->a.get();
+                if (!argRow || argRow->items.empty())
+                    throw std::runtime_error("Function argument missing");
+                auto slices = getArgSlices(argRow);
+
+                // --- Calculus ---
+                if (functionId == SciIntegrate) {
+                    auto detectVarInSlice = [&](size_t start, size_t finish) -> char {
+                        for (size_t k = start; k < finish; ++k) {
+                            if (argRow->items[k]->type == ItemType::Variable)
+                                return argRow->items[k]->variableName;
+                        }
+                        return 'x';
+                    };
+                    if (slices.size() == 1) {
+                        char var = detectVarInSlice(slices[0].first, slices[0].second);
+                        auto subRow = std::make_unique<Row>();
+                        for (size_t k = slices[0].first; k < slices[0].second; ++k) {
+                            subRow->items.push_back(copyItem(argRow->items[k].get()));
+                        }
+                        std::string res = symbolicIntegrate(subRow.get(), var, true);
+                        return EvalValue(res);
+                    }
+                    if (slices.size() == 2) {
+                        bool secondIsVar = (slices[1].first < slices[1].second &&
+                                            argRow->items[slices[1].first]->type == ItemType::Variable);
+                        if (secondIsVar) {
+                            char var = argRow->items[slices[1].first]->variableName;
+                            double b = (var == 'y') ? context.y : context.x;
+                            auto integrand = [&](double t) -> double {
+                                EvaluationContext sub = context;
+                                if (var == 'y') sub.y = t; else sub.x = t;
+                                RowParser fP(argRow, sub, slices[0].first, slices[0].second);
+                                return fP.parseRowValue().asNumber();
+                            };
+                            return EvalValue(numericalIntegrate(integrand, 0.0, b));
+                        }
+                        char var = detectVarInSlice(slices[0].first, slices[0].second);
+                        RowParser bP(argRow, context, slices[1].first, slices[1].second);
+                        double b = bP.parseRowValue().asNumber();
+                        auto integrand = [&](double t) -> double {
+                            EvaluationContext sub = context;
+                            if (var == 'y') sub.y = t; else sub.x = t;
+                            RowParser fP(argRow, sub, slices[0].first, slices[0].second);
+                            return fP.parseRowValue().asNumber();
+                        };
+                        return EvalValue(numericalIntegrate(integrand, 0.0, b));
+                    }
+                    if (slices.size() == 3) {
+                        bool secondIsVar = (slices[1].first < slices[1].second &&
+                                            argRow->items[slices[1].first]->type == ItemType::Variable);
+                        if (secondIsVar) {
+                            char var = argRow->items[slices[1].first]->variableName;
+                            RowParser bP(argRow, context, slices[2].first, slices[2].second);
+                            double b = bP.parseRowValue().asNumber();
+                            auto integrand = [&](double t) -> double {
+                                EvaluationContext sub = context;
+                                if (var == 'y') sub.y = t; else sub.x = t;
+                                RowParser fP(argRow, sub, slices[0].first, slices[0].second);
+                                return fP.parseRowValue().asNumber();
+                            };
+                            return EvalValue(numericalIntegrate(integrand, 0.0, b));
+                        }
+                        char var = detectVarInSlice(slices[0].first, slices[0].second);
+                        RowParser aP(argRow, context, slices[1].first, slices[1].second);
+                        RowParser bP(argRow, context, slices[2].first, slices[2].second);
+                        double a = aP.parseRowValue().asNumber();
+                        double b = bP.parseRowValue().asNumber();
+                        auto integrand = [&](double t) -> double {
+                            EvaluationContext sub = context;
+                            if (var == 'y') sub.y = t; else sub.x = t;
+                            RowParser fP(argRow, sub, slices[0].first, slices[0].second);
+                            return fP.parseRowValue().asNumber();
+                        };
+                        return EvalValue(numericalIntegrate(integrand, a, b));
+                    }
+                    if (slices.size() == 4) {
+                        char var = 'x';
+                        if (slices[1].first < slices[1].second &&
+                            argRow->items[slices[1].first]->type == ItemType::Variable) {
+                            var = argRow->items[slices[1].first]->variableName;
+                        }
+                        RowParser aP(argRow, context, slices[2].first, slices[2].second);
+                        RowParser bP(argRow, context, slices[3].first, slices[3].second);
+                        double a = aP.parseRowValue().asNumber();
+                        double b = bP.parseRowValue().asNumber();
+                        auto integrand = [&](double t) -> double {
+                            EvaluationContext sub = context;
+                            if (var == 'y') sub.y = t; else sub.x = t;
+                            RowParser fP(argRow, sub, slices[0].first, slices[0].second);
+                            return fP.parseRowValue().asNumber();
+                        };
+                        return EvalValue(numericalIntegrate(integrand, a, b));
+                    }
+                    throw std::runtime_error("integrate expects (f, a, b) or (f, var, a, b)");
+                }
+                if (functionId == SciDiff) {
+                    auto detectVarInSlice = [&](size_t start, size_t finish) -> char {
+                        for (size_t k = start; k < finish; ++k) {
+                            if (argRow->items[k]->type == ItemType::Variable)
+                                return argRow->items[k]->variableName;
+                        }
+                        return 'x';
+                    };
+                    if (slices.size() == 1) {
+                        char var = detectVarInSlice(slices[0].first, slices[0].second);
+                        auto subRow = std::make_unique<Row>();
+                        for (size_t k = slices[0].first; k < slices[0].second; ++k) {
+                            subRow->items.push_back(copyItem(argRow->items[k].get()));
+                        }
+                        double pt = (var == 'y') ? context.y : context.x;
+                        if (pt != 0.0) {
+                            return EvalValue(evalDerivativeAtPoint(subRow.get(), pt, var, context));
+                        }
+                        std::string res = symbolicDifferentiate(subRow.get(), var);
+                        return EvalValue(res);
+                    }
+                    if (slices.size() == 2) {
+                        bool secondIsVar = (slices[1].first < slices[1].second &&
+                                            argRow->items[slices[1].first]->type == ItemType::Variable);
+                        if (secondIsVar) {
+                            char var = argRow->items[slices[1].first]->variableName;
+                            double x0 = (var == 'y') ? context.y : context.x;
+                            auto f = [&](double t) -> double {
+                                EvaluationContext sub = context;
+                                if (var == 'y') sub.y = t; else sub.x = t;
+                                RowParser fP(argRow, sub, slices[0].first, slices[0].second);
+                                return fP.parseRowValue().asNumber();
+                            };
+                            return EvalValue(numericalDiff(f, x0));
+                        }
+                        char var = detectVarInSlice(slices[0].first, slices[0].second);
+                        RowParser x0P(argRow, context, slices[1].first, slices[1].second);
+                        double x0 = x0P.parseRowValue().asNumber();
+                        auto f = [&](double t) -> double {
+                            EvaluationContext sub = context;
+                            if (var == 'y') sub.y = t; else sub.x = t;
+                            RowParser fP(argRow, sub, slices[0].first, slices[0].second);
+                            return fP.parseRowValue().asNumber();
+                        };
+                        return EvalValue(numericalDiff(f, x0));
+                    }
+                    if (slices.size() == 3) {
+                        char var = 'x';
+                        if (slices[1].first < slices[1].second &&
+                            argRow->items[slices[1].first]->type == ItemType::Variable) {
+                            var = argRow->items[slices[1].first]->variableName;
+                        }
+                        RowParser x0P(argRow, context, slices[2].first, slices[2].second);
+                        double x0 = x0P.parseRowValue().asNumber();
+                        auto f = [&](double t) -> double {
+                            EvaluationContext sub = context;
+                            if (var == 'y') sub.y = t; else sub.x = t;
+                            RowParser fP(argRow, sub, slices[0].first, slices[0].second);
+                            return fP.parseRowValue().asNumber();
+                        };
+                        return EvalValue(numericalDiff(f, x0));
+                    }
+                    throw std::runtime_error("diff expects (f, x0), (f, var, x0), or (f)");
+                }
+                if (functionId == SciLimit) {
+                    if (slices.size() >= 2) {
+                        RowParser cP(argRow, context, slices[1].first, slices[1].second);
+                        double c = cP.parseRowValue().asNumber();
+                        int dir = 0;
+                        if (slices.size() >= 3) {
+                            RowParser dP(argRow, context, slices[2].first, slices[2].second);
+                            dir = (dP.parseRowValue().asNumber() < 0) ? -1 : 1;
+                        }
+                        auto f = [&](double t) -> double {
+                            EvaluationContext sub = context;
+                            sub.x = t;
+                            RowParser fP(argRow, sub, slices[0].first, slices[0].second);
+                            return fP.parseRowValue().asNumber();
+                        };
+                        return EvalValue(numericalLimit(f, c, dir));
+                    }
+                    throw std::runtime_error("limit expects (f, c) or (f, c, dir)");
+                }
+                if (functionId == SciSum) {
+                    if (slices.size() == 3) {
+                        RowParser aP(argRow, context, slices[1].first, slices[1].second);
+                        RowParser bP(argRow, context, slices[2].first, slices[2].second);
+                        long long a = static_cast<long long>(std::round(aP.parseRowValue().asNumber()));
+                        long long b = static_cast<long long>(std::round(bP.parseRowValue().asNumber()));
+                        if (std::abs(b - a) > 5000000) throw std::runtime_error("Sum range too large");
+                        double total = 0.0;
+                        for (long long k = a; k <= b; ++k) {
+                            EvaluationContext sub = context;
+                            sub.x = static_cast<double>(k);
+                            RowParser fP(argRow, sub, slices[0].first, slices[0].second);
+                            total += fP.parseRowValue().asNumber();
+                        }
+                        return EvalValue(total);
+                    }
+                    if (slices.size() == 4) {
+                        char var = 'x';
+                        if (slices[1].first < slices[1].second &&
+                            argRow->items[slices[1].first]->type == ItemType::Variable) {
+                            var = argRow->items[slices[1].first]->variableName;
+                        }
+                        RowParser aP(argRow, context, slices[2].first, slices[2].second);
+                        RowParser bP(argRow, context, slices[3].first, slices[3].second);
+                        long long a = static_cast<long long>(std::round(aP.parseRowValue().asNumber()));
+                        long long b = static_cast<long long>(std::round(bP.parseRowValue().asNumber()));
+                        if (std::abs(b - a) > 5000000) throw std::runtime_error("Sum range too large");
+                        double total = 0.0;
+                        for (long long k = a; k <= b; ++k) {
+                            EvaluationContext sub = context;
+                            if (var == 'y') sub.y = static_cast<double>(k);
+                            else sub.x = static_cast<double>(k);
+                            RowParser fP(argRow, sub, slices[0].first, slices[0].second);
+                            total += fP.parseRowValue().asNumber();
+                        }
+                        return EvalValue(total);
+                    }
+                    throw std::runtime_error("sum expects (f, a, b)");
+                }
+                if (functionId == SciProduct) {
+                    if (slices.size() == 3) {
+                        RowParser aP(argRow, context, slices[1].first, slices[1].second);
+                        RowParser bP(argRow, context, slices[2].first, slices[2].second);
+                        long long a = static_cast<long long>(std::round(aP.parseRowValue().asNumber()));
+                        long long b = static_cast<long long>(std::round(bP.parseRowValue().asNumber()));
+                        if (std::abs(b - a) > 5000000) throw std::runtime_error("Product range too large");
+                        double total = 1.0;
+                        for (long long k = a; k <= b; ++k) {
+                            EvaluationContext sub = context;
+                            sub.x = static_cast<double>(k);
+                            RowParser fP(argRow, sub, slices[0].first, slices[0].second);
+                            total *= fP.parseRowValue().asNumber();
+                        }
+                        return EvalValue(total);
+                    }
+                    throw std::runtime_error("product expects (f, a, b)");
+                }
+
+                // --- Matrix operations ---
+                if (functionId == SciEye) {
+                    RowParser p(argRow, context, slices[0].first, slices[0].second);
+                    size_t n = static_cast<size_t>(std::max(1.0, std::round(p.parseRowValue().asNumber())));
+                    return EvalValue(matrixEye(n));
+                }
+                if (functionId == SciZeros) {
+                    RowParser p1(argRow, context, slices[0].first, slices[0].second);
+                    size_t r = static_cast<size_t>(std::max(1.0, std::round(p1.parseRowValue().asNumber())));
+                    size_t c = r;
+                    if (slices.size() >= 2) {
+                        RowParser p2(argRow, context, slices[1].first, slices[1].second);
+                        c = static_cast<size_t>(std::max(1.0, std::round(p2.parseRowValue().asNumber())));
+                    }
+                    return EvalValue(matrixZeros(r, c));
+                }
+                if (functionId == SciOnes) {
+                    RowParser p1(argRow, context, slices[0].first, slices[0].second);
+                    size_t r = static_cast<size_t>(std::max(1.0, std::round(p1.parseRowValue().asNumber())));
+                    size_t c = r;
+                    if (slices.size() >= 2) {
+                        RowParser p2(argRow, context, slices[1].first, slices[1].second);
+                        c = static_cast<size_t>(std::max(1.0, std::round(p2.parseRowValue().asNumber())));
+                    }
+                    return EvalValue(matrixOnes(r, c));
+                }
+                if (functionId == SciDet) {
+                    RowParser p(argRow, context, slices[0].first, slices[0].second);
+                    EvalValue v = p.parseRowValue();
+                    return EvalValue(v.isMatrix() ? matrixDet(v.mat) : v.num);
+                }
+                if (functionId == SciInv) {
+                    RowParser p(argRow, context, slices[0].first, slices[0].second);
+                    EvalValue v = p.parseRowValue();
+                    if (v.isMatrix()) return EvalValue(matrixInv(v.mat));
+                    if (v.num == 0.0) throw std::runtime_error("Division by zero");
+                    return EvalValue(1.0 / v.num);
+                }
+                if (functionId == SciTranspose) {
+                    RowParser p(argRow, context, slices[0].first, slices[0].second);
+                    EvalValue v = p.parseRowValue();
+                    return v.isMatrix() ? EvalValue(matrixTranspose(v.mat)) : v;
+                }
+                if (functionId == SciTrace) {
+                    RowParser p(argRow, context, slices[0].first, slices[0].second);
+                    EvalValue v = p.parseRowValue();
+                    return EvalValue(v.isMatrix() ? matrixTrace(v.mat) : v.num);
+                }
+                if (functionId == SciRank) {
+                    RowParser p(argRow, context, slices[0].first, slices[0].second);
+                    EvalValue v = p.parseRowValue();
+                    return EvalValue(v.isMatrix() ? static_cast<double>(matrixRank(v.mat)) : (v.num != 0.0 ? 1.0 : 0.0));
+                }
+                if (functionId == SciRref) {
+                    RowParser p(argRow, context, slices[0].first, slices[0].second);
+                    EvalValue v = p.parseRowValue();
+                    return v.isMatrix() ? EvalValue(matrixRref(v.mat)) : v;
+                }
+                if (functionId == SciNorm) {
+                    RowParser p(argRow, context, slices[0].first, slices[0].second);
+                    EvalValue v = p.parseRowValue();
+                    return EvalValue(v.isMatrix() ? matrixNorm(v.mat) : std::fabs(v.num));
+                }
+                if (functionId == SciDot) {
+                    if (slices.size() < 2) throw std::runtime_error("dot expects (u, v)");
+                    RowParser p1(argRow, context, slices[0].first, slices[0].second);
+                    RowParser p2(argRow, context, slices[1].first, slices[1].second);
+                    EvalValue v1 = p1.parseRowValue();
+                    EvalValue v2 = p2.parseRowValue();
+                    if (v1.isMatrix() && v2.isMatrix()) return EvalValue(vectorDot(v1.mat, v2.mat));
+                    return EvalValue(v1.asNumber() * v2.asNumber());
+                }
+                if (functionId == SciCross) {
+                    if (slices.size() < 2) throw std::runtime_error("cross expects (u, v)");
+                    RowParser p1(argRow, context, slices[0].first, slices[0].second);
+                    RowParser p2(argRow, context, slices[1].first, slices[1].second);
+                    EvalValue v1 = p1.parseRowValue();
+                    EvalValue v2 = p2.parseRowValue();
+                    if (v1.isMatrix() && v2.isMatrix()) return EvalValue(vectorCross(v1.mat, v2.mat));
+                    throw std::runtime_error("cross product requires 3D vectors");
+                }
+
+                // --- Statistics ---
+                if (functionId == SciMean || functionId == SciMedian || functionId == SciStddev ||
+                    functionId == SciVar || functionId == SciMin || functionId == SciMax) {
+                    std::vector<double> vals;
+                    if (slices.size() == 1) {
+                        RowParser p(argRow, context, slices[0].first, slices[0].second);
+                        EvalValue v = p.parseRowValue();
+                        if (v.isMatrix()) vals = v.mat.data;
+                        else vals.push_back(v.num);
+                    } else {
+                        for (auto& sl : slices) {
+                            RowParser p(argRow, context, sl.first, sl.second);
+                            EvalValue v = p.parseRowValue();
+                            if (v.isMatrix()) {
+                                for (double d : v.mat.data) vals.push_back(d);
+                            } else {
+                                vals.push_back(v.num);
+                            }
+                        }
+                    }
+                    if (vals.empty()) throw std::runtime_error("Empty data for statistical function");
+                    if (functionId == SciMin) return EvalValue(*std::min_element(vals.begin(), vals.end()));
+                    if (functionId == SciMax) return EvalValue(*std::max_element(vals.begin(), vals.end()));
+                    if (functionId == SciMean) {
+                        double sum = 0.0;
+                        for (double x : vals) sum += x;
+                        return EvalValue(sum / vals.size());
+                    }
+                    if (functionId == SciMedian) {
+                        std::sort(vals.begin(), vals.end());
+                        size_t n = vals.size();
+                        if (n % 2 == 1) return EvalValue(vals[n / 2]);
+                        return EvalValue((vals[n / 2 - 1] + vals[n / 2]) * 0.5);
+                    }
+                    if (functionId == SciVar || functionId == SciStddev) {
+                        double sum = 0.0;
+                        for (double x : vals) sum += x;
+                        double mean = sum / vals.size();
+                        double vsum = 0.0;
+                        for (double x : vals) vsum += (x - mean) * (x - mean);
+                        double var = vals.size() > 1 ? vsum / (vals.size() - 1) : 0.0;
+                        return EvalValue(functionId == SciStddev ? std::sqrt(var) : var);
+                    }
+                }
+
+                // --- Two-argument math / Number theory ---
+                if (functionId == SciGcd) {
+                    if (slices.size() < 2) throw std::runtime_error("gcd expects two arguments");
+                    RowParser p1(argRow, context, slices[0].first, slices[0].second);
+                    RowParser p2(argRow, context, slices[1].first, slices[1].second);
+                    return EvalValue(calcGcd(p1.parseRowValue().asNumber(), p2.parseRowValue().asNumber()));
+                }
+                if (functionId == SciLcm) {
+                    if (slices.size() < 2) throw std::runtime_error("lcm expects two arguments");
+                    RowParser p1(argRow, context, slices[0].first, slices[0].second);
+                    RowParser p2(argRow, context, slices[1].first, slices[1].second);
+                    return EvalValue(calcLcm(p1.parseRowValue().asNumber(), p2.parseRowValue().asNumber()));
+                }
+                if (functionId == SciNcrFn) {
+                    if (slices.size() < 2) throw std::runtime_error("nCr expects two arguments");
+                    RowParser p1(argRow, context, slices[0].first, slices[0].second);
+                    RowParser p2(argRow, context, slices[1].first, slices[1].second);
+                    return EvalValue(combination(p1.parseRowValue().asNumber(), p2.parseRowValue().asNumber()));
+                }
+                if (functionId == SciNprFn) {
+                    if (slices.size() < 2) throw std::runtime_error("nPr expects two arguments");
+                    RowParser p1(argRow, context, slices[0].first, slices[0].second);
+                    RowParser p2(argRow, context, slices[1].first, slices[1].second);
+                    return EvalValue(permutation(p1.parseRowValue().asNumber(), p2.parseRowValue().asNumber()));
+                }
+                if (functionId == SciBeta) {
+                    if (slices.size() < 2) throw std::runtime_error("beta expects two arguments");
+                    RowParser p1(argRow, context, slices[0].first, slices[0].second);
+                    RowParser p2(argRow, context, slices[1].first, slices[1].second);
+                    double a = p1.parseRowValue().asNumber();
+                    double b = p2.parseRowValue().asNumber();
+                    if (a <= 0.0 || b <= 0.0) throw std::runtime_error("beta needs positive inputs");
+                    return EvalValue(std::exp(std::lgamma(a) + std::lgamma(b) - std::lgamma(a + b)));
+                }
+                if (functionId == SciHypot) {
+                    if (slices.size() < 2) throw std::runtime_error("hypot expects two arguments");
+                    RowParser p1(argRow, context, slices[0].first, slices[0].second);
+                    RowParser p2(argRow, context, slices[1].first, slices[1].second);
+                    return EvalValue(std::hypot(p1.parseRowValue().asNumber(), p2.parseRowValue().asNumber()));
+                }
+                if (functionId == SciAtan2) {
+                    if (slices.size() < 2) throw std::runtime_error("atan2 expects two arguments (y, x)");
+                    RowParser p1(argRow, context, slices[0].first, slices[0].second);
+                    RowParser p2(argRow, context, slices[1].first, slices[1].second);
+                    double y = p1.parseRowValue().asNumber();
+                    double x = p2.parseRowValue().asNumber();
+                    return EvalValue(context.degrees ? std::atan2(y, x) * (180.0 / kSciPi) : std::atan2(y, x));
+                }
+                if (functionId == SciClamp) {
+                    if (slices.size() < 3) throw std::runtime_error("clamp expects three arguments (val, lo, hi)");
+                    RowParser p1(argRow, context, slices[0].first, slices[0].second);
+                    RowParser p2(argRow, context, slices[1].first, slices[1].second);
+                    RowParser p3(argRow, context, slices[2].first, slices[2].second);
+                    double val = p1.parseRowValue().asNumber();
+                    double lo = p2.parseRowValue().asNumber();
+                    double hi = p3.parseRowValue().asNumber();
+                    return EvalValue(std::clamp(val, lo, hi));
+                }
+                if (functionId == SciLerp) {
+                    if (slices.size() < 3) throw std::runtime_error("lerp expects three arguments (a, b, t)");
+                    RowParser p1(argRow, context, slices[0].first, slices[0].second);
+                    RowParser p2(argRow, context, slices[1].first, slices[1].second);
+                    RowParser p3(argRow, context, slices[2].first, slices[2].second);
+                    double a = p1.parseRowValue().asNumber();
+                    double b = p2.parseRowValue().asNumber();
+                    double t = p3.parseRowValue().asNumber();
+                    return EvalValue(a + t * (b - a));
+                }
+
+                // --- Standard 1-argument functions ---
+                RowParser singleP(argRow, context, slices[0].first, slices[0].second);
+                EvalValue v = singleP.parseRowValue();
+                if (v.isNumber()) {
+                    return EvalValue(applySciFunction(functionId, v.num, context.degrees));
+                }
+                Matrix m = v.mat;
+                for (double& d : m.data) d = applySciFunction(functionId, d, context.degrees);
+                return EvalValue(m);
             }
             case ItemType::Name:
                 throw std::runtime_error("Unknown name");
@@ -393,42 +1635,51 @@ struct RowParser {
         throw std::runtime_error("Unknown item");
     }
 
-    double parseFactor() {
+    EvalValue parseFactorValue() {
         bool neg = false;
         while (peekIsOperatorChar('-') || peekIsOperatorChar('+')) {
             if (peekIsOperatorChar('-')) neg = !neg;
             pos++;
         }
-        double v = parseAtom();
+        EvalValue v = parseAtomValue();
         while (peekIsOperatorChar('!')) {
             pos++;
-            v = factorial(v);
+            if (v.isNumber()) {
+                v = EvalValue(factorial(v.num));
+            } else {
+                for (double& d : v.mat.data) d = factorial(d);
+            }
         }
-        return neg ? -v : v;
+        return neg ? evalValueSub(EvalValue(0.0), v) : v;
     }
 
-    // '*' explicit, or bare adjacency of two atoms (implicit multiplication,
-    // e.g. "2(3+4)" or "2\u221A3").
-    double parseTerm() {
-        double v = parseFactor();
+    EvalValue parseTermValue() {
+        EvalValue v = parseFactorValue();
         for (;;) {
             if (peekIsOperatorChar('*')) {
                 pos++;
-                v *= parseFactor();
+                EvalValue next = parseFactorValue();
+                if (v.isSet() && next.isSet()) {
+                    v = EvalValue(setProduct(v.asSet(), next.asSet()));
+                } else {
+                    v = evalValueMul(v, next);
+                }
                 continue;
             }
             if (peekIsOperatorChar('%')) {
                 pos++;
-                double div = parseFactor();
-                if (div == 0.0) throw std::runtime_error("Division by zero");
-                v = std::fmod(v, div);
+                EvalValue div = parseFactorValue();
+                if (v.isNumber() && div.isNumber()) {
+                    if (div.num == 0.0) throw std::runtime_error("Division by zero");
+                    v = EvalValue(std::fmod(v.num, div.num));
+                } else {
+                    throw std::runtime_error("Modulo requires numbers");
+                }
                 continue;
             }
-            // Implicit multiplication: next token exists and is not a
-            // flat operator (+, -, *, %) -> another atom starts here.
             const Item* nxt = peek();
             if (nxt && nxt->type != ItemType::Operator) {
-                v *= parseFactor();
+                v = evalValueMul(v, parseFactorValue());
                 continue;
             }
             break;
@@ -436,14 +1687,29 @@ struct RowParser {
         return v;
     }
 
-    double parseRow() {
-        if (atEnd()) return 0.0; // empty row evaluates to 0 (e.g. empty exponent)
+    EvalValue parseRowValue() {
+        if (atEnd()) return EvalValue(0.0);
         size_t firstTermStart = pos;
-        double v = parseTerm();
+        EvalValue v = parseTermValue();
         for (;;) {
             if (peekIsOperatorChar('+')) {
                 pos++;
-                v += parseTerm();
+                v = evalValueAdd(v, parseTermValue());
+            } else if (peekIsOperatorChar('U')) {
+                pos++;
+                EvalValue next = parseTermValue();
+                if (v.isSet() && next.isSet()) v = EvalValue(setUnion(v.asSet(), next.asSet()));
+                else throw std::runtime_error("Union requires sets");
+            } else if (peekIsOperatorChar('I')) {
+                pos++;
+                EvalValue next = parseTermValue();
+                if (v.isSet() && next.isSet()) v = EvalValue(setIntersection(v.asSet(), next.asSet()));
+                else throw std::runtime_error("Intersection requires sets");
+            } else if (peekIsOperatorChar('D')) {
+                pos++;
+                EvalValue next = parseTermValue();
+                if (v.isSet() && next.isSet()) v = EvalValue(setDelta(v.asSet(), next.asSet()));
+                else throw std::runtime_error("Delta requires sets");
             } else if (peekIsOperatorChar('-')) {
                 size_t secondTermStart = pos + 1;
                 if (secondTermStart < items.size() &&
@@ -453,13 +1719,13 @@ struct RowParser {
                     if (scan <= items.size() &&
                         sameRange(items, firstTermStart, pos, secondTermStart, scan)) {
                         pos = scan;
-                        v = 0.0;
+                        v = EvalValue(0.0);
                         firstTermStart = pos;
                         continue;
                     }
                 }
                 pos++;
-                v -= parseTerm();
+                v = evalValueSub(v, parseTermValue());
             } else {
                 break;
             }
@@ -468,6 +1734,11 @@ struct RowParser {
             throw std::runtime_error("Malformed expression");
         return v;
     }
+
+    double parseAtom() { return parseAtomValue().asNumber(); }
+    double parseFactor() { return parseFactorValue().asNumber(); }
+    double parseTerm() { return parseTermValue().asNumber(); }
+    double parseRow() { return parseRowValue().asNumber(); }
 };
 
 // --- Pro Mode "super large" arithmetic -------------------------------------
@@ -875,6 +2146,9 @@ struct BigParser {
                 throw std::runtime_error("Unexpected operator");
             case ItemType::Equals:
                 throw std::runtime_error("Equation needs two lines");
+            case ItemType::Integral:
+            case ItemType::Derivative:
+                throw std::runtime_error("Calculus not supported in Pro Big mode");
             case ItemType::CloseParen:
                 throw std::runtime_error("Unmatched closing parenthesis");
         }
@@ -1075,6 +2349,8 @@ struct PolynomialParser {
             case ItemType::Function:
             case ItemType::Permutation:
             case ItemType::Combination:
+            case ItemType::Integral:
+            case ItemType::Derivative:
                 return { { 0, 0, 0 }, false };
         }
         return { { 0, 0, 0 }, false };
@@ -1198,6 +2474,8 @@ struct LinearParser {
             case ItemType::Function:
             case ItemType::Permutation:
             case ItemType::Combination:
+            case ItemType::Integral:
+            case ItemType::Derivative:
                 return { 0, 0, 0, false };
         }
         return { 0, 0, 0, false };
@@ -1249,16 +2527,24 @@ Linear linearizeSide(const Row* row) {
 
 } // namespace
 
-double evaluate(const Row* root, const EvaluationContext& context) {
-    if (!root) return 0.0;
+EvalValue evaluateValue(const Row* root, const EvaluationContext& context) {
+    if (!root) return EvalValue(0.0);
     if (root->items.size() == 5 &&
         root->items[2]->type == ItemType::Operator && root->items[2]->opChar == '-' &&
         isOversizedFactorialRange(root->items, 0, 2) &&
         sameRange(root->items, 0, 2, 3, 5)) {
-        return 0.0;
+        return EvalValue(0.0);
     }
     RowParser p(root, context);
-    return p.parseRow();
+    return p.parseRowValue();
+}
+
+EvalValue evaluateValue(const Row* root) {
+    return evaluateValue(root, EvaluationContext{});
+}
+
+double evaluate(const Row* root, const EvaluationContext& context) {
+    return evaluateValue(root, context).asNumber();
 }
 
 double evaluate(const Row* root) {
@@ -1267,7 +2553,11 @@ double evaluate(const Row* root) {
 
 std::string evaluateToString(const Row* root, const EvaluationContext& context) {
     try {
-        double v = evaluate(root, context);
+        EvalValue val = evaluateValue(root, context);
+        if (val.isSymbolic()) return val.text;
+        if (val.isSet()) return val.setVal.toString();
+        if (val.isMatrix()) return val.mat.toString();
+        double v = val.num;
         if (!std::isfinite(v))
             return std::isnan(v) ? "Error" : (v > 0 ? "Infinity" : "-Infinity");
         std::string radical;
@@ -1286,18 +2576,17 @@ std::string evaluateToString(const Row* root) {
 std::string evaluateProToString(const Row* root, const EvaluationContext& context) {
     bool bigNeeded = false;
     try {
-        double value = evaluate(root, context);
+        EvalValue val = evaluateValue(root, context);
+        if (val.isSymbolic()) return val.text;
+        if (val.isSet()) return val.setVal.toString();
+        if (val.isMatrix()) return val.mat.toString();
+        double value = val.num;
         bigNeeded = !std::isfinite(value);
-        // A plain 0 can still hide a real tiny value that underflowed the
-        // double path (exp(-1000) and friends); Pro Mode reruns the whole
-        // expression in log10 space and keeps that answer when it is
-        // genuinely non-zero.
         if (!bigNeeded && value == 0.0) {
             try {
                 BigValue big = bigEvaluate(root, context);
                 if (!big.isZero) return formatBigValue(big);
             } catch (const std::exception&) {
-                // log10 path does not apply here; keep the plain result.
             }
         }
     } catch (const FactorialTooLargeError&) {

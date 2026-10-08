@@ -61,6 +61,51 @@ const char* sciFunctionName(int id) {
         case SciFact: return "fact";
         case SciDeg: return "deg";
         case SciRad: return "rad";
+        // Calculus
+        case SciIntegrate: return "integrate";
+        case SciDiff: return "diff";
+        case SciLimit: return "limit";
+        case SciSum: return "sum";
+        case SciProduct: return "product";
+        // Matrix & Vector
+        case SciDet: return "det";
+        case SciInv: return "inv";
+        case SciTranspose: return "transpose";
+        case SciTrace: return "trace";
+        case SciRank: return "rank";
+        case SciRref: return "rref";
+        case SciDot: return "dot";
+        case SciCross: return "cross";
+        case SciNorm: return "norm";
+        case SciEye: return "eye";
+        case SciZeros: return "zeros";
+        case SciOnes: return "ones";
+        // Statistics
+        case SciMean: return "mean";
+        case SciMedian: return "median";
+        case SciStddev: return "stddev";
+        case SciVar: return "var";
+        case SciMin: return "min";
+        case SciMax: return "max";
+        // Number Theory
+        case SciGcd: return "gcd";
+        case SciLcm: return "lcm";
+        case SciIsPrime: return "isprime";
+        case SciNcrFn: return "ncr";
+        case SciNprFn: return "npr";
+        // Advanced
+        case SciBeta: return "beta";
+        case SciBesselJ0: return "besselj0";
+        case SciBesselJ1: return "besselj1";
+        case SciBesselY0: return "bessely0";
+        case SciBesselY1: return "bessely1";
+        case SciSinc: return "sinc";
+        case SciLambertW: return "lambertw";
+        case SciHypot: return "hypot";
+        case SciAtan2: return "atan2";
+        case SciZeta: return "zeta";
+        case SciClamp: return "clamp";
+        case SciLerp: return "lerp";
     }
     return "?";
 }
@@ -90,6 +135,33 @@ bool findSciFunction(const std::string& lowerNameIn, int& id) {
     if (lowerNameIn == "factorial") { id = SciFact; return true; }
     if (lowerNameIn == "degrees" || lowerNameIn == "todeg") { id = SciDeg; return true; }
     if (lowerNameIn == "radians" || lowerNameIn == "torad") { id = SciRad; return true; }
+    // Calculus aliases
+    if (lowerNameIn == "int" || lowerNameIn == "integral") { id = SciIntegrate; return true; }
+    if (lowerNameIn == "derivative") { id = SciDiff; return true; }
+    if (lowerNameIn == "lim") { id = SciLimit; return true; }
+    if (lowerNameIn == "sigma") { id = SciSum; return true; }
+    if (lowerNameIn == "prod") { id = SciProduct; return true; }
+    // Matrix aliases
+    if (lowerNameIn == "inverse") { id = SciInv; return true; }
+    if (lowerNameIn == "trans") { id = SciTranspose; return true; }
+    if (lowerNameIn == "tr") { id = SciTrace; return true; }
+    if (lowerNameIn == "mag" || lowerNameIn == "magnitude") { id = SciNorm; return true; }
+    if (lowerNameIn == "identity") { id = SciEye; return true; }
+    // Stats aliases
+    if (lowerNameIn == "avg" || lowerNameIn == "average") { id = SciMean; return true; }
+    if (lowerNameIn == "stdev") { id = SciStddev; return true; }
+    if (lowerNameIn == "variance") { id = SciVar; return true; }
+    // Number Theory aliases
+    if (lowerNameIn == "hcf") { id = SciGcd; return true; }
+    if (lowerNameIn == "prime") { id = SciIsPrime; return true; }
+    if (lowerNameIn == "comb" || lowerNameIn == "combinations") { id = SciNcrFn; return true; }
+    if (lowerNameIn == "perm" || lowerNameIn == "permutations") { id = SciNprFn; return true; }
+    // Advanced aliases
+    if (lowerNameIn == "j0") { id = SciBesselJ0; return true; }
+    if (lowerNameIn == "j1") { id = SciBesselJ1; return true; }
+    if (lowerNameIn == "y0") { id = SciBesselY0; return true; }
+    if (lowerNameIn == "y1") { id = SciBesselY1; return true; }
+    if (lowerNameIn == "lambert") { id = SciLambertW; return true; }
     return false;
 }
 
@@ -133,6 +205,9 @@ static bool isARow(Row* child) {
 static bool isBRow(Row* child) {
     return child && child->owner && child->owner->b.get() == child;
 }
+static bool isCRow(Row* child) {
+    return child && child->owner && child->owner->c.get() == child;
+}
 
 // Remove the structural item at `parent->items[ownerIndex]` and splice
 // `sourceRow`'s items directly into `parent` in its place, instead of
@@ -159,6 +234,8 @@ static void collapseStructuralItem(Expression& expr, Row* parent, int ownerIndex
         // structural children they own must point back to `parent`.
         if (itemPtr->a) itemPtr->a->ownerParentRow = parent;
         if (itemPtr->b) itemPtr->b->ownerParentRow = parent;
+        if (itemPtr->c) itemPtr->c->ownerParentRow = parent;
+        if (itemPtr->d) itemPtr->d->ownerParentRow = parent;
         parent->items.insert(parent->items.begin() + ownerIndex + i, std::move(spliced[i]));
     }
     expr.cursor.row = parent;
@@ -226,15 +303,20 @@ static void serializeItem(const Item* it, std::string& out) {
             out += it->variableName;
             break;
         case ItemType::Operator:
-            out += ' ';
-            out += it->opChar;
-            out += ' ';
+            if (it->opChar == 'U') out += " U ";
+            else if (it->opChar == 'I') out += " \xE2\x88\xA9 ";
+            else if (it->opChar == 'D') out += " \xCE\x94 ";
+            else {
+                out += ' ';
+                out += it->opChar;
+                out += ' ';
+            }
             break;
         case ItemType::Equals:
             out += " = ";
             break;
         case ItemType::CloseParen:
-            out += ')';
+            out += it->isBrace ? '}' : (it->isBracket ? ']' : ')');
             break;
         case ItemType::Fraction:
             out += '(';
@@ -244,9 +326,9 @@ static void serializeItem(const Item* it, std::string& out) {
             out += ')';
             break;
         case ItemType::Paren:
-            out += '(';
+            out += it->isBrace ? '{' : (it->isBracket ? '[' : '(');
             serializeRow(it->a.get(), out);
-            out += ')';
+            out += it->isBrace ? '}' : (it->isBracket ? ']' : ')');
             break;
         case ItemType::Power:
             out += '(';
@@ -269,8 +351,14 @@ static void serializeItem(const Item* it, std::string& out) {
             else out += "e";
             break;
         case ItemType::Function:
-            out += sciFunctionName(it->functionId);
-            out += '(';
+            if (it->functionId == SciIntegrate) {
+                out += "\xE2\x88\xAB(";
+            } else if (it->functionId == SciDiff) {
+                out += "d/dx(";
+            } else {
+                out += sciFunctionName(it->functionId);
+                out += '(';
+            }
             serializeRow(it->a.get(), out);
             out += ')';
             break;
@@ -290,6 +378,36 @@ static void serializeItem(const Item* it, std::string& out) {
                 out += '(';
                 serializeRow(it->b.get(), out);
                 out += ')';
+            }
+            break;
+        }
+        case ItemType::Integral: {
+            out += "\xE2\x88\xAB";
+            if (!rowIsEmpty(it->b.get()) || !rowIsEmpty(it->c.get())) {
+                out += "_(";
+                serializeRow(it->b.get(), out);
+                out += ")^(";
+                serializeRow(it->c.get(), out);
+                out += ")";
+            }
+            out += "(";
+            serializeRow(it->a.get(), out);
+            out += ")d";
+            out += (it->variableName ? it->variableName : 'x');
+            break;
+        }
+        case ItemType::Derivative: {
+            out += "d/d";
+            out += (it->variableName ? it->variableName : 'x');
+            out += "(";
+            serializeRow(it->a.get(), out);
+            out += ")";
+            if (!rowIsEmpty(it->b.get())) {
+                out += "|_(";
+                out += (it->variableName ? it->variableName : 'x');
+                out += "=";
+                serializeRow(it->b.get(), out);
+                out += ")";
             }
             break;
         }
@@ -329,7 +447,7 @@ void deleteRange(Expression& expression, Cursor first, Cursor last) {
     expression.cursor.index = begin;
 }
 
-static std::unique_ptr<Row> cloneRow(const Row* source, Item* owner, Row* parent) {
+std::unique_ptr<Row> cloneRow(const Row* source, Item* owner, Row* parent) {
     auto copy = std::make_unique<Row>();
     copy->owner = owner;
     copy->ownerParentRow = parent;
@@ -342,9 +460,13 @@ static std::unique_ptr<Row> cloneRow(const Row* source, Item* owner, Row* parent
         item->nameText = sourceItem->nameText;
         item->constantName = sourceItem->constantName;
         item->functionId = sourceItem->functionId;
+        item->isBracket = sourceItem->isBracket;
+        item->isBrace = sourceItem->isBrace;
         Item* itemPtr = item.get();
         if (sourceItem->a) item->a = cloneRow(sourceItem->a.get(), itemPtr, copy.get());
         if (sourceItem->b) item->b = cloneRow(sourceItem->b.get(), itemPtr, copy.get());
+        if (sourceItem->c) item->c = cloneRow(sourceItem->c.get(), itemPtr, copy.get());
+        if (sourceItem->d) item->d = cloneRow(sourceItem->d.get(), itemPtr, copy.get());
         copy->items.push_back(std::move(item));
     }
     return copy;
@@ -389,9 +511,18 @@ void insertVariable(Expression& expr, char name) {
 }
 
 void insertOperator(Expression& expr, char op) {
-    if (op != '-' && isBRow(expr.cursor.row) && expr.cursor.row->owner &&
+    if (op == ',' || op == ';') {
+        while (expr.cursor.row && expr.cursor.row->owner &&
+               (expr.cursor.row->owner->type == ItemType::Fraction ||
+                expr.cursor.row->owner->type == ItemType::Power ||
+                expr.cursor.row->owner->type == ItemType::Permutation ||
+                expr.cursor.row->owner->type == ItemType::Combination)) {
+            moveRight(expr);
+        }
+    } else if (isBRow(expr.cursor.row) && expr.cursor.row->owner &&
         expr.cursor.row->owner->type == ItemType::Power &&
-        expr.cursor.index == (int)expr.cursor.row->items.size()) {
+        expr.cursor.index == (int)expr.cursor.row->items.size() &&
+        (op != '-' || !expr.cursor.row->items.empty())) {
         moveRight(expr);
     }
     Row* row = expr.cursor.row;
@@ -446,6 +577,8 @@ static void reparentItemChildren(Item* item, Row* newParentRow) {
     if (!item) return;
     if (item->a) item->a->ownerParentRow = newParentRow;
     if (item->b) item->b->ownerParentRow = newParentRow;
+    if (item->c) item->c->ownerParentRow = newParentRow;
+    if (item->d) item->d->ownerParentRow = newParentRow;
 }
 
 void insertFraction(Expression& expr) {
@@ -589,33 +722,77 @@ void insertOpenParen(Expression& expr) {
     expr.cursor.index = 0;
 }
 
+void insertOpenBracket(Expression& expr) {
+    Row* row = expr.cursor.row;
+    int idx = expr.cursor.index;
+
+    auto pItem = std::make_unique<Item>(ItemType::Paren);
+    pItem->isBracket = true;
+    Item* pPtr = pItem.get();
+    attachRow(pItem->a, pPtr, row);
+
+    row->items.insert(row->items.begin() + idx, std::move(pItem));
+    expr.cursor.row = pPtr->a.get();
+    expr.cursor.index = 0;
+}
+
+void insertOpenBrace(Expression& expr) {
+    Row* row = expr.cursor.row;
+    int idx = expr.cursor.index;
+
+    auto pItem = std::make_unique<Item>(ItemType::Paren);
+    pItem->isBrace = true;
+    Item* pPtr = pItem.get();
+    attachRow(pItem->a, pPtr, row);
+
+    row->items.insert(row->items.begin() + idx, std::move(pItem));
+    expr.cursor.row = pPtr->a.get();
+    expr.cursor.index = 0;
+}
+
+void insertIntegral(Expression& expr) {
+    Row* row = expr.cursor.row;
+    int idx = expr.cursor.index;
+
+    auto item = std::make_unique<Item>(ItemType::Integral);
+    Item* ptr = item.get();
+    ptr->variableName = 'x';
+    attachRow(item->a, ptr, row); // integrand
+    attachRow(item->b, ptr, row); // lower limit
+    attachRow(item->c, ptr, row); // upper limit
+
+    row->items.insert(row->items.begin() + idx, std::move(item));
+    expr.cursor.row = ptr->a.get();
+    expr.cursor.index = 0;
+}
+
+void insertDerivative(Expression& expr) {
+    Row* row = expr.cursor.row;
+    int idx = expr.cursor.index;
+
+    auto item = std::make_unique<Item>(ItemType::Derivative);
+    Item* ptr = item.get();
+    ptr->variableName = 'x';
+    attachRow(item->a, ptr, row); // expression
+    attachRow(item->b, ptr, row); // eval point (optional)
+
+    row->items.insert(row->items.begin() + idx, std::move(item));
+    expr.cursor.row = ptr->a.get();
+    expr.cursor.index = 0;
+}
+
 void insertCloseParen(Expression& expr) {
-    // ')' is structural, not a typed glyph (see header comment): if the
-    // cursor sits anywhere inside an unclosed Paren's inner row, step out
-    // to just after that Paren -- regardless of whether the cursor is at
-    // the row's end, since any content still to the right stays exactly
-    // where it is (inside the paren) either way. This matches how natural
-    // display calculators (Casio fx-991ES) resolve ')'.
-    //
-    // If the cursor is NOT inside an open paren, do nothing. Inserting a
-    // bare ')' character here would draw as a small flat glyph instead of
-    // the tall stretched bracket a real Paren renders, which is exactly
-    // the "mismatched bracket" look this avoids.
-    //
-    // Function and Sqrt argument rows count too: their ')' is part of the
-    // call itself ("sin(30)"), so a ')' typed or pasted while the cursor
-    // is inside the argument steps out of the call rather than littering
-    // the argument row with an unmatched glyph.
     Row* insertionRow = expr.cursor.row;
     int insertionIndex = expr.cursor.index;
     Row* row = insertionRow;
     while (row && row->owner) {
         int k = ownerIndexInParentRow(row);
         if (k < 0) break;
-        if (row->owner->a.get() == row &&
-            (row->owner->type == ItemType::Paren ||
-             row->owner->type == ItemType::Function ||
-             row->owner->type == ItemType::Sqrt)) {
+        if (row->owner->type == ItemType::Paren ||
+            row->owner->type == ItemType::Function ||
+            row->owner->type == ItemType::Sqrt ||
+            row->owner->type == ItemType::Integral ||
+            row->owner->type == ItemType::Derivative) {
             expr.cursor.row = row->ownerParentRow;
             expr.cursor.index = k + 1;
             return;
@@ -662,8 +839,9 @@ void moveLeft(Expression& expr) {
             case ItemType::Paren:
             case ItemType::Sqrt:
             case ItemType::Function:
-                // These have only one child row, so entering from either
-                // side lands in the same place: its end.
+            case ItemType::Integral:
+            case ItemType::Derivative:
+                // These enter into their main row (a) from either side
                 expr.cursor.row = prev->a.get();
                 expr.cursor.index = (int)prev->a->items.size();
                 return;
@@ -672,11 +850,6 @@ void moveLeft(Expression& expr) {
 
     // idx == 0: step out of the current structure, if any.
     if (row->owner) {
-        // Leaving the start of a denominator/exponent steps sideways into
-        // the end of its sibling numerator/base, instead of exiting the
-        // whole structure -- otherwise the numerator would be completely
-        // unreachable by arrow keys once you'd arrowed into the
-        // denominator.
         if (isBRow(row) && isTwoRowStructure(row->owner->type)) {
             Row* a = row->owner->a.get();
             expr.cursor.row = a;
@@ -715,6 +888,8 @@ void moveRight(Expression& expr) {
             case ItemType::Paren:
             case ItemType::Sqrt:
             case ItemType::Function:
+            case ItemType::Integral:
+            case ItemType::Derivative:
                 expr.cursor.row = next->a.get();
                 expr.cursor.index = 0;
                 return;
@@ -723,10 +898,6 @@ void moveRight(Expression& expr) {
 
     // idx == end of row: step out of the current structure, if any.
     if (row->owner) {
-        // Leaving the end of a numerator/base steps sideways into the
-        // start of its sibling denominator/exponent, instead of exiting
-        // the whole structure -- otherwise the denominator would be
-        // completely unreachable by arrow keys.
         if (isARow(row) && isTwoRowStructure(row->owner->type)) {
             Row* b = row->owner->b.get();
             expr.cursor.row = b;
@@ -739,17 +910,11 @@ void moveRight(Expression& expr) {
             expr.cursor.index = k + 1; // land just after the owning item
         }
     }
-    // else: already at the very end of the whole expression; no-op.
 }
 
-// Returns true if the cursor actually moved (i.e. it was inside a
-// denominator/exponent and stepped up into the numerator/base). Callers
-// (e.g. the Up arrow key handler) use this to fall back to other
-// behavior -- like recalling history -- only when there is genuinely
-// nowhere to navigate to inside the current expression.
 bool moveUp(Expression& expr) {
     Row* row = expr.cursor.row;
-    if (isBRow(row)) { // in denominator/exponent -> go to numerator/base
+    if (isBRow(row)) {
         Item* owner = row->owner;
         Row* target = owner->a.get();
         expr.cursor.row = target;
@@ -757,21 +922,48 @@ bool moveUp(Expression& expr) {
             expr.cursor.index = (int)target->items.size();
         return true;
     }
-    // In a-row, or in a single-row structure (Paren/Sqrt), or in root:
-    // no vertical sibling to move to (simplification).
+    if (isARow(row) && row->owner && row->owner->type == ItemType::Integral) {
+        // From integrand (a) -> go to upper limit (c)
+        Item* owner = row->owner;
+        Row* target = owner->c.get();
+        expr.cursor.row = target;
+        if (expr.cursor.index > (int)target->items.size())
+            expr.cursor.index = (int)target->items.size();
+        return true;
+    }
     return false;
 }
 
 // Mirror of moveUp: returns true if the cursor moved.
 bool moveDown(Expression& expr) {
     Row* row = expr.cursor.row;
-    if (isARow(row) && row->owner && isTwoRowStructure(row->owner->type)) {
+    if (isCRow(row) && row->owner && row->owner->type == ItemType::Integral) {
+        // From upper limit (c) -> go to integrand (a)
         Item* owner = row->owner;
-        Row* target = owner->b.get();
+        Row* target = owner->a.get();
         expr.cursor.row = target;
         if (expr.cursor.index > (int)target->items.size())
             expr.cursor.index = (int)target->items.size();
         return true;
+    }
+    if (isARow(row) && row->owner) {
+        if (row->owner->type == ItemType::Integral) {
+            // From integrand (a) -> go to lower limit (b)
+            Item* owner = row->owner;
+            Row* target = owner->b.get();
+            expr.cursor.row = target;
+            if (expr.cursor.index > (int)target->items.size())
+                expr.cursor.index = (int)target->items.size();
+            return true;
+        }
+        if (isTwoRowStructure(row->owner->type) || row->owner->type == ItemType::Derivative) {
+            Item* owner = row->owner;
+            Row* target = owner->b.get();
+            expr.cursor.row = target;
+            if (expr.cursor.index > (int)target->items.size())
+                expr.cursor.index = (int)target->items.size();
+            return true;
+        }
     }
     return false;
 }
@@ -1089,6 +1281,19 @@ static bool normalizeRowNames(Expression& expr, Row* row) {
         } else if (lower == "y") {
             it->type = ItemType::Variable; it->variableName = 'y'; it->nameText.clear();
             changed = true;
+        } else if (lower == "union") {
+            it->type = ItemType::Operator; it->opChar = 'U'; it->nameText.clear();
+            changed = true;
+        } else if (lower == "u") {
+            // "U" converts to union operator
+            it->type = ItemType::Operator; it->opChar = 'U'; it->nameText.clear();
+            changed = true;
+        } else if (lower == "inter" || lower == "intersection") {
+            it->type = ItemType::Operator; it->opChar = 'I'; it->nameText.clear();
+            changed = true;
+        } else if (lower == "delta") {
+            it->type = ItemType::Operator; it->opChar = 'D'; it->nameText.clear();
+            changed = true;
         }
     }
 
@@ -1141,6 +1346,8 @@ void normalizeNames(Expression& expr) {
         for (auto& it : row->items) {
             if (it->a) walk(it->a.get());
             if (it->b) walk(it->b.get());
+            if (it->c) walk(it->c.get());
+            if (it->d) walk(it->d.get());
         }
         normalizeRowNames(expr, row);
     };
@@ -1176,7 +1383,25 @@ static size_t matchNameToken(const std::string& text, size_t k, int& functionId,
         { "arccoth", SciAcoth }, { "log10", SciLog }, { "ceiling", SciCeil },
         { "signum", SciSgn }, { "sign", SciSgn }, { "lngamma", SciLgamma },
         { "factorial", SciFact }, { "degrees", SciDeg }, { "todeg", SciDeg },
-        { "radians", SciRad }, { "torad", SciRad }
+        { "radians", SciRad }, { "torad", SciRad },
+        // Calculus
+        { "int", SciIntegrate }, { "integral", SciIntegrate },
+        { "derivative", SciDiff }, { "lim", SciLimit },
+        { "sigma", SciSum }, { "prod", SciProduct },
+        // Matrix
+        { "inverse", SciInv }, { "trans", SciTranspose }, { "tr", SciTrace },
+        { "mag", SciNorm }, { "magnitude", SciNorm }, { "identity", SciEye },
+        // Stats
+        { "avg", SciMean }, { "average", SciMean },
+        { "stdev", SciStddev }, { "variance", SciVar },
+        // Number Theory
+        { "hcf", SciGcd }, { "prime", SciIsPrime },
+        { "comb", SciNcrFn }, { "combinations", SciNcrFn },
+        { "perm", SciNprFn }, { "permutations", SciNprFn },
+        // Advanced
+        { "j0", SciBesselJ0 }, { "j1", SciBesselJ1 },
+        { "y0", SciBesselY0 }, { "y1", SciBesselY1 },
+        { "lambert", SciLambertW }
     };
     for (const auto& a : kAliases) {
         size_t len = std::strlen(a.alias);
@@ -1234,15 +1459,95 @@ void insertFromText(Expression& expr, const std::string& text) {
             if (b2 == 0x80) { insertConstant(expr, 'p'); i += 2; continue; }
             if (b2 == 0x86) { insertConstant(expr, 'f'); i += 2; continue; }
         }
+        // UTF-8 ∫ (\xE2\x88\xAB)
+        if (i + 2 < text.size() && (unsigned char)text[i] == 0xE2 &&
+            (unsigned char)text[i + 1] == 0x88 && (unsigned char)text[i + 2] == 0xAB) {
+            i += 3;
+            if (i < text.size() && text[i] == '(') {
+                insertFunction(expr, SciIntegrate);
+                ++i;
+            } else {
+                insertIntegral(expr);
+            }
+            continue;
+        }
+        // UTF-8 ∪ (\xE2\x88\xAA)
+        if (i + 2 < text.size() && (unsigned char)text[i] == 0xE2 &&
+            (unsigned char)text[i + 1] == 0x88 && (unsigned char)text[i + 2] == 0xAA) {
+            insertOperator(expr, 'U');
+            i += 3;
+            continue;
+        }
+        // UTF-8 ∩ (\xE2\x88\xA9)
+        if (i + 2 < text.size() && (unsigned char)text[i] == 0xE2 &&
+            (unsigned char)text[i + 1] == 0x88 && (unsigned char)text[i + 2] == 0xA9) {
+            insertOperator(expr, 'I');
+            i += 3;
+            continue;
+        }
+        // UTF-8 Δ (\xCE\x94)
+        if (i + 1 < text.size() && (unsigned char)text[i] == 0xCE &&
+            (unsigned char)text[i + 1] == 0x94) {
+            insertOperator(expr, 'D');
+            i += 2;
+            continue;
+        }
+        if (startsWithCaseInsensitive(text, i, "d/dx", 4)) {
+            i += 4;
+            if (i < text.size() && text[i] == '(') {
+                insertFunction(expr, SciDiff);
+                ++i;
+            } else {
+                insertDerivative(expr);
+            }
+            continue;
+        }
+        if (startsWithCaseInsensitive(text, i, "union", 5)) {
+            insertOperator(expr, 'U');
+            i += 5;
+            continue;
+        }
+        if (startsWithCaseInsensitive(text, i, "inter", 5)) {
+            size_t len = 5;
+            if (startsWithCaseInsensitive(text, i, "intersection", 12)) len = 12;
+            insertOperator(expr, 'I');
+            i += len;
+            continue;
+        }
+        if (startsWithCaseInsensitive(text, i, "delta", 5)) {
+            insertOperator(expr, 'D');
+            i += 5;
+            continue;
+        }
 
         char c = text[i];
         if ((c >= '0' && c <= '9') || c == '.') { insertDigit(expr, c); ++i; continue; }
-        if (c == '+' || c == '-' || c == '*' || c == '!' || c == '%') { insertOperator(expr, c); ++i; continue; }
+        if (c == '+' || c == '-' || c == '*' || c == '!' || c == '%' || c == ',' || c == ';') { insertOperator(expr, c); ++i; continue; }
+        if (c == 'U') { insertOperator(expr, 'U'); ++i; continue; }
         if (c == '/') { insertFraction(expr); ++i; continue; }
         if (c == '=') { insertEquals(expr); ++i; continue; }
         if (c == '(') { insertOpenParen(expr); ++i; continue; }
         if (c == ')') { insertCloseParen(expr); ++i; continue; }
+        if (c == '[') { insertOpenBracket(expr); ++i; continue; }
+        if (c == ']') { insertCloseParen(expr); ++i; continue; }
+        if (c == '{') { insertOpenBrace(expr); ++i; continue; }
+        if (c == '}') { insertCloseParen(expr); ++i; continue; }
         if (c == '^') { insertPower(expr); ++i; continue; }
+
+        if (startsWithCaseInsensitive(text, i, "npr", 3)) {
+            if (!(i + 3 < text.size() && text[i + 3] == '(')) {
+                insertPermutation(expr);
+                i += 3;
+                continue;
+            }
+        }
+        if (startsWithCaseInsensitive(text, i, "ncr", 3)) {
+            if (!(i + 3 < text.size() && text[i + 3] == '(')) {
+                insertCombination(expr);
+                i += 3;
+                continue;
+            }
+        }
 
         int functionId = -1;
         bool isSqrt = false, isPi = false, isPhi = false;
@@ -1260,17 +1565,6 @@ void insertFromText(Expression& expr, const std::string& text) {
                 if (i + fnLen < text.size() && text[i + fnLen] == '(') fnLen++;
             }
             i += fnLen;
-            continue;
-        }
-
-        if (startsWithCaseInsensitive(text, i, "npr", 3)) {
-            insertPermutation(expr);
-            i += 3;
-            continue;
-        }
-        if (startsWithCaseInsensitive(text, i, "ncr", 3)) {
-            insertCombination(expr);
-            i += 3;
             continue;
         }
 

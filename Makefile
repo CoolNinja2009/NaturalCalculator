@@ -22,7 +22,7 @@ OBJECTS  := $(patsubst $(SRC_DIR)/%.cpp,$(BUILD_DIR)/%.o,$(SOURCES))
 
 CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -municode -mwindows -DUNICODE -D_UNICODE
 LDFLAGS  := -static -static-libgcc -static-libstdc++ -municode -mwindows -s
-LIBS     := -lgdi32 -luser32 -lkernel32 -ldwmapi -ladvapi32 -lcomctl32 -lcomdlg32 -lgdiplus -lole32
+LIBS     := -lgdi32 -luser32 -lkernel32 -ldwmapi -ladvapi32 -lcomctl32 -lcomdlg32 -lgdiplus -lole32 -ld3d11 -ldxgi
 
 .PHONY: all clean run test
 
@@ -45,5 +45,7 @@ clean:
 	rm -rf $(BUILD_DIR)
 
 test:
-	$(CXX) -std=c++17 -O2 -Wall -Wextra -Isrc src/expr_tree.cpp src/evaluator.cpp src/layout.cpp src/workspace.cpp tests/calculator_tests.cpp -lgdi32 -o $(BUILD_DIR)/calculator_tests.exe
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Isrc src/expr_tree.cpp src/evaluator.cpp src/layout.cpp src/workspace.cpp src/graph.cpp src/symbolic.cpp tests/calculator_tests.cpp -lgdi32 -o $(BUILD_DIR)/calculator_tests.exe
 	$(BUILD_DIR)/calculator_tests.exe
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Isrc src/expr_tree.cpp src/evaluator.cpp src/layout.cpp src/workspace.cpp src/graph.cpp src/gpu_graph.cpp src/symbolic.cpp tests/gpu_graph_tests.cpp -lgdi32 -ld3d11 -ldxgi -o $(BUILD_DIR)/gpu_graph_tests.exe
+	$(BUILD_DIR)/gpu_graph_tests.exe

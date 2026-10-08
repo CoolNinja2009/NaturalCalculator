@@ -94,9 +94,7 @@ bool Workspace::commitCurrent(const EvaluationContext& context) {
                 // double, log10-domain "m * 10^e" beyond that.
                 entry->result = evaluateProToString(entry->expr->root.get(), context);
             } else {
-                double v = evaluate(entry->expr->root.get(), context);
                 entry->result = evaluateToString(entry->expr->root.get(), context);
-                (void)v;
             }
             entry->isError = false;
         } catch (const std::exception& e) {
@@ -126,6 +124,8 @@ bool Workspace::commitCurrent(const EvaluationContext& context) {
                 }
                 self(item->a.get(), hasX, hasY, self);
                 self(item->b.get(), hasX, hasY, self);
+                self(item->c.get(), hasX, hasY, self);
+                self(item->d.get(), hasX, hasY, self);
             }
         };
         bool hasX = false, hasY = false;

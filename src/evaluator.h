@@ -23,6 +23,7 @@
 #include "expr_tree.h"
 #include <string>
 #include <vector>
+#include <stdexcept>
 
 struct EvaluationContext {
 	double x = 0.0;
@@ -37,7 +38,76 @@ struct EvaluationContext {
 	bool degrees = true;
 };
 
-// Evaluate the whole expression. Throws std::runtime_error on error.
+struct Matrix {
+	size_t rows = 0;
+	size_t cols = 0;
+	std::vector<double> data;
+
+	Matrix() = default;
+	Matrix(size_t r, size_t c) : rows(r), cols(c), data(r * c, 0.0) {}
+	Matrix(size_t r, size_t c, const std::vector<double>& d) : rows(r), cols(c), data(d) {}
+
+	double& at(size_t r, size_t c) { return data[r * cols + c]; }
+	double at(size_t r, size_t c) const { return data[r * cols + c]; }
+	bool isSquare() const { return rows == cols && rows > 0; }
+	std::string toString() const;
+};
+
+struct MathSet {
+	std::vector<std::string> elements;
+	bool contains(const std::string& s) const;
+	void add(const std::string& s);
+	std::string toString() const;
+};
+
+MathSet setUnion(const MathSet& a, const MathSet& b);
+MathSet setIntersection(const MathSet& a, const MathSet& b);
+MathSet setProduct(const MathSet& a, const MathSet& b);
+MathSet setDelta(const MathSet& a, const MathSet& b);
+
+enum class ValueType { Number, Matrix, Symbolic, Set };
+
+struct EvalValue {
+	ValueType type = ValueType::Number;
+	double num = 0.0;
+	Matrix mat;
+	std::string text;
+	MathSet setVal;
+
+	EvalValue() = default;
+	EvalValue(double n) : type(ValueType::Number), num(n) {}
+	EvalValue(const Matrix& m) : type(ValueType::Matrix), mat(m) {}
+	EvalValue(const std::string& s) : type(ValueType::Symbolic), text(s) {}
+	EvalValue(const MathSet& s) : type(ValueType::Set), setVal(s) {}
+
+	bool isNumber() const { return type == ValueType::Number; }
+	bool isMatrix() const { return type == ValueType::Matrix; }
+	bool isSymbolic() const { return type == ValueType::Symbolic; }
+	bool isSet() const { return type == ValueType::Set; }
+
+	double asNumber() const {
+		if (!isNumber()) throw std::runtime_error("Expected a number");
+		return num;
+	}
+	const Matrix& asMatrix() const {
+		if (!isMatrix()) throw std::runtime_error("Expected a matrix");
+		return mat;
+	}
+	const std::string& asSymbolic() const {
+		if (!isSymbolic()) throw std::runtime_error("Expected symbolic expression");
+		return text;
+	}
+	const MathSet& asSet() const {
+		if (!isSet()) throw std::runtime_error("Expected a set");
+		return setVal;
+	}
+};
+
+// Evaluate the whole expression to an EvalValue (Number or Matrix).
+EvalValue evaluateValue(const Row* root);
+EvalValue evaluateValue(const Row* root, const EvaluationContext& context);
+
+// Evaluate the whole expression to double. Throws std::runtime_error on error.
 double evaluate(const Row* root);
 double evaluate(const Row* root, const EvaluationContext& context);
 

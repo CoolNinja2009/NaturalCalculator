@@ -163,12 +163,21 @@ Size measureNameText(HDC hdc, const std::string& text, int depth) {
 }
 
 std::wstring functionNameGlyph(const Item* it) {
+    if (it->functionId == SciIntegrate) return L"\u222B";
+    if (it->functionId == SciDiff) return L"d/dx";
     const char* name = sciFunctionName(it->functionId);
     return std::wstring(name, name + std::char_traits<char>::length(name));
 }
 
 Size measureFunctionName(HDC hdc, const Item* it, int depth) {
-    return measureNameText(hdc, sciFunctionName(it->functionId), depth);
+    std::wstring w = functionNameGlyph(it);
+    HFONT f = fontForDepth(depth);
+    HFONT old = (HFONT)SelectObject(hdc, f);
+    SIZE sz{};
+    GetTextExtentPoint32W(hdc, w.c_str(), (int)w.size(), &sz);
+    SelectObject(hdc, old);
+    TEXTMETRICW tm = textMetricsForDepth(hdc, depth);
+    return { sz.cx, tm.tmAscent, tm.tmDescent };
 }
 
 const wchar_t* opGlyph(char c) {
@@ -178,6 +187,11 @@ const wchar_t* opGlyph(char c) {
         case '*': return L" \u00D7 ";
         case '%': return L" % ";
         case '!': return L"!";
+        case ',': return L", ";
+        case ';': return L"; ";
+        case 'U': return L" U ";
+        case 'I': return L" \u2229 ";
+        case 'D': return L" \u0394 ";
         default: return L" ";
     }
 }
@@ -343,6 +357,71 @@ Size measureItemImpl(HDC hdc, const Item* it, int depth) {
             s.width = name.width + gap + inner.width + 2 * glyphW;
             s.ascent = std::max(inner.ascent + scaledPx(2, depth), name.ascent);
             s.descent = std::max(inner.descent + scaledPx(2, depth), name.descent);
+            return s;
+        }
+        case ItemType::Integral: {
+            Size integrand = measureRowImpl(hdc, it->a.get(), depth);
+            Size lower = measureRowImpl(hdc, it->b.get(), depth + 1);
+            Size upper = measureRowImpl(hdc, it->c.get(), depth + 1);
+
+            int contentH = std::max(integrand.height(), fontPxForDepth(depth) * 2);
+            int intFontPx = contentH + scaledPx(10, depth);
+            HFONT intFont = CreateFontW(-intFontPx, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                        DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+            HFONT oldFont = (HFONT)SelectObject(hdc, intFont);
+            SIZE intGlyphSz{};
+            GetTextExtentPoint32W(hdc, L"\u222B", 1, &intGlyphSz);
+            SelectObject(hdc, oldFont);
+            DeleteObject(intFont);
+
+            std::wstring diffStr = L" d";
+            diffStr.push_back(it->variableName ? (wchar_t)it->variableName : L'x');
+            HFONT f = fontForDepth(depth);
+            oldFont = (HFONT)SelectObject(hdc, f);
+            SIZE diffSz{};
+            GetTextExtentPoint32W(hdc, diffStr.c_str(), (int)diffStr.size(), &diffSz);
+            SelectObject(hdc, oldFont);
+            TEXTMETRICW tm = textMetricsForDepth(hdc, depth);
+
+            int limitsW = std::max(lower.width, upper.width);
+            int pad = scaledPx(3, depth);
+            Size s;
+            s.width = intGlyphSz.cx + limitsW + pad + integrand.width + pad + diffSz.cx;
+            int upperRaise = (int)(tm.tmAscent * 0.8) + upper.height();
+            int lowerDrop = (int)(tm.tmDescent * 0.8) + lower.height();
+            s.ascent = std::max({integrand.ascent, upperRaise, intFontPx / 2});
+            s.descent = std::max({integrand.descent, lowerDrop, intFontPx / 2});
+            return s;
+        }
+        case ItemType::Derivative: {
+            Size inner = measureRowImpl(hdc, it->a.get(), depth);
+            int glyphW = measureParenWidth(hdc, depth, inner.height());
+            std::wstring dStr = L"d/d";
+            dStr.push_back(it->variableName ? (wchar_t)it->variableName : L'x');
+            HFONT f = fontForDepth(depth);
+            HFONT oldFont = (HFONT)SelectObject(hdc, f);
+            SIZE dSz{};
+            GetTextExtentPoint32W(hdc, dStr.c_str(), (int)dStr.size(), &dSz);
+            SelectObject(hdc, oldFont);
+
+            int totalW = dSz.cx + scaledPx(2, depth) + inner.width + 2 * glyphW;
+            Size evalPt = measureRowImpl(hdc, it->b.get(), depth + 1);
+            std::wstring atStr = L"|_";
+            atStr.push_back(it->variableName ? (wchar_t)it->variableName : L'x');
+            atStr += L"=";
+            oldFont = (HFONT)SelectObject(hdc, fontForDepth(depth + 1));
+            SIZE atSz{};
+            GetTextExtentPoint32W(hdc, atStr.c_str(), (int)atStr.size(), &atSz);
+            SelectObject(hdc, oldFont);
+            int barW = atSz.cx + evalPt.width + scaledPx(4, depth);
+            totalW += barW;
+
+            TEXTMETRICW tm = textMetricsForDepth(hdc, depth);
+            Size s;
+            s.width = totalW;
+            s.ascent = std::max(inner.ascent + scaledPx(2, depth), (int)tm.tmAscent);
+            s.descent = std::max(inner.descent + scaledPx(2, depth), evalPt.height());
             return s;
         }
     }
@@ -518,11 +597,97 @@ void drawItemImpl(HDC hdc, const Item* it, int depth, int x, int baselineY,
             SetTextColor(hdc, theme.text);
             TEXTMETRICW metrics{};
             GetTextMetricsW(hdc, &metrics);
-            TextOutW(hdc, x, baselineY - metrics.tmAscent, L"(", 1);
+            const wchar_t* openG = it->isBrace ? L"{" : (it->isBracket ? L"[" : L"(");
+            const wchar_t* closeG = it->isBrace ? L"}" : (it->isBracket ? L"]" : L")");
+            TextOutW(hdc, x, baselineY - metrics.tmAscent, openG, 1);
             drawRowImpl(hdc, it->a.get(), depth, x + glyphW, baselineY, theme, cursor, outCaret);
-            TextOutW(hdc, x + glyphW + inner.width, baselineY - metrics.tmAscent, L")", 1);
+            TextOutW(hdc, x + glyphW + inner.width, baselineY - metrics.tmAscent, closeG, 1);
             SelectObject(hdc, oldFont);
             DeleteObject(parenFont);
+            return;
+        }
+        case ItemType::Integral: {
+            Size integrand = measureRowImpl(hdc, it->a.get(), depth);
+            Size lower = measureRowImpl(hdc, it->b.get(), depth + 1);
+            Size upper = measureRowImpl(hdc, it->c.get(), depth + 1);
+
+            int contentH = std::max(integrand.height(), fontPxForDepth(depth) * 2);
+            int intFontPx = contentH + scaledPx(10, depth);
+            HFONT intFont = CreateFontW(-intFontPx, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                        DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+            HFONT oldFont = (HFONT)SelectObject(hdc, intFont);
+            SIZE intGlyphSz{};
+            GetTextExtentPoint32W(hdc, L"\u222B", 1, &intGlyphSz);
+            TEXTMETRICW intTm{};
+            GetTextMetricsW(hdc, &intTm);
+
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, theme.operatorColor);
+            TextOutW(hdc, x, baselineY - intTm.tmAscent / 2 - scaledPx(2, depth), L"\u222B", 1);
+            SelectObject(hdc, oldFont);
+            DeleteObject(intFont);
+
+            int limitsX = x + intGlyphSz.cx;
+            int limitsW = std::max(lower.width, upper.width);
+            TEXTMETRICW tm = textMetricsForDepth(hdc, depth);
+
+            // Upper limit
+            int upperY = baselineY - (int)(tm.tmAscent * 0.7) - upper.descent;
+            drawRowImpl(hdc, it->c.get(), depth + 1, limitsX, upperY, theme, cursor, outCaret);
+
+            // Lower limit
+            int lowerY = baselineY + (int)(tm.tmDescent * 0.7) + lower.ascent;
+            drawRowImpl(hdc, it->b.get(), depth + 1, limitsX, lowerY, theme, cursor, outCaret);
+
+            // Integrand
+            int pad = scaledPx(3, depth);
+            int integrandX = limitsX + limitsW + pad;
+            drawRowImpl(hdc, it->a.get(), depth, integrandX, baselineY, theme, cursor, outCaret);
+
+            // "dx"
+            int diffX = integrandX + integrand.width + pad;
+            std::wstring diffStr = L" d";
+            diffStr.push_back(it->variableName ? (wchar_t)it->variableName : L'x');
+            drawText(hdc, depth, diffX, baselineY, diffStr, theme.operatorColor);
+            return;
+        }
+        case ItemType::Derivative: {
+            std::wstring dStr = L"d/d";
+            dStr.push_back(it->variableName ? (wchar_t)it->variableName : L'x');
+            drawText(hdc, depth, x, baselineY, dStr, theme.operatorColor);
+            HFONT f = fontForDepth(depth);
+            HFONT oldFont = (HFONT)SelectObject(hdc, f);
+            SIZE dSz{};
+            GetTextExtentPoint32W(hdc, dStr.c_str(), (int)dStr.size(), &dSz);
+            SelectObject(hdc, oldFont);
+
+            int px = x + dSz.cx + scaledPx(2, depth);
+            Size inner = measureRowImpl(hdc, it->a.get(), depth);
+            int glyphW = measureParenWidth(hdc, depth, inner.height());
+            HFONT parenFont = createParenFont(depth, inner.height());
+            oldFont = (HFONT)SelectObject(hdc, parenFont);
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, theme.text);
+            TEXTMETRICW metrics{};
+            GetTextMetricsW(hdc, &metrics);
+            TextOutW(hdc, px, baselineY - metrics.tmAscent, L"(", 1);
+            drawRowImpl(hdc, it->a.get(), depth, px + glyphW, baselineY, theme, cursor, outCaret);
+            TextOutW(hdc, px + glyphW + inner.width, baselineY - metrics.tmAscent, L")", 1);
+            SelectObject(hdc, oldFont);
+            DeleteObject(parenFont);
+
+            int barX = px + 2 * glyphW + inner.width + scaledPx(2, depth);
+            std::wstring atStr = L"|_";
+            atStr.push_back(it->variableName ? (wchar_t)it->variableName : L'x');
+            atStr += L"=";
+            drawText(hdc, depth + 1, barX, baselineY, atStr, theme.operatorColor);
+            oldFont = (HFONT)SelectObject(hdc, fontForDepth(depth + 1));
+            SIZE atSz{};
+            GetTextExtentPoint32W(hdc, atStr.c_str(), (int)atStr.size(), &atSz);
+            SelectObject(hdc, oldFont);
+            int ptX = barX + atSz.cx + scaledPx(2, depth);
+            drawRowImpl(hdc, it->b.get(), depth + 1, ptX, baselineY + scaledPx(2, depth), theme, cursor, outCaret);
             return;
         }
         case ItemType::Sqrt: {
@@ -667,6 +832,62 @@ void findItemHit(HDC hdc, Row* parent, int index, Item* item, int depth,
             int gap = scaledPx(2, depth);
             findRowHit(hdc, item->a.get(), depth, x + name.width + gap + glyphW,
                        baselineY, pointX, pointY, best);
+            return;
+        }
+        case ItemType::Integral: {
+            Size integrand = measureRowImpl(hdc, item->a.get(), depth);
+            Size lower = measureRowImpl(hdc, item->b.get(), depth + 1);
+            Size upper = measureRowImpl(hdc, item->c.get(), depth + 1);
+
+            int contentH = std::max(integrand.height(), fontPxForDepth(depth) * 2);
+            int intFontPx = contentH + scaledPx(10, depth);
+            HFONT intFont = CreateFontW(-intFontPx, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                        DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+            HFONT oldFont = (HFONT)SelectObject(hdc, intFont);
+            SIZE intGlyphSz{};
+            GetTextExtentPoint32W(hdc, L"\u222B", 1, &intGlyphSz);
+            SelectObject(hdc, oldFont);
+            DeleteObject(intFont);
+
+            int limitsX = x + intGlyphSz.cx;
+            int limitsW = std::max(lower.width, upper.width);
+            TEXTMETRICW tm = textMetricsForDepth(hdc, depth);
+
+            int upperY = baselineY - (int)(tm.tmAscent * 0.7) - upper.descent;
+            int lowerY = baselineY + (int)(tm.tmDescent * 0.7) + lower.ascent;
+            int pad = scaledPx(3, depth);
+            int integrandX = limitsX + limitsW + pad;
+
+            findRowHit(hdc, item->c.get(), depth + 1, limitsX, upperY, pointX, pointY, best);
+            findRowHit(hdc, item->b.get(), depth + 1, limitsX, lowerY, pointX, pointY, best);
+            findRowHit(hdc, item->a.get(), depth, integrandX, baselineY, pointX, pointY, best);
+            return;
+        }
+        case ItemType::Derivative: {
+            std::wstring dStr = L"d/d";
+            dStr.push_back(item->variableName ? (wchar_t)item->variableName : L'x');
+            HFONT f = fontForDepth(depth);
+            HFONT oldFont = (HFONT)SelectObject(hdc, f);
+            SIZE dSz{};
+            GetTextExtentPoint32W(hdc, dStr.c_str(), (int)dStr.size(), &dSz);
+            SelectObject(hdc, oldFont);
+
+            int px = x + dSz.cx + scaledPx(2, depth);
+            Size inner = measureRowImpl(hdc, item->a.get(), depth);
+            int glyphW = measureParenWidth(hdc, depth, inner.height());
+            findRowHit(hdc, item->a.get(), depth, px + glyphW, baselineY, pointX, pointY, best);
+
+            int barX = px + 2 * glyphW + inner.width + scaledPx(2, depth);
+            std::wstring atStr = L"|_";
+            atStr.push_back(item->variableName ? (wchar_t)item->variableName : L'x');
+            atStr += L"=";
+            oldFont = (HFONT)SelectObject(hdc, fontForDepth(depth + 1));
+            SIZE atSz{};
+            GetTextExtentPoint32W(hdc, atStr.c_str(), (int)atStr.size(), &atSz);
+            SelectObject(hdc, oldFont);
+            int ptX = barX + atSz.cx + scaledPx(2, depth);
+            findRowHit(hdc, item->b.get(), depth + 1, ptX, baselineY + scaledPx(2, depth), pointX, pointY, best);
             return;
         }
         case ItemType::Name:

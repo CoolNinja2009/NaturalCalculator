@@ -2,6 +2,7 @@
 #include "expr_tree.h"
 #include "layout.h"
 #include "workspace.h"
+#include "graph.h"
 #include <cassert>
 #include <cmath>
 #include <iostream>
@@ -812,6 +813,9 @@ static void testCombinatoricsNavigationAndEditing() {
     assert(expr.cursor.row == expr.root->items[0]->b.get());
 }
 
+void testCalculusAndMatrices();
+void testNaturalCalculusAndSetOperations();
+
 int main() {
     testVariableEvaluation();
     testSingleVariableEquation();
@@ -834,6 +838,408 @@ int main() {
     testAllScientificFunctions();
     testBigCombinatoricsAndFunctions();
     testCombinatoricsNavigationAndEditing();
+    testCalculusAndMatrices();
+    testNaturalCalculusAndSetOperations();
     std::cout << "All calculator edge-case tests passed\n";
     return 0;
+}
+
+void testCalculusAndMatrices() {
+    EvaluationContext ctx;
+    ctx.degrees = false; // radians for calculus tests
+
+    // 1. Calculus: Integration
+    {
+        Expression e1;
+        insertFromText(e1, "integrate(x^2, 0, 1)");
+        double v1 = evaluate(e1.root.get(), ctx);
+        assertNear(v1, 1.0 / 3.0);
+
+        // UTF-8 ∫ symbol with variable
+        Expression e1Glyph;
+        insertFromText(e1Glyph, "\xE2\x88\xAB(x^2, 0, 1)");
+        double v1Glyph = evaluate(e1Glyph.root.get(), ctx);
+        assertNear(v1Glyph, 1.0 / 3.0);
+
+        Expression e1Var;
+        insertFromText(e1Var, "\xE2\x88\xAB(y^2, y, 0, 2)");
+        double v1Var = evaluate(e1Var.root.get(), ctx);
+        assertNear(v1Var, 8.0 / 3.0);
+
+        Expression e2;
+        insertFromText(e2, "integrate(sin(x), 0, pi)");
+        double v2 = evaluate(e2.root.get(), ctx);
+        assertNear(v2, 2.0);
+    }
+
+    // 2. Calculus: Differentiation
+    {
+        Expression e1;
+        insertFromText(e1, "diff(x^3, 2)");
+        double v1 = evaluate(e1.root.get(), ctx);
+        assertNear(v1, 12.0);
+
+        // d/dx syntax with variables
+        Expression e1Ddx;
+        insertFromText(e1Ddx, "d/dx(x^3, 2)");
+        double v1Ddx = evaluate(e1Ddx.root.get(), ctx);
+        assertNear(v1Ddx, 12.0);
+
+        Expression e1Ddy;
+        insertFromText(e1Ddy, "d/dx(y^4, y, 2)");
+        double v1Ddy = evaluate(e1Ddy.root.get(), ctx);
+        assertNear(v1Ddy, 32.0);
+
+        // d/dx at context variable
+        EvaluationContext ctxDiff = ctx;
+        ctxDiff.x = 4.0;
+        Expression e1Ctx;
+        insertFromText(e1Ctx, "d/dx(x^2)");
+        double v1Ctx = evaluate(e1Ctx.root.get(), ctxDiff);
+        assertNear(v1Ctx, 8.0);
+
+        Expression e2;
+        insertFromText(e2, "diff(sin(x), 0)");
+        double v2 = evaluate(e2.root.get(), ctx);
+        assertNear(v2, 1.0);
+    }
+
+    // 3. Calculus: Limits
+    {
+        Expression e1;
+        insertFromText(e1, "limit(sin(x)/x, 0)");
+        double v1 = evaluate(e1.root.get(), ctx);
+        assertNear(v1, 1.0);
+    }
+
+    // 4. Calculus: Summation & Product
+    {
+        Expression e1;
+        insertFromText(e1, "sum(x^2, 1, 10)");
+        double v1 = evaluate(e1.root.get(), ctx);
+        assertNear(v1, 385.0);
+
+        Expression e2;
+        insertFromText(e2, "product(x, 1, 5)");
+        double v2 = evaluate(e2.root.get(), ctx);
+        assertNear(v2, 120.0);
+    }
+
+    // 5. Matrices: Bracket syntax & operations
+    {
+        Expression eMat;
+        insertFromText(eMat, "[[1, 2], [3, 4]]");
+        EvalValue val = evaluateValue(eMat.root.get(), ctx);
+        assert(val.isMatrix());
+        assert(val.mat.rows == 2 && val.mat.cols == 2);
+        assert(val.mat.at(0, 0) == 1 && val.mat.at(0, 1) == 2);
+        assert(val.mat.at(1, 0) == 3 && val.mat.at(1, 1) == 4);
+
+        // det
+        Expression eDet;
+        insertFromText(eDet, "det([[1, 2], [3, 4]])");
+        assertNear(evaluate(eDet.root.get(), ctx), -2.0);
+
+        // trace
+        Expression eTr;
+        insertFromText(eTr, "trace([[1, 2], [3, 4]])");
+        assertNear(evaluate(eTr.root.get(), ctx), 5.0);
+
+        // transpose
+        Expression eTrans;
+        insertFromText(eTrans, "transpose([[1, 2], [3, 4]])");
+        EvalValue tVal = evaluateValue(eTrans.root.get(), ctx);
+        assert(tVal.isMatrix());
+        assert(tVal.mat.at(0, 1) == 3 && tVal.mat.at(1, 0) == 2);
+
+        // matrix arithmetic
+        Expression eAdd;
+        insertFromText(eAdd, "[[1, 2], [3, 4]] + [[5, 6], [7, 8]]");
+        EvalValue addVal = evaluateValue(eAdd.root.get(), ctx);
+        assert(addVal.isMatrix());
+        assert(addVal.mat.at(0, 0) == 6 && addVal.mat.at(1, 1) == 12);
+
+        Expression eMul;
+        insertFromText(eMul, "[[1, 2], [3, 4]] * [[2, 0], [1, 2]]");
+        EvalValue mulVal = evaluateValue(eMul.root.get(), ctx);
+        assert(mulVal.isMatrix());
+        assert(mulVal.mat.at(0, 0) == 4 && mulVal.mat.at(0, 1) == 4);
+        assert(mulVal.mat.at(1, 0) == 10 && mulVal.mat.at(1, 1) == 8);
+
+        // inverse
+        Expression eInv;
+        insertFromText(eInv, "inv([[4, 7], [2, 6]])");
+        EvalValue invVal = evaluateValue(eInv.root.get(), ctx);
+        assert(invVal.isMatrix());
+        assertNear(invVal.mat.at(0, 0), 0.6);
+        assertNear(invVal.mat.at(0, 1), -0.7);
+
+        // vector dot & cross & norm
+        Expression eDot;
+        insertFromText(eDot, "dot([1, 2, 3], [4, 5, 6])");
+        assertNear(evaluate(eDot.root.get(), ctx), 32.0);
+
+        Expression eCross;
+        insertFromText(eCross, "cross([1, 0, 0], [0, 1, 0])");
+        EvalValue crossVal = evaluateValue(eCross.root.get(), ctx);
+        assert(crossVal.isMatrix());
+        assertNear(crossVal.mat.at(0, 0), 0.0);
+        assertNear(crossVal.mat.at(0, 1), 0.0);
+        assertNear(crossVal.mat.at(0, 2), 1.0);
+
+        Expression eNorm;
+        insertFromText(eNorm, "norm([3, 4])");
+        assertNear(evaluate(eNorm.root.get(), ctx), 5.0);
+    }
+
+    // 6. Statistics
+    {
+        Expression eMean;
+        insertFromText(eMean, "mean(1, 2, 3, 4, 5)");
+        assertNear(evaluate(eMean.root.get(), ctx), 3.0);
+
+        Expression eMed;
+        insertFromText(eMed, "median(1, 5, 2, 8, 7)");
+        assertNear(evaluate(eMed.root.get(), ctx), 5.0);
+
+        Expression eMin;
+        insertFromText(eMin, "min(10, 4, 8)");
+        assertNear(evaluate(eMin.root.get(), ctx), 4.0);
+
+        Expression eMax;
+        insertFromText(eMax, "max(10, 4, 8)");
+        assertNear(evaluate(eMax.root.get(), ctx), 10.0);
+    }
+
+    // 7. Number Theory & Advanced
+    {
+        Expression eGcd;
+        insertFromText(eGcd, "gcd(12, 18)");
+        assertNear(evaluate(eGcd.root.get(), ctx), 6.0);
+
+        Expression eLcm;
+        insertFromText(eLcm, "lcm(4, 6)");
+        assertNear(evaluate(eLcm.root.get(), ctx), 12.0);
+
+        Expression ePrime;
+        insertFromText(ePrime, "isprime(17)");
+        assertNear(evaluate(ePrime.root.get(), ctx), 1.0);
+
+        Expression eNotPrime;
+        insertFromText(eNotPrime, "isprime(18)");
+        assertNear(evaluate(eNotPrime.root.get(), ctx), 0.0);
+
+        Expression eSinc;
+        insertFromText(eSinc, "sinc(0)");
+        assertNear(evaluate(eSinc.root.get(), ctx), 1.0);
+
+        Expression eJ0;
+        insertFromText(eJ0, "besselj0(0)");
+        assertNear(evaluate(eJ0.root.get(), ctx), 1.0);
+
+        Expression eZeta;
+        insertFromText(eZeta, "zeta(2)");
+        assertNear(evaluate(eZeta.root.get(), ctx), 3.141592653589793 * 3.141592653589793 / 6.0);
+    }
+
+    // 8. Graph Equation Analysis & Live Evaluation
+    {
+        // Explicit y = sin(x)
+        Expression g1;
+        insertFromText(g1, "sin(x)");
+        GraphAnalysis a1 = analyzeGraphExpression(g1.root.get(), ctx);
+        assert(a1.isValid);
+        assert(a1.kind == GraphEquationKind::ExplicitY);
+        assertNear(a1.evalExplicit(0.0), 0.0);
+        assertNear(a1.evalExplicit(3.141592653589793 / 2.0), 1.0);
+
+        // Explicit y = x^2 - 4
+        Expression g2;
+        insertFromText(g2, "x^2 - 4");
+        GraphAnalysis a2 = analyzeGraphExpression(g2.root.get(), ctx);
+        assert(a2.isValid);
+        assert(a2.kind == GraphEquationKind::ExplicitY);
+        assertNear(a2.evalExplicit(2.0), 0.0);
+        assertNear(a2.evalExplicit(0.0), -4.0);
+
+        // Explicit y = x^3 - x
+        Expression g3;
+        insertFromText(g3, "y = x^3 - x");
+        GraphAnalysis a3 = analyzeGraphExpression(g3.root.get(), ctx);
+        assert(a3.isValid);
+        assert(a3.kind == GraphEquationKind::ExplicitY);
+        assertNear(a3.evalExplicit(1.0), 0.0);
+        assertNear(a3.evalExplicit(2.0), 6.0);
+
+        // Implicit x^2 + y^2 = 25
+        Expression g4;
+        insertFromText(g4, "x^2 + y^2 = 25");
+        GraphAnalysis a4 = analyzeGraphExpression(g4.root.get(), ctx);
+        assert(a4.isValid);
+        assert(a4.kind == GraphEquationKind::ImplicitXY);
+        assertNear(a4.evalImplicit(3.0, 4.0), 0.0);
+        assertNear(a4.evalImplicit(0.0, 5.0), 0.0);
+
+        // Implicit linear equation 3x + y = 2
+        Expression gLine;
+        insertFromText(gLine, "3x + y = 2");
+        GraphAnalysis aLine = analyzeGraphExpression(gLine.root.get(), ctx);
+        assert(aLine.isValid);
+        assert(aLine.kind == GraphEquationKind::ImplicitXY);
+        assertNear(aLine.evalImplicit(0.0, 2.0), 0.0);
+        assertNear(aLine.evalImplicit(1.0, -1.0), 0.0);
+
+        // Non-graphable (plain scalar 2 + 2)
+        Expression g5;
+        insertFromText(g5, "2 + 2");
+        GraphAnalysis a5 = analyzeGraphExpression(g5.root.get(), ctx);
+        assert(!a5.isValid);
+        assert(a5.kind == GraphEquationKind::None);
+    }
+}
+
+void testNaturalCalculusAndSetOperations() {
+    EvaluationContext ctx;
+
+    // 1. Set operations
+    {
+        // {x} U {y} -> {x, y}
+        Expression sUnion;
+        insertFromText(sUnion, "{x} U {y}");
+        assert(evaluateToString(sUnion.root.get(), ctx) == "{x, y}");
+
+        // typing "union" converts to U
+        Expression sUnionWord;
+        insertFromText(sUnionWord, "{x} union {y}");
+        assert(evaluateToString(sUnionWord.root.get(), ctx) == "{x, y}");
+
+        // Unicode ∪
+        Expression sUnionUnicode;
+        insertFromText(sUnionUnicode, "{x} \xE2\x88\xAA {y}");
+        assert(evaluateToString(sUnionUnicode.root.get(), ctx) == "{x, y}");
+
+        // {x} ∩ {y} -> {}
+        Expression sInter;
+        insertFromText(sInter, "{x} \xE2\x88\xA9 {y}");
+        assert(evaluateToString(sInter.root.get(), ctx) == "{}");
+
+        // typing "inter" converts to ∩
+        Expression sInterWord;
+        insertFromText(sInterWord, "{x} inter {y}");
+        assert(evaluateToString(sInterWord.root.get(), ctx) == "{}");
+
+        // {x} * {y} -> {(x, y)}
+        Expression sProd;
+        insertFromText(sProd, "{x} * {y}");
+        assert(evaluateToString(sProd.root.get(), ctx) == "{(x, y)}");
+
+        // {x} delta {y} -> {x, y}
+        Expression sDeltaWord;
+        insertFromText(sDeltaWord, "{x} delta {y}");
+        assert(evaluateToString(sDeltaWord.root.get(), ctx) == "{x, y}");
+
+        // Unicode Δ
+        Expression sDeltaUnicode;
+        insertFromText(sDeltaUnicode, "{x} \xCE\x94 {y}");
+        assert(evaluateToString(sDeltaUnicode.root.get(), ctx) == "{x, y}");
+
+        // Numeric sets
+        Expression sNumU;
+        insertFromText(sNumU, "{1, 2} U {2, 3}");
+        assert(evaluateToString(sNumU.root.get(), ctx) == "{1, 2, 3}");
+
+        Expression sNumI;
+        insertFromText(sNumI, "{1, 2} \xE2\x88\xA9 {2, 3}");
+        assert(evaluateToString(sNumI.root.get(), ctx) == "{2}");
+
+        Expression sNumP;
+        insertFromText(sNumP, "{1, 2} * {3, 4}");
+        assert(evaluateToString(sNumP.root.get(), ctx) == "{(1, 3), (1, 4), (2, 3), (2, 4)}");
+
+        Expression sNumD;
+        insertFromText(sNumD, "{1, 2} \xCE\x94 {2, 3}");
+        assert(evaluateToString(sNumD.root.get(), ctx) == "{1, 3}");
+    }
+
+    // 2. Natural 2D Integral: Indefinite (empty limits) & Definite (with limits)
+    {
+        // Indefinite: ∫ (3x^2 + 4) dx = x^3 + 4x + C
+        Expression indExpr;
+        insertIntegral(indExpr);
+        // cursor is inside integrand row (a)
+        insertFromText(indExpr, "3x^2 + 4");
+        std::string indRes = evaluateToString(indExpr.root.get(), ctx);
+        assert(indRes.find("+ C") != std::string::npos);
+        assert(indRes == "x^3 + 4x + C");
+
+        // Definite: ∫_1^3 (3x^2 + 4) dx = [x^3 + 4x]_1^3 = (27 + 12) - (1 + 4) = 39 - 5 = 34
+        Expression defExpr;
+        insertIntegral(defExpr);
+        insertFromText(defExpr, "3x^2 + 4");
+        // Fill lower limit row (b)
+        defExpr.cursor.row = defExpr.root->items[0]->b.get();
+        defExpr.cursor.index = 0;
+        insertDigit(defExpr, '1');
+        // Fill upper limit row (c)
+        defExpr.cursor.row = defExpr.root->items[0]->c.get();
+        defExpr.cursor.index = 0;
+        insertDigit(defExpr, '3');
+        std::string defRes = evaluateToString(defExpr.root.get(), ctx);
+        assertNear(std::stod(defRes), 34.0);
+
+        // Definite trig: ∫_0^π sin(x) dx = [-cos(x)]_0^π = 1 - (-1) = 2
+        Expression sinDef;
+        insertIntegral(sinDef);
+        insertFromText(sinDef, "sin(x)");
+        sinDef.cursor.row = sinDef.root->items[0]->b.get();
+        sinDef.cursor.index = 0;
+        insertDigit(sinDef, '0');
+        sinDef.cursor.row = sinDef.root->items[0]->c.get();
+        sinDef.cursor.index = 0;
+        insertConstant(sinDef, 'p'); // pi
+        std::string sinRes = evaluateToString(sinDef.root.get(), ctx);
+        assertNear(std::stod(sinRes), 2.0);
+    }
+
+    // 3. Natural 2D Derivative: Symbolic & Numerical
+    {
+        // Symbolic: d/dx (3x^2 + 4) = 6x
+        Expression symDiff;
+        insertDerivative(symDiff);
+        // cursor is in row a (inner expression)
+        insertFromText(symDiff, "3x^2 + 4");
+        std::string symRes = evaluateToString(symDiff.root.get(), ctx);
+        assert(symRes == "6x");
+
+        // Numerical: d/dx (3x^2 + 4) |_{x = 2} = 6(2) = 12
+        Expression numDiff;
+        insertDerivative(numDiff);
+        insertFromText(numDiff, "3x^2 + 4");
+        // Fill row b (evaluation point)
+        numDiff.cursor.row = numDiff.root->items[0]->b.get();
+        numDiff.cursor.index = 0;
+        insertDigit(numDiff, '2');
+        std::string numRes = evaluateToString(numDiff.root.get(), ctx);
+        assert(std::fabs(std::stod(numRes) - 12.0) < 1e-5);
+    }
+
+    // 4. Graphing Sinusoidal Verification
+    {
+        // In Cartesian coordinate graphs, sin(x) must plot sinusoidal wave in radians
+        // even if calculator base context has degrees = true
+        EvaluationContext degCtx;
+        degCtx.degrees = true;
+        Expression gSin;
+        insertFromText(gSin, "sin(x)");
+        GraphAnalysis aSin = analyzeGraphExpression(gSin.root.get(), degCtx);
+        assert(aSin.isValid);
+        assert(aSin.kind == GraphEquationKind::ExplicitY);
+        // Radians check: sin(0) = 0, sin(pi/2) = 1, sin(pi) = 0, sin(3pi/2) = -1, sin(2pi) = 0
+        constexpr double pi = 3.14159265358979323846;
+        assertNear(aSin.evalExplicit(0.0), 0.0);
+        assertNear(aSin.evalExplicit(pi / 2.0), 1.0);
+        assertNear(aSin.evalExplicit(pi), 0.0);
+        assertNear(aSin.evalExplicit(3.0 * pi / 2.0), -1.0);
+        assertNear(aSin.evalExplicit(2.0 * pi), 0.0);
+    }
 }

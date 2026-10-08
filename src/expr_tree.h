@@ -38,7 +38,9 @@ enum class ItemType {
     Constant,   // pi ('p'), e ('e'), phi ('f') -- leaf
     Function,   // sciFunction(id)(arg) -> child row: argument (a). b unused.
     Permutation,// nPr: a = n (superscript), b = r (subscript)
-    Combination // nCr: a = n (superscript), b = r (subscript)
+    Combination,// nCr: a = n (superscript), b = r (subscript)
+    Integral,   // \int: a = integrand, b = lower limit, c = upper limit
+    Derivative  // d/dx: a = expression, b = eval point (optional)
 };
 
 // Scientific functions available in Calc Pro Max / Scientific mode.
@@ -64,6 +66,18 @@ enum SciFunction {
     SciGamma, SciLgamma, SciErf, SciErfc, SciFact,
     // Angle conversion
     SciDeg, SciRad,
+    // Calculus
+    SciIntegrate, SciDiff, SciLimit, SciSum, SciProduct,
+    // Matrix & Vector
+    SciDet, SciInv, SciTranspose, SciTrace, SciRank, SciRref,
+    SciDot, SciCross, SciNorm, SciEye, SciZeros, SciOnes,
+    // Statistics
+    SciMean, SciMedian, SciStddev, SciVar, SciMin, SciMax,
+    // Number Theory
+    SciGcd, SciLcm, SciIsPrime, SciNcrFn, SciNprFn,
+    // Advanced & Applied Mathematics
+    SciBeta, SciBesselJ0, SciBesselJ1, SciBesselY0, SciBesselY1,
+    SciSinc, SciLambertW, SciHypot, SciAtan2, SciZeta, SciClamp, SciLerp,
     SciFunctionCount
 };
 
@@ -82,24 +96,33 @@ struct Item {
     char variableName = 0; // 'x' or 'y'
 
     // Operator
-    char opChar = 0;       // '+', '-', '*'
+    char opChar = 0;       // '+', '-', '*', '%', ',', ';'
 
     // Name
     std::string nameText;  // word as typed, e.g. "sin"
 
     // Constant
-    char constantName = 0; // 'p' = pi, 'e' = e
+    char constantName = 0; // 'p' = pi, 'e' = e, 'f' = phi
 
     // Function
     int functionId = -1;   // SciFunction enum value
 
+    // Bracket styling: true if square bracket [ ... ] instead of ( ... )
+    bool isBracket = false;
+    // Set / brace styling: true if curly brace { ... }
+    bool isBrace = false;
+
     // Structural children. Meaning depends on `type`:
-    //   Fraction: a = numerator,   b = denominator
-    //   Power:    a = base,        b = exponent
-    //   Paren:    a = inner,       b = unused (nullptr)
-    //   Sqrt:     a = radicand,    b = unused (nullptr)
+    //   Fraction:   a = numerator,   b = denominator
+    //   Power:      a = base,        b = exponent
+    //   Paren:      a = inner,       b = unused (nullptr)
+    //   Sqrt:       a = radicand,    b = unused (nullptr)
+    //   Integral:   a = integrand,   b = lower limit, c = upper limit
+    //   Derivative: a = expr,        b = eval point
     std::unique_ptr<Row> a;
     std::unique_ptr<Row> b;
+    std::unique_ptr<Row> c;
+    std::unique_ptr<Row> d;
 
     explicit Item(ItemType t) : type(t) {}
 };
@@ -136,6 +159,7 @@ struct Expression {
 
 // Copy an expression tree for history recall without sharing editable state.
 std::unique_ptr<Expression> cloneExpression(const Expression& source);
+std::unique_ptr<Row> cloneRow(const Row* source, Item* owner = nullptr, Row* parent = nullptr);
 
 std::string rowRangeToPlainString(const Row* row, int begin, int end);
 void deleteRange(Expression& expression, Cursor first, Cursor last);
@@ -166,10 +190,20 @@ void insertPower(Expression& expr);
 // sqrt button: insert an empty Sqrt at the cursor, cursor moves inside.
 void insertSqrt(Expression& expr);
 
+// '[' key: insert an open bracket for matrices / vectors
+void insertOpenBracket(Expression& expr);
+
+// '{' key: insert an open brace for sets
+void insertOpenBrace(Expression& expr);
+
 // Scientific keys: insert an empty function call, cursor moves into the
 // argument; or insert the pi / e / phi constant leaf.
 void insertFunction(Expression& expr, int functionId);
 void insertConstant(Expression& expr, char which); // 'p' = pi, 'e' = e, 'f' = phi
+
+// Calculus: natural textbook integral and derivative
+void insertIntegral(Expression& expr);
+void insertDerivative(Expression& expr);
 
 // Combinatorics: nPr / nCr. Wrap atom to the left into n, cursor moves to r.
 void insertPermutation(Expression& expr);

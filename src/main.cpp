@@ -30,6 +30,8 @@
 #include "layout.h"
 #include "evaluator.h"
 #include "workspace.h"
+#include "graph.h"
+#include "gpu_graph.h"
 #include "resource.h"
 
 namespace {
@@ -50,7 +52,8 @@ enum Action {
     ActDigit0, ActDigit1, ActDigit2, ActDigit3, ActDigit4,
     ActDigit5, ActDigit6, ActDigit7, ActDigit8, ActDigit9,
     ActDot, ActPlus, ActMinus, ActMul, ActFrac,
-    ActOpenParen, ActCloseParen, ActPower, ActSqrt,
+    ActOpenParen, ActCloseParen, ActOpenBracket, ActComma, ActSemicolon,
+    ActPower, ActSqrt,
     ActEquals, ActClear, ActClearAll, ActToggleTheme, ActBackspace,
     ActVariableX, ActVariableY, ActQuadratic,
     ActPermutation, ActCombination,
@@ -83,7 +86,8 @@ struct App {
     EvaluationContext values;
     bool proMode = false;
     bool degrees = true;   // Pro Max angle unit: true = DEG, false = RAD
-    bool secondPage = false; // 2nd shift for scientific keypad
+    int keypadPage = 0;    // 0 = 1st, 1 = 2nd, 2 = Calc/Matrix
+    GraphState graphState;
     DWORD proModeStarted = 0;
     DWORD explosionStarted = 0;
     bool explosionActive = false;
@@ -96,7 +100,7 @@ struct App {
     bool petDragging = false;
     POINT petDragOffset{};
     std::vector<ButtonDef> buttons;
-    RECT topBarRect{}, historyRect{}, editorRect{}, buttonAreaRect{};
+    RECT topBarRect{}, historyRect{}, editorRect{}, buttonAreaRect{}, graphRect{};
     HFONT uiFont = nullptr;
     HFONT uiFontSmall = nullptr;
     HICON appIcon = nullptr;
@@ -251,12 +255,14 @@ void layoutButtons(int areaLeft, int areaTop, int areaW, int areaH) {
     if (g.proMode) {
         // Scientific pad: three extra key columns to the right of the
         // classic keypad, only in Calc Pro Max / Scientific mode.
-        place(4, 0, 1, L"nPr", ActPermutation, false, false, true);
-        place(5, 0, 1, L"nCr", ActCombination, false, false, true);
-        place(6, 0, 1, g.secondPage ? L"1st" : L"2nd", ActToggle2nd, false, false, true);
-
+        const wchar_t* toggleLabel = (g.keypadPage == 0) ? L"2nd" :
+                                      (g.keypadPage == 1) ? L"Calc" : L"1st";
         auto sciAct = [](int id) -> Action { return (Action)((int)ActSciFirst + id); };
-        if (!g.secondPage) {
+        if (g.keypadPage == 0) {
+            place(4, 0, 1, L"\u222B", sciAct(SciIntegrate), false, false, true);
+            place(5, 0, 1, L"d/dx", sciAct(SciDiff), false, false, true);
+            place(6, 0, 1, toggleLabel, ActToggle2nd, false, false, true);
+
             place(4, 1, 1, L"sin", sciAct(SciSin), false, false, true);
             place(5, 1, 1, L"asin", sciAct(SciAsin), false, false, true);
             place(6, 1, 1, L"sinh", sciAct(SciSinh), false, false, true);
@@ -272,7 +278,11 @@ void layoutButtons(int areaLeft, int areaTop, int areaW, int areaH) {
             place(4, 5, 1, L"\u03C0", ActPi, false, false, true);
             place(5, 5, 1, L"e", ActE, false, false, true);
             place(6, 5, 1, L"|x|", sciAct(SciAbs), false, false, true);
-        } else {
+        } else if (g.keypadPage == 1) {
+            place(4, 0, 1, L"nPr", ActPermutation, false, false, true);
+            place(5, 0, 1, L"nCr", ActCombination, false, false, true);
+            place(6, 0, 1, toggleLabel, ActToggle2nd, false, false, true);
+
             place(4, 1, 1, L"sec", sciAct(SciSec), false, false, true);
             place(5, 1, 1, L"asec", sciAct(SciAsec), false, false, true);
             place(6, 1, 1, L"sech", sciAct(SciSech), false, false, true);
@@ -288,6 +298,26 @@ void layoutButtons(int areaLeft, int areaTop, int areaW, int areaH) {
             place(4, 5, 1, L"\u03C6", ActPhi, false, false, true);
             place(5, 5, 1, L"n!", sciAct(SciFact), false, false, true);
             place(6, 5, 1, L"rnd", sciAct(SciRound), false, false, true);
+        } else {
+            place(4, 0, 1, L"\u222B", sciAct(SciIntegrate), false, false, true);
+            place(5, 0, 1, L"d/dx", sciAct(SciDiff), false, false, true);
+            place(6, 0, 1, toggleLabel, ActToggle2nd, false, false, true);
+
+            place(4, 1, 1, L"lim", sciAct(SciLimit), false, false, true);
+            place(5, 1, 1, L"\u03A3", sciAct(SciSum), false, false, true);
+            place(6, 1, 1, L"\u03A0", sciAct(SciProduct), false, false, true);
+            place(4, 2, 1, L"det", sciAct(SciDet), false, false, true);
+            place(5, 2, 1, L"inv", sciAct(SciInv), false, false, true);
+            place(6, 2, 1, L"trans", sciAct(SciTranspose), false, false, true);
+            place(4, 3, 1, L"trace", sciAct(SciTrace), false, false, true);
+            place(5, 3, 1, L"rref", sciAct(SciRref), false, false, true);
+            place(6, 3, 1, L"norm", sciAct(SciNorm), false, false, true);
+            place(4, 4, 1, L"dot", sciAct(SciDot), false, false, true);
+            place(5, 4, 1, L"cross", sciAct(SciCross), false, false, true);
+            place(6, 4, 1, L"eye", sciAct(SciEye), false, false, true);
+            place(4, 5, 1, L"[", ActOpenBracket, false, false, true);
+            place(5, 5, 1, L"]", ActCloseParen, false, false, true);
+            place(6, 5, 1, L",", ActComma, false, false, true);
         }
     }
 
@@ -303,13 +333,26 @@ void recomputeLayout(const RECT& rc) {
     int editorH = std::max(70, h / 6);
     int buttonAreaH = std::min(420, std::max(300, h * 1 / 2));
 
-    g.topBarRect = { 0, 0, w, topBarH };
-    g.buttonAreaRect = { 0, h - buttonAreaH, w, h };
-    g.editorRect = { 0, g.buttonAreaRect.top - editorH, w, g.buttonAreaRect.top };
-    g.historyRect = { 0, topBarH, w, g.editorRect.top };
+    if (g.proMode && w >= 600) {
+        int calcW = std::clamp((w * 50) / 100, 420, std::max(420, w - 300));
+        g.topBarRect = { 0, 0, calcW, topBarH };
+        g.buttonAreaRect = { 0, h - buttonAreaH, calcW, h };
+        g.editorRect = { 0, g.buttonAreaRect.top - editorH, calcW, g.buttonAreaRect.top };
+        g.historyRect = { 0, topBarH, calcW, g.editorRect.top };
+        g.graphRect = { calcW, 0, w, h };
 
-    layoutButtons(g.buttonAreaRect.left, g.buttonAreaRect.top,
-                  w, g.buttonAreaRect.bottom - g.buttonAreaRect.top);
+        layoutButtons(g.buttonAreaRect.left, g.buttonAreaRect.top,
+                      calcW, g.buttonAreaRect.bottom - g.buttonAreaRect.top);
+    } else {
+        g.topBarRect = { 0, 0, w, topBarH };
+        g.buttonAreaRect = { 0, h - buttonAreaH, w, h };
+        g.editorRect = { 0, g.buttonAreaRect.top - editorH, w, g.buttonAreaRect.top };
+        g.historyRect = { 0, topBarH, w, g.editorRect.top };
+        g.graphRect = { 0, 0, 0, 0 };
+
+        layoutButtons(g.buttonAreaRect.left, g.buttonAreaRect.top,
+                      w, g.buttonAreaRect.bottom - g.buttonAreaRect.top);
+    }
 }
 
 void recomputeLayout() {
@@ -326,13 +369,23 @@ double proTransitionProgress() {
 
 void activateProMode() {
     if (g.proMode) return;
-    RECT client{};
-    GetClientRect(g.hwnd, &client);
     g.proMode = true;
     g.proModeStarted = GetTickCount();
     g.explosionStarted = g.proModeStarted;
     g.explosionActive = true;
-    g.petX = std::max(8, (int)client.right - 62);
+
+    RECT wr{};
+    GetWindowRect(g.hwnd, &wr);
+    int curW = wr.right - wr.left;
+    int curH = wr.bottom - wr.top;
+    if (curW < 960) {
+        SetWindowPos(g.hwnd, nullptr, 0, 0, 960, std::max(curH, 560), SWP_NOMOVE | SWP_NOZORDER);
+    }
+
+    RECT client{};
+    GetClientRect(g.hwnd, &client);
+    recomputeLayout(client);
+    g.petX = std::max(8, (int)g.topBarRect.right - 62);
     int editorHeight = (int)(g.editorRect.bottom - g.editorRect.top);
     g.petY = (int)g.editorRect.top + std::max(6, (editorHeight - 58) / 2);
     setDarkTitleBar(g.hwnd, true);
@@ -381,6 +434,9 @@ void doAction(int action) {
         case ActFrac: insertFraction(cur); break;
         case ActOpenParen: insertOpenParen(cur); break;
         case ActCloseParen: insertCloseParen(cur); break;
+        case ActOpenBracket: insertOpenBracket(cur); break;
+        case ActComma: insertOperator(cur, ','); break;
+        case ActSemicolon: insertOperator(cur, ';'); break;
         case ActPower: insertPower(cur); break;
         case ActSqrt: insertSqrt(cur); break;
         case ActBackspace: backspace(cur); break;
@@ -404,7 +460,7 @@ void doAction(int action) {
             }
             break;
         case ActToggle2nd: {
-            g.secondPage = !g.secondPage;
+            g.keypadPage = (g.keypadPage + 1) % 3;
             RECT rc{};
             GetClientRect(g.hwnd, &rc);
             recomputeLayout(rc);
@@ -439,7 +495,10 @@ void doAction(int action) {
             break;
         default:
             if (action >= ActSciFirst && action <= ActSciLast) {
-                insertFunction(cur, action - ActSciFirst);
+                int sci = action - ActSciFirst;
+                if (sci == SciIntegrate) insertIntegral(cur);
+                else if (sci == SciDiff) insertDerivative(cur);
+                else insertFunction(cur, sci);
             }
             break;
     }
@@ -659,8 +718,12 @@ void pasteExpression() {
         deleteRange(expression, g.selectionAnchor, expression.cursor);
         g.rangeSelected = false;
     }
+    int needed = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
     std::string pasted;
-    for (const wchar_t* p = text; *p; ++p) pasted += (char)std::tolower((char)*p);
+    if (needed > 0) {
+        pasted.resize(needed - 1);
+        WideCharToMultiByte(CP_UTF8, 0, text, -1, &pasted[0], needed, nullptr, nullptr);
+    }
     if (replacingEditorSelection) replaceEditorSelection(pasted);
     else insertPlainText(expression, pasted);
     GlobalUnlock(data);
@@ -1489,6 +1552,22 @@ void paint(HDC hdc, RECT client) {
     }
     drawProExplosion(mem, client, theme);
 
+    // --- live graph panel in scientific mode ---
+    if (g.proMode && g.graphRect.right > g.graphRect.left) {
+        GraphAnalysis analysis = analyzeGraphExpression(g.workspace.current().root.get(), g.values);
+        if (!analysis.isValid && !g.workspace.history().empty()) {
+            analysis = analyzeGraphExpression(g.workspace.history().back()->expr->root.get(), g.values);
+        }
+        renderGraph(mem, g.graphRect, analysis, g.graphState, theme, g.uiFont, g.uiFontSmall);
+
+        HPEN divPen = CreatePen(PS_SOLID, 1, theme.divider);
+        HPEN oldDivPen = (HPEN)SelectObject(mem, divPen);
+        MoveToEx(mem, g.graphRect.left, 0, nullptr);
+        LineTo(mem, g.graphRect.left, client.bottom);
+        SelectObject(mem, oldDivPen);
+        DeleteObject(divPen);
+    }
+
     BitBlt(hdc, 0, 0, client.right, client.bottom, mem, 0, 0, SRCCOPY);
     SelectObject(mem, oldBmp);
     DeleteObject(bmp);
@@ -1501,6 +1580,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE:
             g.hwnd = hwnd;
+            initGpuGraph();
             loadProExplosionAsset();
             setDarkTitleBar(hwnd, g.dark);
             g.uiFont = CreateFontW(-18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
@@ -1521,7 +1601,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_GETMINMAXINFO: {
             MINMAXINFO* mmi = (MINMAXINFO*)lParam;
-            mmi->ptMinTrackSize.x = g.proMode ? 560 : kMinWidth;
+            mmi->ptMinTrackSize.x = g.proMode ? 880 : kMinWidth;
             mmi->ptMinTrackSize.y = kMinHeight;
             return 0;
         }
@@ -1576,6 +1656,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 g.petDragOffset = { pt.x - currentPetBounds.left, pt.y - currentPetBounds.top };
                 SetCapture(hwnd);
                 return 0;
+            }
+            if (g.proMode && PtInRect(&g.graphRect, pt)) {
+                if (handleGraphMouseDown(g.graphState, g.graphRect, (int)pt.x, (int)pt.y)) {
+                    SetCapture(hwnd);
+                    InvalidateRect(hwnd, &g.graphRect, FALSE);
+                    return 0;
+                }
             }
             RECT toggleRect = themeToggleRect();
             RECT xRect = topActionRect(g.topBarRect.right - 68, 28);
@@ -1638,6 +1725,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
+            if (g.proMode) {
+                POINT point = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+                if (handleGraphMouseMove(g.graphState, g.graphRect, (int)point.x, (int)point.y)) {
+                    InvalidateRect(hwnd, &g.graphRect, FALSE);
+                    if (g.graphState.isDragging) return 0;
+                }
+            }
             if (g.editorSelecting) {
                 POINT point = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
                 if (PtInRect(&g.editorRect, point)) {
@@ -1665,6 +1759,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
+            if (g.proMode && g.graphState.isDragging) {
+                handleGraphMouseUp(g.graphState);
+                ReleaseCapture();
+                InvalidateRect(hwnd, &g.graphRect, FALSE);
+                return 0;
+            }
             if (g.editorSelecting) {
                 g.editorSelecting = false;
                 ReleaseCapture();
@@ -1679,6 +1779,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_MOUSEWHEEL: {
             int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+            if (g.proMode) {
+                POINT point = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+                ScreenToClient(hwnd, &point);
+                if (PtInRect(&g.graphRect, point)) {
+                    handleGraphMouseWheel(g.graphState, g.graphRect, (int)point.x, (int)point.y, (short)delta);
+                    InvalidateRect(hwnd, &g.graphRect, FALSE);
+                    return 0;
+                }
+            }
             g.scrollY -= delta / 2;
             if (g.scrollY < 0) g.scrollY = 0;
             InvalidateRect(hwnd, &g.historyRect, FALSE);
@@ -1698,7 +1807,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     return 0;
                 } else if ((c >= L'0' && c <= L'9') || c == L'.' || c == L'+' || c == L'-' ||
                            c == L'*' || c == L'/' || c == L'(' || c == L')' || c == L'^' ||
-                           c == L'!' || c == L'=' || c == L'%' ||
+                           c == L'!' || c == L'=' || c == L'%' || c == L'[' || c == L']' || c == L',' || c == L';' ||
+                           c == L'{' || c == L'}' ||
                            ((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z'))) {
                     text.insert(text.begin() + position, (char)std::tolower((char)c));
                     ++position;
@@ -1709,13 +1819,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
-            if (c == L'!' || c == L'=' || c == L'%')
+            if (c == L'!' || c == L'=' || c == L'%' || c == L',' || c == L';')
                 g.undo.push_back(cloneExpression(g.workspace.current()));
             if (g.editorCaret != g.editorAnchor) {
                 if (c == 8) replaceEditorSelection("");
                 else if ((c >= L'0' && c <= L'9') || c == L'.' || c == L'+' || c == L'-' ||
                          c == L'*' || c == L'/' || c == L'(' || c == L')' || c == L'^' ||
-                         c == L'!' || c == L'=' || c == L'%' ||
+                         c == L'!' || c == L'=' || c == L'%' || c == L'[' || c == L']' || c == L',' || c == L';' ||
+                         c == L'{' || c == L'}' ||
                          ((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z'))) {
                     char replacement = (char)c;
                     if (replacement == '/') replacement = '/';
@@ -1747,6 +1858,46 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 case L'/': doAction(ActFrac); return 0;
                 case L'(': doAction(ActOpenParen); return 0;
                 case L')': doAction(ActCloseParen); return 0;
+                case L'[': doAction(ActOpenBracket); return 0;
+                case L']': doAction(ActCloseParen); return 0;
+                case L'{':
+                    g.undo.push_back(cloneExpression(g.workspace.current()));
+                    insertOpenBrace(g.workspace.current());
+                    ensureCaretVisible();
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                case L'}':
+                    g.undo.push_back(cloneExpression(g.workspace.current()));
+                    insertCloseParen(g.workspace.current());
+                    ensureCaretVisible();
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                case L'\u222A':
+                    g.undo.push_back(cloneExpression(g.workspace.current()));
+                    insertOperator(g.workspace.current(), 'U');
+                    ensureCaretVisible();
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                case L'\u2229':
+                    g.undo.push_back(cloneExpression(g.workspace.current()));
+                    insertOperator(g.workspace.current(), 'I');
+                    ensureCaretVisible();
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                case L'\u0394':
+                    g.undo.push_back(cloneExpression(g.workspace.current()));
+                    insertOperator(g.workspace.current(), 'D');
+                    ensureCaretVisible();
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                case L'\u222B':
+                    g.undo.push_back(cloneExpression(g.workspace.current()));
+                    insertIntegral(g.workspace.current());
+                    ensureCaretVisible();
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                case L',': doAction(ActComma); return 0;
+                case L';': doAction(ActSemicolon); return 0;
                 case L'^': doAction(ActPower); return 0;
                 case L'!': insertOperator(g.workspace.current(), '!'); ensureCaretVisible(); InvalidateRect(hwnd, nullptr, FALSE); return 0;
                 case L'%': insertOperator(g.workspace.current(), '%'); ensureCaretVisible(); InvalidateRect(hwnd, nullptr, FALSE); return 0;
@@ -1890,6 +2041,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             KillTimer(hwnd, kCaretTimerId);
             KillTimer(hwnd, kProAnimationTimerId);
             releaseProExplosionAsset();
+            shutdownGpuGraph();
             if (g.appIcon) DestroyIcon(g.appIcon);
             if (g.uiFont) DeleteObject(g.uiFont);
             if (g.uiFontSmall) DeleteObject(g.uiFontSmall);
