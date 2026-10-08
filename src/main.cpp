@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cctype>
 #include <cstring>
+#include <cstdint>
 #include "expr_tree.h"
 #include "layout.h"
 #include "evaluator.h"
@@ -95,6 +96,8 @@ struct App {
     Gdiplus::Image* explosionImage = nullptr;
     IStream* explosionStream = nullptr;
     UINT explosionFrameCount = 0;
+    Gdiplus::Image* brickImage = nullptr;
+    IStream* brickStream = nullptr;
     int petX = -1;
     int petY = -1;
     bool petDragging = false;
@@ -105,7 +108,71 @@ struct App {
     HFONT uiFontSmall = nullptr;
     HICON appIcon = nullptr;
     std::vector<std::unique_ptr<Expression>> undo;
+
+    // --- High-performance render caches ---
+    HDC backbufferDC = nullptr;
+    HBITMAP backbufferBmp = nullptr;
+    HBITMAP backbufferOldBmp = nullptr;
+    int backbufferW = 0;
+    int backbufferH = 0;
+
+    HDC buttonCacheDC = nullptr;
+    HBITMAP buttonCacheBmp = nullptr;
+    HBITMAP buttonCacheOldBmp = nullptr;
+    int buttonCacheW = 0;
+    int buttonCacheH = 0;
+    bool buttonCacheValid = false;
+
+    HDC graphCacheDC = nullptr;
+    HBITMAP graphCacheBmp = nullptr;
+    HBITMAP graphCacheOldBmp = nullptr;
+    int graphCacheW = 0;
+    int graphCacheH = 0;
+    bool graphCacheValid = false;
+    std::string graphCacheExpr;
+    uint64_t graphCacheStateHash = 0;
+    bool graphCacheDark = false;
 } g;
+
+void invalidateButtonCache() {
+    g.buttonCacheValid = false;
+}
+
+void invalidateGraphCache() {
+    g.graphCacheValid = false;
+}
+
+void cleanupRenderCaches() {
+    if (g.backbufferDC) {
+        if (g.backbufferOldBmp) SelectObject(g.backbufferDC, g.backbufferOldBmp);
+        if (g.backbufferBmp) DeleteObject(g.backbufferBmp);
+        DeleteDC(g.backbufferDC);
+        g.backbufferDC = nullptr;
+        g.backbufferBmp = nullptr;
+        g.backbufferOldBmp = nullptr;
+        g.backbufferW = g.backbufferH = 0;
+    }
+    if (g.buttonCacheDC) {
+        if (g.buttonCacheOldBmp) SelectObject(g.buttonCacheDC, g.buttonCacheOldBmp);
+        if (g.buttonCacheBmp) DeleteObject(g.buttonCacheBmp);
+        DeleteDC(g.buttonCacheDC);
+        g.buttonCacheDC = nullptr;
+        g.buttonCacheBmp = nullptr;
+        g.buttonCacheOldBmp = nullptr;
+        g.buttonCacheW = g.buttonCacheH = 0;
+        g.buttonCacheValid = false;
+    }
+    if (g.graphCacheDC) {
+        if (g.graphCacheOldBmp) SelectObject(g.graphCacheDC, g.graphCacheOldBmp);
+        if (g.graphCacheBmp) DeleteObject(g.graphCacheBmp);
+        DeleteDC(g.graphCacheDC);
+        g.graphCacheDC = nullptr;
+        g.graphCacheBmp = nullptr;
+        g.graphCacheOldBmp = nullptr;
+        g.graphCacheW = g.graphCacheH = 0;
+        g.graphCacheValid = false;
+    }
+}
 
 constexpr UINT_PTR kCaretTimerId = 1;
 constexpr UINT_PTR kProAnimationTimerId = 2;
@@ -182,6 +249,63 @@ void loadProExplosionAsset() {
     g.explosionImage = image;
 }
 
+void loadProBrickAsset() {
+    if (g.brickImage) return;
+    if (!g.gdiplusToken) {
+        Gdiplus::GdiplusStartupInput startupInput;
+        if (Gdiplus::GdiplusStartup(&g.gdiplusToken, &startupInput, nullptr) != Gdiplus::Ok)
+            return;
+    }
+
+    HRSRC resource = FindResourceW(GetModuleHandleW(nullptr),
+                                   MAKEINTRESOURCEW(IDR_BRICK_TEXTURE), RT_RCDATA);
+    if (resource) {
+        DWORD resourceSize = SizeofResource(GetModuleHandleW(nullptr), resource);
+        HGLOBAL loadedResource = LoadResource(GetModuleHandleW(nullptr), resource);
+        const void* source = loadedResource ? LockResource(loadedResource) : nullptr;
+        if (source && resourceSize > 0) {
+            HGLOBAL imageMemory = GlobalAlloc(GMEM_MOVEABLE, resourceSize);
+            if (imageMemory) {
+                void* destination = GlobalLock(imageMemory);
+                if (destination) {
+                    std::memcpy(destination, source, resourceSize);
+                    GlobalUnlock(imageMemory);
+                    if (SUCCEEDED(CreateStreamOnHGlobal(imageMemory, TRUE, &g.brickStream))) {
+                        Gdiplus::Image* img = Gdiplus::Image::FromStream(g.brickStream, FALSE);
+                        if (img && img->GetLastStatus() == Gdiplus::Ok) {
+                            g.brickImage = img;
+                            return;
+                        }
+                        delete img;
+                        if (g.brickStream) { g.brickStream->Release(); g.brickStream = nullptr; }
+                    }
+                } else {
+                    GlobalFree(imageMemory);
+                }
+            }
+        }
+    }
+
+    const wchar_t* paths[] = { L"src/brick_texture.png", L"brick_texture.png", L"src/brick_texture.jpg", L"brick_texture.jpg" };
+    for (const wchar_t* p : paths) {
+        Gdiplus::Image* fileImg = Gdiplus::Image::FromFile(p, FALSE);
+        if (fileImg && fileImg->GetLastStatus() == Gdiplus::Ok) {
+            g.brickImage = fileImg;
+            return;
+        }
+        delete fileImg;
+    }
+}
+
+void releaseProBrickAsset() {
+    delete g.brickImage;
+    g.brickImage = nullptr;
+    if (g.brickStream) {
+        g.brickStream->Release();
+        g.brickStream = nullptr;
+    }
+}
+
 void releaseProExplosionAsset() {
     delete g.explosionImage;
     g.explosionImage = nullptr;
@@ -189,6 +313,7 @@ void releaseProExplosionAsset() {
         g.explosionStream->Release();
         g.explosionStream = nullptr;
     }
+    releaseProBrickAsset();
     if (g.gdiplusToken) {
         Gdiplus::GdiplusShutdown(g.gdiplusToken);
         g.gdiplusToken = 0;
@@ -353,6 +478,8 @@ void recomputeLayout(const RECT& rc) {
         layoutButtons(g.buttonAreaRect.left, g.buttonAreaRect.top,
                       w, g.buttonAreaRect.bottom - g.buttonAreaRect.top);
     }
+    invalidateButtonCache();
+    invalidateGraphCache();
 }
 
 void recomputeLayout() {
@@ -373,6 +500,7 @@ void activateProMode() {
     g.proModeStarted = GetTickCount();
     g.explosionStarted = g.proModeStarted;
     g.explosionActive = true;
+    loadProBrickAsset();
 
     RECT wr{};
     GetWindowRect(g.hwnd, &wr);
@@ -492,6 +620,8 @@ void doAction(int action) {
             g.dark = !g.dark;
             saveDarkMode(g.dark);
             setDarkTitleBar(g.hwnd, g.proMode || g.dark);
+            invalidateButtonCache();
+            invalidateGraphCache();
             break;
         default:
             if (action >= ActSciFirst && action <= ActSciLast) {
@@ -898,6 +1028,12 @@ void solveQuadraticFromDialog() {
 
 RECT topActionRect(int right, int width);
 
+RECT topActionXRect() { return topActionRect(g.topBarRect.right - 68, 28); }
+RECT topActionYRect() { return topActionRect(g.topBarRect.right - 100, 28); }
+RECT topActionQuadraticRect() { return topActionRect(g.topBarRect.right - 132, 76); }
+RECT topActionSciRect() { return topActionRect(g.topBarRect.right - 214, g.proMode ? 72 : 44); }
+RECT topActionAngleRect() { return topActionRect(g.topBarRect.right - (g.proMode ? 292 : 264), 46); }
+
 RECT themeToggleRect() {
     return topActionRect(g.topBarRect.right - 8, 52);
 }
@@ -920,21 +1056,21 @@ COLORREF blendColor(COLORREF from, COLORREF to, double amount) {
 
 Theme proTheme(Theme theme, double amount) {
     Theme target = darkTheme();
-    target.background = RGB(0x09, 0x03, 0x06);
-    target.panelBackground = RGB(0x21, 0x06, 0x0C);
-    target.text = RGB(0xF7, 0xE8, 0xEB);
-    target.operatorColor = RGB(0xFF, 0x47, 0x62);
-    target.resultColor = RGB(0xFF, 0x4D, 0x69);
-    target.caret = RGB(0xFF, 0xB5, 0xC0);
-    target.placeholder = RGB(0x67, 0x2B, 0x38);
-    target.divider = RGB(0x6D, 0x13, 0x27);
-    target.accent = RGB(0xD9, 0x10, 0x32);
-    target.screenBackground = RGB(0x13, 0x04, 0x08);
-    target.screenText = RGB(0xFF, 0xE9, 0xED);
-    target.screenOperator = RGB(0xFF, 0x65, 0x7A);
-    target.screenResult = RGB(0xFF, 0x58, 0x75);
-    target.screenCaret = RGB(0xFF, 0xD7, 0xDD);
-    target.screenPlaceholder = RGB(0x6D, 0x36, 0x43);
+    target.background = RGB(0x0C, 0x05, 0x07);
+    target.panelBackground = RGB(0x16, 0x07, 0x09);
+    target.text = RGB(0xF5, 0xEB, 0xE1);
+    target.operatorColor = RGB(0xFF, 0x55, 0x18);
+    target.resultColor = RGB(0xFF, 0xB8, 0x2E);
+    target.caret = RGB(0xFF, 0x85, 0x1C);
+    target.placeholder = RGB(0x5A, 0x22, 0x1A);
+    target.divider = RGB(0x4A, 0x12, 0x0E);
+    target.accent = RGB(0xDF, 0x28, 0x10);
+    target.screenBackground = RGB(0x0E, 0x05, 0x07);
+    target.screenText = RGB(0xF8, 0xEE, 0xE4);
+    target.screenOperator = RGB(0xFF, 0x6A, 0x24);
+    target.screenResult = RGB(0xFF, 0xBF, 0x36);
+    target.screenCaret = RGB(0xFF, 0x90, 0x20);
+    target.screenPlaceholder = RGB(0x5A, 0x25, 0x18);
 
     theme.background = blendColor(theme.background, target.background, amount);
     theme.panelBackground = blendColor(theme.panelBackground, target.panelBackground, amount);
@@ -1016,15 +1152,15 @@ void drawProPet(HDC hdc, int x, int y, POINT cursor) {
                         { x + 47, y + 34 + sway }, { x + 49, y + 29 + sway } };
     drawPetShape(hdc, tailTip, 4, hotRed, deepRed);
 
-    POINT leftWing[] = { { x + 17, y + 32 }, { x + 2, y + 26 }, { x + 9, y + 38 },
-                         { x + 3, y + 44 }, { x + 18, y + 46 } };
-    POINT rightWing[] = { { x + 34, y + 31 }, { x + 49, y + 25 }, { x + 43, y + 38 },
-                          { x + 51, y + 44 }, { x + 33, y + 46 } };
+    POINT leftWing[] = { { x + 17, y + 32 }, { x - 5, y + 21 }, { x + 7, y + 36 },
+                         { x - 1, y + 46 }, { x + 18, y + 46 } };
+    POINT rightWing[] = { { x + 34, y + 31 }, { x + 56, y + 20 }, { x + 44, y + 36 },
+                          { x + 52, y + 46 }, { x + 33, y + 46 } };
     drawPetShape(hdc, leftWing, 5, deepRed, black);
     drawPetShape(hdc, rightWing, 5, deepRed, black);
 
-    POINT leftHorn[] = { { x + 12, y + 17 }, { x + 7, y - 1 }, { x + 22, y + 11 } };
-    POINT rightHorn[] = { { x + 31, y + 11 }, { x + 47, y - 2 }, { x + 40, y + 20 } };
+    POINT leftHorn[] = { { x + 12, y + 17 }, { x + 5, y - 5 }, { x + 22, y + 11 } };
+    POINT rightHorn[] = { { x + 31, y + 11 }, { x + 49, y - 6 }, { x + 40, y + 20 } };
     drawPetShape(hdc, leftHorn, 3, deepRed, hotRed);
     drawPetShape(hdc, rightHorn, 3, deepRed, hotRed);
 
@@ -1093,7 +1229,8 @@ void drawProExplosion(HDC hdc, RECT client, const Theme& theme) {
         int sourceX = (frame % columns) * frameWidth;
         int sourceY = (frame / columns) * frameHeight;
         Gdiplus::Graphics graphics(hdc);
-        graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        graphics.SetInterpolationMode(Gdiplus::InterpolationModeBilinear);
+        graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
         Gdiplus::Rect destination(centerX - drawWidth / 2,
                                   centerY - drawHeight / 2,
                                   drawWidth, drawHeight);
@@ -1139,6 +1276,9 @@ void drawProExplosion(HDC hdc, RECT client, const Theme& theme) {
     }
 
     double rayProgress = std::clamp(elapsed / 560.0, 0.0, 1.0);
+    HPEN rayPenLight = CreatePen(PS_SOLID, 2, RGB(0xFF, 0xD9, 0xA0));
+    COLORREF blendRayCol = blendColor(RGB(0xFF, 0x56, 0x68), theme.accent, rayProgress);
+    HPEN rayPenAccent = CreatePen(PS_SOLID, 1, blendRayCol);
     for (int ray = 0; ray < 22; ++ray) {
         double angle = ray * 6.283185307179586 / 22.0;
         double inner = maxDimension * (0.035 + rayProgress * 0.13);
@@ -1147,15 +1287,27 @@ void drawProExplosion(HDC hdc, RECT client, const Theme& theme) {
         int y1 = centerY + (int)(std::sin(angle) * inner);
         int x2 = centerX + (int)(std::cos(angle) * outer);
         int y2 = centerY + (int)(std::sin(angle) * outer);
-        COLORREF rayColor = (ray % 3 == 0) ? RGB(0xFF, 0xD9, 0xA0) :
-                            blendColor(RGB(0xFF, 0x56, 0x68), theme.accent, rayProgress);
-        HPEN pen = CreatePen(PS_SOLID, ray % 3 == 0 ? 2 : 1, rayColor);
-        HPEN oldPen = (HPEN)SelectObject(hdc, pen);
+        HPEN activePen = (ray % 3 == 0) ? rayPenLight : rayPenAccent;
+        HPEN oldPen = (HPEN)SelectObject(hdc, activePen);
         MoveToEx(hdc, x1, y1, nullptr);
         LineTo(hdc, x2, y2);
         SelectObject(hdc, oldPen);
-        DeleteObject(pen);
     }
+    DeleteObject(rayPenLight);
+    DeleteObject(rayPenAccent);
+
+    COLORREF sparkColors[4] = {
+        RGB(0xFF, 0xF0, 0xC5),
+        RGB(0xFF, 0x2A, 0x48),
+        RGB(0xFF, 0x2A, 0x48),
+        RGB(0xFF, 0x8B, 0x45)
+    };
+    HPEN sparkPens[4][2] = {
+        { CreatePen(PS_SOLID, 2, sparkColors[0]), CreatePen(PS_SOLID, 4, sparkColors[0]) },
+        { CreatePen(PS_SOLID, 2, sparkColors[1]), CreatePen(PS_SOLID, 4, sparkColors[1]) },
+        { CreatePen(PS_SOLID, 2, sparkColors[2]), CreatePen(PS_SOLID, 4, sparkColors[2]) },
+        { CreatePen(PS_SOLID, 2, sparkColors[3]), CreatePen(PS_SOLID, 4, sparkColors[3]) }
+    };
 
     for (int spark = 0; spark < 96; ++spark) {
         double angle = spark * 6.283185307179586 / 96.0 +
@@ -1169,14 +1321,12 @@ void drawProExplosion(HDC hdc, RECT client, const Theme& theme) {
         int trail = 8 + spark % 15;
         int x1 = x2 - (int)(std::cos(angle) * trail);
         int y1 = y2 - (int)(std::sin(angle) * trail);
-        COLORREF sparkColor = spark % 4 == 0 ? RGB(0xFF, 0xF0, 0xC5) :
-                              (spark % 3 == 0 ? RGB(0xFF, 0x8B, 0x45) : RGB(0xFF, 0x2A, 0x48));
-        HPEN pen = CreatePen(PS_SOLID, spark % 5 == 0 ? 4 : 2, sparkColor);
-        HPEN oldPen = (HPEN)SelectObject(hdc, pen);
+        int cIdx = (spark % 4 == 0) ? 0 : (spark % 3 == 0 ? 3 : 1);
+        int wIdx = (spark % 5 == 0) ? 1 : 0;
+        HPEN oldPen = (HPEN)SelectObject(hdc, sparkPens[cIdx][wIdx]);
         MoveToEx(hdc, x1, y1, nullptr);
         LineTo(hdc, x2, y2);
         SelectObject(hdc, oldPen);
-        DeleteObject(pen);
 
         if (spark % 2 == 0) {
             int shardLength = 7 + spark % 10;
@@ -1190,15 +1340,203 @@ void drawProExplosion(HDC hdc, RECT client, const Theme& theme) {
                 { x2 - (int)(std::cos(angle) * shardLength - perpendicularX * shardWidth),
                   y2 - (int)(std::sin(angle) * shardLength - perpendicularY * shardWidth) }
             };
-            drawPetShape(hdc, shard, 3, sparkColor, RGB(0xFF, 0xD6, 0xA1));
+            drawPetShape(hdc, shard, 3, sparkColors[cIdx], RGB(0xFF, 0xD6, 0xA1));
         }
+    }
+    for (int i = 0; i < 4; ++i) {
+        DeleteObject(sparkPens[i][0]);
+        DeleteObject(sparkPens[i][1]);
     }
 }
 
+void paintButtonPro(HDC hdc, const ButtonDef& b, const Theme& theme, double proProgress) {
+    (void)theme;
+    (void)proProgress;
+    int bW = b.rect.right - b.rect.left;
+    int bH = b.rect.bottom - b.rect.top;
+    if (bW <= 0 || bH <= 0) return;
+
+    // Hardcore sharp chamfer: 6px 45-degree angled corner cuts
+    int ch = std::min(6, std::min(bW, bH) / 4);
+    int x0 = (int)b.rect.left;
+    int y0 = (int)b.rect.top;
+    int x1 = (int)b.rect.right;
+    int y1 = (int)b.rect.bottom;
+
+    COLORREF fg = RGB(0xF2, 0xE6, 0xDB);
+    bool drawnByGdiPlus = false;
+
+    {
+        Gdiplus::Graphics graphics(hdc);
+        graphics.SetInterpolationMode(Gdiplus::InterpolationModeBilinear);
+        graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+
+        Gdiplus::Point pts[8] = {
+            Gdiplus::Point(x0 + ch, y0),
+            Gdiplus::Point(x1 - ch, y0),
+            Gdiplus::Point(x1, y0 + ch),
+            Gdiplus::Point(x1, y1 - ch),
+            Gdiplus::Point(x1 - ch, y1),
+            Gdiplus::Point(x0 + ch, y1),
+            Gdiplus::Point(x0, y1 - ch),
+            Gdiplus::Point(x0, y0 + ch)
+        };
+        Gdiplus::GraphicsPath btnPath;
+        btnPath.AddPolygon(pts, 8);
+
+        // 1. Dark charred faceted drop shadow
+        Gdiplus::Point shadowPts[8];
+        for (int i = 0; i < 8; ++i) shadowPts[i] = Gdiplus::Point(pts[i].X + 1, pts[i].Y + 2);
+        Gdiplus::GraphicsPath shadowPath;
+        shadowPath.AddPolygon(shadowPts, 8);
+        Gdiplus::SolidBrush shadowBrush(Gdiplus::Color(160, 4, 1, 2));
+        graphics.FillPath(&shadowBrush, &shadowPath);
+
+        // 2. Base texture & dulled obsidian wash
+        if (g.brickImage) {
+            graphics.SetClip(&btnPath);
+            int imgW = (int)g.brickImage->GetWidth();
+            int imgH = (int)g.brickImage->GetHeight();
+            int srcW = std::min(bW * 2, imgW);
+            int srcH = std::min(bH * 2, imgH);
+            int srcX = std::abs((int)(b.rect.left * 2 + 30)) % std::max(1, imgW);
+            int srcY = std::abs((int)(b.rect.top * 2 + 40)) % std::max(1, imgH);
+            if (srcX + srcW > imgW) srcX = std::max(0, imgW - srcW);
+            if (srcY + srcH > imgH) srcY = std::max(0, imgH - srcH);
+            graphics.DrawImage(g.brickImage,
+                               Gdiplus::Rect((INT)x0, (INT)y0, (INT)bW, (INT)bH),
+                               (INT)srcX, (INT)srcY, (INT)srcW, (INT)srcH,
+                               Gdiplus::UnitPixel);
+
+            // Dull and darken the brick texture so it is less visually distracting
+            Gdiplus::SolidBrush obsidianDull(Gdiplus::Color(165, 10, 5, 7));
+            graphics.FillPath(&obsidianDull, &btnPath);
+
+            // High-tech infernal role tinting
+            if (b.isDanger) {
+                Gdiplus::SolidBrush dangerTint(Gdiplus::Color(85, 220, 28, 20));
+                graphics.FillPath(&dangerTint, &btnPath);
+                fg = RGB(0xFF, 0xFF, 0xFF);
+            } else if (b.isAccent || b.isOperator) {
+                Gdiplus::SolidBrush magmaTint(Gdiplus::Color(75, 235, 75, 12));
+                graphics.FillPath(&magmaTint, &btnPath);
+                fg = RGB(0xFF, 0xEE, 0x88);
+            } else if (b.isFunction) {
+                Gdiplus::SolidBrush fnTint(Gdiplus::Color(60, 65, 14, 18));
+                graphics.FillPath(&fnTint, &btnPath);
+                fg = RGB(0xFF, 0xBA, 0x48);
+            } else {
+                Gdiplus::SolidBrush numTint(Gdiplus::Color(45, 14, 6, 8));
+                graphics.FillPath(&numTint, &btnPath);
+                fg = RGB(0xF5, 0xEB, 0xE1);
+            }
+            graphics.ResetClip();
+        } else {
+            COLORREF solidFill = b.isDanger ? RGB(0x8A, 0x06, 0x1A) :
+                                 (b.isAccent || b.isOperator) ? RGB(0xB8, 0x24, 0x0C) :
+                                 b.isFunction ? RGB(0x28, 0x06, 0x0C) : RGB(0x18, 0x06, 0x09);
+            Gdiplus::SolidBrush fallbackBrush(Gdiplus::Color(255, GetRValue(solidFill), GetGValue(solidFill), GetBValue(solidFill)));
+            graphics.FillPath(&fallbackBrush, &btnPath);
+            if (b.isDanger) fg = RGB(0xFF, 0xFF, 0xFF);
+            else if (b.isAccent || b.isOperator) fg = RGB(0xFF, 0xEE, 0x88);
+            else if (b.isFunction) fg = RGB(0xFF, 0xBA, 0x48);
+            else fg = RGB(0xF5, 0xEB, 0xE1);
+        }
+
+        // 3. Razor-sharp chamfered borders
+        Gdiplus::Color borderCol = (b.isOperator || b.isAccent) ? Gdiplus::Color(230, 255, 95, 20)
+                                  : b.isDanger ? Gdiplus::Color(245, 255, 45, 25)
+                                  : b.isFunction ? Gdiplus::Color(190, 200, 80, 28)
+                                  : Gdiplus::Color(150, 80, 30, 22);
+        float penWidth = (b.isOperator || b.isAccent || b.isDanger) ? 1.4f : 1.1f;
+        Gdiplus::Pen borderPen(borderCol, penWidth);
+        graphics.DrawPath(&borderPen, &btnPath);
+
+        // 4. Razor top ember highlight
+        Gdiplus::Pen topEmber(Gdiplus::Color(170, 255, 195, 120), 1.0f);
+        graphics.DrawLine(&topEmber, (INT)(x0 + ch), (INT)(y0 + 1), (INT)(x1 - ch), (INT)(y0 + 1));
+
+        // 5. Tactical HUD corner ticks on operators & accents
+        if (b.isOperator || b.isAccent || b.isDanger) {
+            Gdiplus::Pen tickPen(Gdiplus::Color(210, 255, 160, 60), 1.2f);
+            graphics.DrawLine(&tickPen, (INT)(x0 + ch - 1), (INT)(y0 + 1), (INT)(x0 + 1), (INT)(y0 + ch - 1));
+            graphics.DrawLine(&tickPen, (INT)(x1 - 1), (INT)(y1 - ch + 1), (INT)(x1 - ch + 1), (INT)(y1 - 1));
+        }
+
+        // Custom sharp geometric glyphs for Pro Max mode
+        if (b.action == ActEquals) {
+            int midY = (y0 + y1) / 2;
+            int barW = std::min(bW * 3 / 5, 46);
+            int barL = x0 + (bW - barW) / 2;
+            int barR = barL + barW;
+            int barH = 3;
+            int barC = 2;
+            auto drawSharpBar = [&](int barTop) {
+                Gdiplus::Point barPts[6] = {
+                    Gdiplus::Point(barL + barC, barTop),
+                    Gdiplus::Point(barR - barC, barTop),
+                    Gdiplus::Point(barR, barTop + barC),
+                    Gdiplus::Point(barR - barC, barTop + barH),
+                    Gdiplus::Point(barL + barC, barTop + barH),
+                    Gdiplus::Point(barL, barTop + barC)
+                };
+                Gdiplus::GraphicsPath barPath;
+                barPath.AddPolygon(barPts, 6);
+                Gdiplus::SolidBrush barBrush(Gdiplus::Color(255, 255, 195, 45));
+                graphics.FillPath(&barBrush, &barPath);
+                Gdiplus::Pen barPen(Gdiplus::Color(255, 255, 245, 180), 1.0f);
+                graphics.DrawPath(&barPen, &barPath);
+            };
+            drawSharpBar(midY - 5);
+            drawSharpBar(midY + 3);
+            drawnByGdiPlus = true;
+        } else if (b.action == ActMul) {
+            int midX = (x0 + x1) / 2;
+            int midY = (y0 + y1) / 2;
+            int s = 6;
+            Gdiplus::Pen bladePen(Gdiplus::Color(255, 255, 235, 140), 2.2f);
+            bladePen.SetStartCap(Gdiplus::LineCapTriangle);
+            bladePen.SetEndCap(Gdiplus::LineCapTriangle);
+            graphics.DrawLine(&bladePen, midX - s, midY - s, midX + s, midY + s);
+            graphics.DrawLine(&bladePen, midX + s, midY - s, midX - s, midY + s);
+            drawnByGdiPlus = true;
+        } else if (b.action == ActFrac) {
+            int midX = (x0 + x1) / 2;
+            int midY = (y0 + y1) / 2;
+            int s = 7;
+            Gdiplus::Pen slashPen(Gdiplus::Color(255, 255, 235, 140), 2.4f);
+            slashPen.SetStartCap(Gdiplus::LineCapTriangle);
+            slashPen.SetEndCap(Gdiplus::LineCapTriangle);
+            graphics.DrawLine(&slashPen, midX + s, midY - s, midX - s, midY + s);
+            drawnByGdiPlus = true;
+        }
+    }
+
+    if (drawnByGdiPlus) return;
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, fg);
+
+    std::wstring displayLabel = b.label;
+    if (b.action == ActPower) {
+        displayLabel = L"x^y";
+    }
+
+    HFONT fontToUse = (b.isFunction && displayLabel.length() > 2) ? g.uiFontSmall : g.uiFont;
+    HFONT old = (HFONT)SelectObject(hdc, fontToUse);
+    RECT r = b.rect;
+    DrawTextW(hdc, displayLabel.c_str(), -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(hdc, old);
+}
+
 void paintButton(HDC hdc, const ButtonDef& b, const Theme& theme) {
-    // Casio-style keycap palette: cream digit keys, dark slate function
-    // keys, an orange operator column + "=" key, and a red AC key -- the
-    // classic desk-calculator color coding instead of one flat button style.
+    if (g.proMode) {
+        paintButtonPro(hdc, b, theme, proTransitionProgress());
+        return;
+    }
+
+    // Normal mode: Casio-style keycap palette with classic rounded styling
     COLORREF fill;
     COLORREF fg;
     if (b.isDanger) { fill = theme.isDark ? RGB(0xB0, 0x36, 0x27) : RGB(0xC7, 0x3E, 0x2A); fg = RGB(255, 255, 255); }
@@ -1207,19 +1545,9 @@ void paintButton(HDC hdc, const ButtonDef& b, const Theme& theme) {
     else if (b.isFunction) { fill = theme.isDark ? RGB(0x3A, 0x3D, 0x45) : RGB(0x50, 0x54, 0x5C); fg = RGB(0xF2, 0xF2, 0xF2); }
     else { fill = theme.isDark ? RGB(0x4E, 0x51, 0x58) : RGB(0xF9, 0xF7, 0xF2); fg = theme.isDark ? RGB(0xF2, 0xF2, 0xF2) : RGB(0x24, 0x24, 0x24); }
 
-    double proProgress = proTransitionProgress();
-    if (g.proMode) {
-        COLORREF infernalFill = b.isDanger ? RGB(0xA6, 0x06, 0x22) :
-                                (b.isAccent || b.isOperator) ? RGB(0xDA, 0x0A, 0x31) :
-                                b.isFunction ? RGB(0x35, 0x06, 0x10) : RGB(0x25, 0x07, 0x0D);
-        fill = blendColor(fill, infernalFill, proProgress);
-        fg = blendColor(fg, RGB(0xFF, 0xE5, 0xE0), proProgress);
-    }
-
     int radius = 6;
 
-    // Drop shadow: a slightly-inset darker copy offset down-right so the
-    // key reads as sitting proud of the calculator body.
+    // Drop shadow
     HBRUSH shadowBrush = CreateSolidBrush(shade(theme.background, theme.isDark ? -18 : -35));
     HBRUSH oldShadowBrush = (HBRUSH)SelectObject(hdc, shadowBrush);
     HPEN nullPen = (HPEN)GetStockObject(NULL_PEN);
@@ -1229,7 +1557,7 @@ void paintButton(HDC hdc, const ButtonDef& b, const Theme& theme) {
     SelectObject(hdc, oldPen0);
     DeleteObject(shadowBrush);
 
-    // The keycap itself.
+    // The keycap itself
     HBRUSH brush = CreateSolidBrush(fill);
     HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, brush);
     HPEN pen = CreatePen(PS_SOLID, 1, shade(fill, theme.isDark ? -35 : -45));
@@ -1237,54 +1565,6 @@ void paintButton(HDC hdc, const ButtonDef& b, const Theme& theme) {
     RoundRect(hdc, b.rect.left, b.rect.top, b.rect.right, b.rect.bottom, radius, radius);
     SelectObject(hdc, oldPen);
     DeleteObject(pen);
-
-    if (g.proMode && proProgress > 0.2) {
-        int saved = SaveDC(hdc);
-        HRGN keyClip = CreateRoundRectRgn(b.rect.left + 1, b.rect.top + 1,
-                                          b.rect.right, b.rect.bottom,
-                                          radius, radius);
-        SelectClipRgn(hdc, keyClip);
-        int keyWidth = (int)(b.rect.right - b.rect.left);
-        int keyHeight = (int)(b.rect.bottom - b.rect.top);
-        int veinCount = std::max(2, keyWidth / 15);
-        COLORREF veinColor = blendColor(fill, RGB(0x90, 0x08, 0x20), 0.82);
-        COLORREF emberColor = blendColor(fill, RGB(0xFF, 0x43, 0x32), 0.64);
-        HPEN veinPen = CreatePen(PS_SOLID, 1, veinColor);
-        HPEN emberPen = CreatePen(PS_SOLID, 1, emberColor);
-        for (int vein = 0; vein < veinCount; ++vein) {
-            int startX = (int)b.rect.left + 5 + (vein * 17) % std::max(1, keyWidth - 10);
-            int startY = (int)b.rect.top + 4 + (vein * 7) % std::max(1, keyHeight - 8);
-            HPEN activePen = vein % 3 == 0 ? emberPen : veinPen;
-            HPEN oldTexturePen = (HPEN)SelectObject(hdc, activePen);
-            MoveToEx(hdc, startX, startY, nullptr);
-            LineTo(hdc, startX + 4, startY + 4);
-            LineTo(hdc, startX + 1, startY + 9);
-            LineTo(hdc, startX + 6, startY + 14);
-            if (vein % 2 == 0) {
-                MoveToEx(hdc, startX + 2, startY + 7, nullptr);
-                LineTo(hdc, startX - 3, startY + 11);
-            }
-            SelectObject(hdc, oldTexturePen);
-        }
-        DeleteObject(veinPen);
-        DeleteObject(emberPen);
-
-        HBRUSH fleckBrush = CreateSolidBrush(RGB(0xFF, 0x71, 0x3E));
-        HPEN oldTexturePen = (HPEN)SelectObject(hdc, GetStockObject(NULL_PEN));
-        HBRUSH oldFleckBrush = (HBRUSH)SelectObject(hdc, fleckBrush);
-        for (int fleck = 0; fleck < 3; ++fleck) {
-            int px = (int)b.rect.left + 7 + (fleck * 31 + b.action * 3) %
-                     std::max(1, keyWidth - 12);
-            int py = (int)b.rect.top + 5 + (fleck * 13 + b.action * 7) %
-                     std::max(1, keyHeight - 10);
-            Ellipse(hdc, px, py, px + 2, py + 2);
-        }
-        SelectObject(hdc, oldFleckBrush);
-        SelectObject(hdc, oldTexturePen);
-        DeleteObject(fleckBrush);
-        RestoreDC(hdc, saved);
-        DeleteObject(keyClip);
-    }
 
     // Bevel highlight along the top edge for a subtle raised look.
     HPEN hi = CreatePen(PS_SOLID, 1, shade(fill, theme.isDark ? 25 : 40));
@@ -1322,31 +1602,24 @@ void paint(HDC hdc, RECT client) {
     screenTheme.caret = theme.screenCaret;
     screenTheme.placeholder = theme.screenPlaceholder;
 
-    HDC mem = CreateCompatibleDC(hdc);
-    if (!mem) {
-        HBRUSH fallback = CreateSolidBrush(theme.background);
-        FillRect(hdc, &client, fallback);
-        DeleteObject(fallback);
-        return;
+    int clientW = client.right - client.left;
+    int clientH = client.bottom - client.top;
+    if (clientW <= 0 || clientH <= 0) return;
+
+    if (!g.backbufferDC || !g.backbufferBmp || g.backbufferW != clientW || g.backbufferH != clientH) {
+        if (g.backbufferDC) {
+            if (g.backbufferOldBmp) SelectObject(g.backbufferDC, g.backbufferOldBmp);
+            if (g.backbufferBmp) DeleteObject(g.backbufferBmp);
+        } else {
+            g.backbufferDC = CreateCompatibleDC(hdc);
+        }
+        g.backbufferBmp = CreateCompatibleBitmap(hdc, clientW, clientH);
+        g.backbufferOldBmp = (HBITMAP)SelectObject(g.backbufferDC, g.backbufferBmp);
+        g.backbufferW = clientW;
+        g.backbufferH = clientH;
     }
-    HBITMAP bmp = CreateCompatibleBitmap(hdc, client.right - client.left,
-                                        client.bottom - client.top);
-    if (!bmp) {
-        DeleteDC(mem);
-        HBRUSH fallback = CreateSolidBrush(theme.background);
-        FillRect(hdc, &client, fallback);
-        DeleteObject(fallback);
-        return;
-    }
-    HGDIOBJ oldBmp = SelectObject(mem, bmp);
-    if (!oldBmp || oldBmp == HGDI_ERROR) {
-        DeleteObject(bmp);
-        DeleteDC(mem);
-        HBRUSH fallback = CreateSolidBrush(theme.background);
-        FillRect(hdc, &client, fallback);
-        DeleteObject(fallback);
-        return;
-    }
+    HDC mem = g.backbufferDC;
+    if (!mem) return;
 
     HBRUSH bgBrush = CreateSolidBrush(theme.background);
     FillRect(mem, &client, bgBrush);
@@ -1365,36 +1638,73 @@ void paint(HDC hdc, RECT client) {
               -1, &r, DT_VCENTER | DT_SINGLELINE);
         SelectObject(mem, old);
     }
-    // Small slate pill buttons -- same family as the dark function keycaps
-    // below, so the whole chrome reads as one coherent design instead of
-    // a row of near-invisible white-on-white outlined boxes.
-    auto drawPill = [&](RECT rect, const wchar_t* label) {
-        COLORREF regularFill = theme.isDark ? RGB(0x3A, 0x3D, 0x45) : RGB(0x50, 0x54, 0x5C);
-        COLORREF fill = g.proMode ? blendColor(regularFill, theme.accent, proProgress) : regularFill;
+    auto drawPill = [&](RECT rect, const wchar_t* label, bool active = false) {
+        if (!g.proMode) {
+            // Standard smooth rounded pill in normal mode
+            COLORREF regularFill = theme.isDark ? RGB(0x3A, 0x3D, 0x45) : RGB(0x50, 0x54, 0x5C);
+            COLORREF fill = regularFill;
+            HBRUSH b = CreateSolidBrush(fill);
+            HBRUSH ob = (HBRUSH)SelectObject(mem, b);
+            HPEN nullPen = (HPEN)GetStockObject(NULL_PEN);
+            HPEN op = (HPEN)SelectObject(mem, nullPen);
+            RoundRect(mem, rect.left, rect.top, rect.right, rect.bottom, 8, 8);
+            SelectObject(mem, ob); SelectObject(mem, op);
+            DeleteObject(b);
+            SetTextColor(mem, RGB(0xF2, 0xF2, 0xF2));
+            HFONT old = (HFONT)SelectObject(mem, g.uiFontSmall);
+            DrawTextW(mem, label, -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            SelectObject(mem, old);
+            return;
+        }
+
+        // Pro Max: Hardcore sharp chamfered tactical HUD badge
+        int c = 4;
+        POINT pts[8] = {
+            { rect.left + c, rect.top },
+            { rect.right - c, rect.top },
+            { rect.right, rect.top + c },
+            { rect.right, rect.bottom - c },
+            { rect.right - c, rect.bottom },
+            { rect.left + c, rect.bottom },
+            { rect.left, rect.bottom - c },
+            { rect.left, rect.top + c }
+        };
+        COLORREF fill = active ? RGB(0x8A, 0x06, 0x1A) : RGB(0x1B, 0x07, 0x0A);
+        COLORREF border = active ? RGB(0xFF, 0x55, 0x18) : RGB(0xB8, 0x2A, 0x12);
         HBRUSH b = CreateSolidBrush(fill);
+        HPEN p = CreatePen(PS_SOLID, 1, border);
         HBRUSH ob = (HBRUSH)SelectObject(mem, b);
-        HPEN nullPen = (HPEN)GetStockObject(NULL_PEN);
-        HPEN op = (HPEN)SelectObject(mem, nullPen);
-        RoundRect(mem, rect.left, rect.top, rect.right, rect.bottom, 8, 8);
-        SelectObject(mem, ob); SelectObject(mem, op);
+        HPEN op = (HPEN)SelectObject(mem, p);
+        Polygon(mem, pts, 8);
+        SelectObject(mem, ob);
+        SelectObject(mem, op);
         DeleteObject(b);
-        SetTextColor(mem, RGB(0xF2, 0xF2, 0xF2));
+        DeleteObject(p);
+
+        HPEN hiPen = CreatePen(PS_SOLID, 1, RGB(0xFF, 0x88, 0x30));
+        HPEN oldHi = (HPEN)SelectObject(mem, hiPen);
+        MoveToEx(mem, rect.left + c, rect.top + 1, nullptr);
+        LineTo(mem, rect.right - c, rect.top + 1);
+        SelectObject(mem, oldHi);
+        DeleteObject(hiPen);
+
+        SetTextColor(mem, active ? RGB(0xFF, 0xF4, 0xEA) : RGB(0xF5, 0xEB, 0xE1));
         HFONT old = (HFONT)SelectObject(mem, g.uiFontSmall);
         DrawTextW(mem, label, -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         SelectObject(mem, old);
     };
     {
-        RECT xr = topActionRect(g.topBarRect.right - 68, 28);
-        RECT yr = topActionRect(g.topBarRect.right - 100, 28);
-        RECT qr = topActionRect(g.topBarRect.right - 132, 76);
-        RECT sciRect = topActionRect(g.topBarRect.right - 212, 44);
+        RECT xr = topActionXRect();
+        RECT yr = topActionYRect();
+        RECT qr = topActionQuadraticRect();
+        RECT sciRect = topActionSciRect();
         drawPill(xr, L"x");
         drawPill(yr, L"y");
         drawPill(qr, L"Quadratic");
-        drawPill(sciRect, g.proMode ? L"Sci On" : L"Sci");
+        drawPill(sciRect, g.proMode ? L"PRO MAX" : L"Sci", g.proMode);
         if (g.proMode) {
-            RECT angleRect = topActionRect(g.topBarRect.right - 260, 44);
-            drawPill(angleRect, g.degrees ? L"DEG" : L"RAD");
+            RECT angleRect = topActionAngleRect();
+            drawPill(angleRect, g.degrees ? L"DEG" : L"RAD", true);
         }
     }
     drawPill(themeToggleRect(), g.dark ? L"Light" : L"Dark");
@@ -1536,12 +1846,105 @@ void paint(HDC hdc, RECT client) {
         }
     }
 
-    // --- button panel ---
+    // --- button panel (cached off-screen) ---
     {
-        HBRUSH b = CreateSolidBrush(theme.background);
-        FillRect(mem, &g.buttonAreaRect, b);
-        DeleteObject(b);
-        for (auto& btn : g.buttons) paintButton(mem, btn, theme);
+        int btnW = g.buttonAreaRect.right - g.buttonAreaRect.left;
+        int btnH = g.buttonAreaRect.bottom - g.buttonAreaRect.top;
+        if (btnW > 0 && btnH > 0) {
+            if (!g.buttonCacheDC || !g.buttonCacheBmp || g.buttonCacheW != clientW || g.buttonCacheH != clientH) {
+                if (g.buttonCacheDC) {
+                    if (g.buttonCacheOldBmp) SelectObject(g.buttonCacheDC, g.buttonCacheOldBmp);
+                    if (g.buttonCacheBmp) DeleteObject(g.buttonCacheBmp);
+                } else {
+                    g.buttonCacheDC = CreateCompatibleDC(mem);
+                }
+                g.buttonCacheBmp = CreateCompatibleBitmap(mem, clientW, clientH);
+                g.buttonCacheOldBmp = (HBITMAP)SelectObject(g.buttonCacheDC, g.buttonCacheBmp);
+                g.buttonCacheW = clientW;
+                g.buttonCacheH = clientH;
+                g.buttonCacheValid = false;
+            }
+
+            if (!g.buttonCacheValid) {
+                HBRUSH b = CreateSolidBrush(theme.background);
+                FillRect(g.buttonCacheDC, &g.buttonAreaRect, b);
+                DeleteObject(b);
+
+                for (auto& btn : g.buttons) paintButton(g.buttonCacheDC, btn, theme);
+
+                g.buttonCacheValid = true;
+            }
+
+            BitBlt(mem, g.buttonAreaRect.left, g.buttonAreaRect.top, btnW, btnH,
+                   g.buttonCacheDC, g.buttonAreaRect.left, g.buttonAreaRect.top, SRCCOPY);
+        }
+    }
+
+    // --- live graph panel in scientific mode (cached off-screen) ---
+    if (g.proMode && g.graphRect.right > g.graphRect.left) {
+        int gw = g.graphRect.right - g.graphRect.left;
+        int gh = g.graphRect.bottom - g.graphRect.top;
+        if (gw > 0 && gh > 0) {
+            std::string curPlain = g.workspace.current().toPlainString();
+            if (curPlain.empty() && !g.workspace.history().empty()) {
+                curPlain = g.workspace.history().back()->expr->toPlainString();
+            }
+            uint64_t stateHash = 0;
+            auto hashDouble = [](double v) -> uint64_t {
+                uint64_t u = 0;
+                std::memcpy(&u, &v, sizeof(u));
+                return u;
+            };
+            stateHash ^= hashDouble(g.graphState.minX) + 0x9e3779b9 + (stateHash << 6) + (stateHash >> 2);
+            stateHash ^= hashDouble(g.graphState.maxX) + 0x9e3779b9 + (stateHash << 6) + (stateHash >> 2);
+            stateHash ^= hashDouble(g.graphState.minY) + 0x9e3779b9 + (stateHash << 6) + (stateHash >> 2);
+            stateHash ^= hashDouble(g.graphState.maxY) + 0x9e3779b9 + (stateHash << 6) + (stateHash >> 2);
+            stateHash ^= ((uint64_t)g.graphState.hoverPos.x << 32) | (uint32_t)g.graphState.hoverPos.y;
+            stateHash ^= (uint64_t)(g.degrees ? 1 : 0) | ((uint64_t)(g.graphState.isHovering ? 1 : 0) << 1);
+
+            bool needGraphRender = !g.graphCacheValid ||
+                                   g.graphCacheW != gw ||
+                                   g.graphCacheH != gh ||
+                                   g.graphCacheExpr != curPlain ||
+                                   g.graphCacheStateHash != stateHash ||
+                                   g.graphCacheDark != theme.isDark;
+
+            if (needGraphRender) {
+                if (!g.graphCacheDC || !g.graphCacheBmp || g.graphCacheW != gw || g.graphCacheH != gh) {
+                    if (g.graphCacheDC) {
+                        if (g.graphCacheOldBmp) SelectObject(g.graphCacheDC, g.graphCacheOldBmp);
+                        if (g.graphCacheBmp) DeleteObject(g.graphCacheBmp);
+                    } else {
+                        g.graphCacheDC = CreateCompatibleDC(mem);
+                    }
+                    g.graphCacheBmp = CreateCompatibleBitmap(mem, gw, gh);
+                    g.graphCacheOldBmp = (HBITMAP)SelectObject(g.graphCacheDC, g.graphCacheBmp);
+                    g.graphCacheW = gw;
+                    g.graphCacheH = gh;
+                }
+
+                GraphAnalysis analysis = analyzeGraphExpression(g.workspace.current().root.get(), g.values);
+                if (!analysis.isValid && !g.workspace.history().empty()) {
+                    analysis = analyzeGraphExpression(g.workspace.history().back()->expr->root.get(), g.values);
+                }
+                RECT localRect = { 0, 0, gw, gh };
+                renderGraph(g.graphCacheDC, localRect, analysis, g.graphState, theme, g.uiFont, g.uiFontSmall);
+
+                g.graphCacheExpr = curPlain;
+                g.graphCacheStateHash = stateHash;
+                g.graphCacheDark = theme.isDark;
+                g.graphCacheValid = true;
+            }
+
+            BitBlt(mem, g.graphRect.left, g.graphRect.top, gw, gh, g.graphCacheDC, 0, 0, SRCCOPY);
+
+            HPEN divPen = CreatePen(PS_SOLID, 1, theme.divider);
+            HPEN oldDivPen = (HPEN)SelectObject(mem, divPen);
+            MoveToEx(mem, g.graphRect.left, 0, nullptr);
+            LineTo(mem, g.graphRect.left, client.bottom);
+            SelectObject(mem, oldDivPen);
+            DeleteObject(divPen);
+        }
     }
 
     if (g.proMode && proProgress > 0.16) {
@@ -1552,26 +1955,7 @@ void paint(HDC hdc, RECT client) {
     }
     drawProExplosion(mem, client, theme);
 
-    // --- live graph panel in scientific mode ---
-    if (g.proMode && g.graphRect.right > g.graphRect.left) {
-        GraphAnalysis analysis = analyzeGraphExpression(g.workspace.current().root.get(), g.values);
-        if (!analysis.isValid && !g.workspace.history().empty()) {
-            analysis = analyzeGraphExpression(g.workspace.history().back()->expr->root.get(), g.values);
-        }
-        renderGraph(mem, g.graphRect, analysis, g.graphState, theme, g.uiFont, g.uiFontSmall);
-
-        HPEN divPen = CreatePen(PS_SOLID, 1, theme.divider);
-        HPEN oldDivPen = (HPEN)SelectObject(mem, divPen);
-        MoveToEx(mem, g.graphRect.left, 0, nullptr);
-        LineTo(mem, g.graphRect.left, client.bottom);
-        SelectObject(mem, oldDivPen);
-        DeleteObject(divPen);
-    }
-
     BitBlt(hdc, 0, 0, client.right, client.bottom, mem, 0, 0, SRCCOPY);
-    SelectObject(mem, oldBmp);
-    DeleteObject(bmp);
-    DeleteDC(mem);
 }
 
 // ------------------------------------------------------------- WndProc
@@ -1582,6 +1966,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g.hwnd = hwnd;
             initGpuGraph();
             loadProExplosionAsset();
+            loadProBrickAsset();
             setDarkTitleBar(hwnd, g.dark);
             g.uiFont = CreateFontW(-18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                     DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
@@ -1615,7 +2000,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             RECT client;
             GetClientRect(hwnd, &client);
             if (client.right > client.left && client.bottom > client.top) {
-                recomputeLayout(client);
                 paint(hdc, client);
             }
             EndPaint(hwnd, &ps);
@@ -1629,6 +2013,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             } else if (wParam == kProAnimationTimerId && g.proMode) {
                 clampPetToClient();
                 InvalidateRect(hwnd, nullptr, FALSE);
+                if (!g.explosionActive && proTransitionProgress() >= 1.0) {
+                    SetTimer(hwnd, kProAnimationTimerId, 33, nullptr);
+                }
             }
             return 0;
 
@@ -1659,17 +2046,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             if (g.proMode && PtInRect(&g.graphRect, pt)) {
                 if (handleGraphMouseDown(g.graphState, g.graphRect, (int)pt.x, (int)pt.y)) {
+                    invalidateGraphCache();
                     SetCapture(hwnd);
                     InvalidateRect(hwnd, &g.graphRect, FALSE);
                     return 0;
                 }
             }
             RECT toggleRect = themeToggleRect();
-            RECT xRect = topActionRect(g.topBarRect.right - 68, 28);
-            RECT yRect = topActionRect(g.topBarRect.right - 100, 28);
-            RECT quadraticRect = topActionRect(g.topBarRect.right - 132, 76);
-            RECT sciRect = topActionRect(g.topBarRect.right - 212, 44);
-            RECT angleRect = topActionRect(g.topBarRect.right - 260, 44);
+            RECT xRect = topActionXRect();
+            RECT yRect = topActionYRect();
+            RECT quadraticRect = topActionQuadraticRect();
+            RECT sciRect = topActionSciRect();
+            RECT angleRect = topActionAngleRect();
             if (PtInRect(&toggleRect, pt)) { doAction(ActToggleTheme); return 0; }
             if (PtInRect(&xRect, pt)) { doAction(ActVariableX); return 0; }
             if (PtInRect(&yRect, pt)) { doAction(ActVariableY); return 0; }
@@ -1728,6 +2116,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (g.proMode) {
                 POINT point = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
                 if (handleGraphMouseMove(g.graphState, g.graphRect, (int)point.x, (int)point.y)) {
+                    invalidateGraphCache();
                     InvalidateRect(hwnd, &g.graphRect, FALSE);
                     if (g.graphState.isDragging) return 0;
                 }
@@ -1761,6 +2150,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             if (g.proMode && g.graphState.isDragging) {
                 handleGraphMouseUp(g.graphState);
+                invalidateGraphCache();
                 ReleaseCapture();
                 InvalidateRect(hwnd, &g.graphRect, FALSE);
                 return 0;
@@ -1784,6 +2174,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 ScreenToClient(hwnd, &point);
                 if (PtInRect(&g.graphRect, point)) {
                     handleGraphMouseWheel(g.graphState, g.graphRect, (int)point.x, (int)point.y, (short)delta);
+                    invalidateGraphCache();
                     InvalidateRect(hwnd, &g.graphRect, FALSE);
                     return 0;
                 }
@@ -1815,6 +2206,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 } else return 0;
                 g.undo.push_back(cloneExpression(g.workspace.current()));
                 rebuildEditorText(text, position);
+                invalidateGraphCache();
                 ensureCaretVisible();
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
@@ -2041,6 +2433,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             KillTimer(hwnd, kCaretTimerId);
             KillTimer(hwnd, kProAnimationTimerId);
             releaseProExplosionAsset();
+            releaseProBrickAsset();
+            cleanupRenderCaches();
             shutdownGpuGraph();
             if (g.appIcon) DestroyIcon(g.appIcon);
             if (g.uiFont) DeleteObject(g.uiFont);

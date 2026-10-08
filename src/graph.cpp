@@ -526,27 +526,36 @@ void renderGraph(HDC hdc, const RECT& graphRect, const GraphAnalysis& analysis,
         // Title text
         SelectObject(mem, font);
         SetTextColor(mem, theme.screenText);
-        std::string titleStr = analysis.isValid ? analysis.title : "Graphing (Enter f(x) or eqn in x, y)";
+        std::string titleStr = analysis.isValid ? ("// " + analysis.title + " //") : "// LIVE GRAPH ENGINE //";
         RECT titleRect = { 12, 6, w - 110, 30 };
         DrawTextA(mem, titleStr.c_str(), -1, &titleRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-        // Zoom / Reset buttons in header
+        // Zoom / Reset buttons in header: sharp angular HUD buttons
         SelectObject(mem, smallFont);
-        int btnW = 22, btnH = 22, btnY = 6;
+        int btnW = 24, btnH = 22, btnY = 6;
         int bx = w - 10 - btnW;
 
         auto drawBtn = [&](int left, int width, const wchar_t* label) {
             RECT br = { left, btnY, left + width, btnY + btnH };
-            HBRUSH btnBrush = CreateSolidBrush(theme.isDark ? RGB(0x35, 0x3A, 0x44) : RGB(0xE0, 0xE4, 0xEB));
-            FillRect(mem, &br, btnBrush);
+            COLORREF btnBg = theme.isDark ? RGB(0x1F, 0x0A, 0x0E) : RGB(0xE0, 0xE4, 0xEB);
+            COLORREF borderCol = theme.isDark ? RGB(0xC0, 0x35, 0x18) : RGB(0xC0, 0xC5, 0xD0);
+            HBRUSH btnBrush = CreateSolidBrush(btnBg);
+            HPEN btnPen = CreatePen(PS_SOLID, 1, borderCol);
+            HBRUSH oldB = (HBRUSH)SelectObject(mem, btnBrush);
+            HPEN oldP = (HPEN)SelectObject(mem, btnPen);
+            Rectangle(mem, br.left, br.top, br.right, br.bottom);
+            SelectObject(mem, oldB);
+            SelectObject(mem, oldP);
             DeleteObject(btnBrush);
-            SetTextColor(mem, theme.text);
+            DeleteObject(btnPen);
+
+            SetTextColor(mem, theme.isDark ? RGB(0xF5, 0xEB, 0xE1) : theme.text);
             DrawTextW(mem, label, -1, &br, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         };
 
         drawBtn(bx, btnW, L"+");
         drawBtn(bx - btnW - 4, btnW, L"\u2212");
-        drawBtn(bx - 2 * btnW - 46, 42, L"Reset");
+        drawBtn(bx - 2 * btnW - 48, 44, L"RESET");
     }
 
     // 7. Hover Tooltip Coordinates

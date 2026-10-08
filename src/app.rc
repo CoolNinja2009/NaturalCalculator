@@ -2,3 +2,4 @@
 
 IDI_APP ICON "app.ico"
 IDR_EXPLOSION_SHEET RCDATA "explosion_sheet.png"
+IDR_BRICK_TEXTURE RCDATA "brick_texture.png"

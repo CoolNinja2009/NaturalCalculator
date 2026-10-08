@@ -363,35 +363,30 @@ Size measureItemImpl(HDC hdc, const Item* it, int depth) {
             Size integrand = measureRowImpl(hdc, it->a.get(), depth);
             Size lower = measureRowImpl(hdc, it->b.get(), depth + 1);
             Size upper = measureRowImpl(hdc, it->c.get(), depth + 1);
+            TEXTMETRICW tm = textMetricsForDepth(hdc, depth);
 
-            int contentH = std::max(integrand.height(), fontPxForDepth(depth) * 2);
-            int intFontPx = contentH + scaledPx(10, depth);
-            HFONT intFont = CreateFontW(-intFontPx, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                                        DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-            HFONT oldFont = (HFONT)SelectObject(hdc, intFont);
-            SIZE intGlyphSz{};
-            GetTextExtentPoint32W(hdc, L"\u222B", 1, &intGlyphSz);
-            SelectObject(hdc, oldFont);
-            DeleteObject(intFont);
+            int intW = scaledPx(15, depth);
+            int baseH = tm.tmAscent + tm.tmDescent;
+            int ascent = std::max(integrand.ascent, upper.height() + scaledPx(4, depth));
+            int descent = std::max(integrand.descent, lower.height() + scaledPx(4, depth));
+            ascent = std::max(ascent, (int)(baseH * 1.05));
+            descent = std::max(descent, (int)(baseH * 1.05));
+
+            int limitsW = std::max(upper.width, lower.width);
+            int pad = scaledPx(4, depth);
 
             std::wstring diffStr = L" d";
             diffStr.push_back(it->variableName ? (wchar_t)it->variableName : L'x');
             HFONT f = fontForDepth(depth);
-            oldFont = (HFONT)SelectObject(hdc, f);
+            HFONT oldFont = (HFONT)SelectObject(hdc, f);
             SIZE diffSz{};
             GetTextExtentPoint32W(hdc, diffStr.c_str(), (int)diffStr.size(), &diffSz);
             SelectObject(hdc, oldFont);
-            TEXTMETRICW tm = textMetricsForDepth(hdc, depth);
 
-            int limitsW = std::max(lower.width, upper.width);
-            int pad = scaledPx(3, depth);
             Size s;
-            s.width = intGlyphSz.cx + limitsW + pad + integrand.width + pad + diffSz.cx;
-            int upperRaise = (int)(tm.tmAscent * 0.8) + upper.height();
-            int lowerDrop = (int)(tm.tmDescent * 0.8) + lower.height();
-            s.ascent = std::max({integrand.ascent, upperRaise, intFontPx / 2});
-            s.descent = std::max({integrand.descent, lowerDrop, intFontPx / 2});
+            s.width = intW + limitsW + pad + integrand.width + scaledPx(6, depth) + diffSz.cx;
+            s.ascent = ascent + scaledPx(2, depth);
+            s.descent = descent + scaledPx(2, depth);
             return s;
         }
         case ItemType::Derivative: {
@@ -610,44 +605,63 @@ void drawItemImpl(HDC hdc, const Item* it, int depth, int x, int baselineY,
             Size integrand = measureRowImpl(hdc, it->a.get(), depth);
             Size lower = measureRowImpl(hdc, it->b.get(), depth + 1);
             Size upper = measureRowImpl(hdc, it->c.get(), depth + 1);
-
-            int contentH = std::max(integrand.height(), fontPxForDepth(depth) * 2);
-            int intFontPx = contentH + scaledPx(10, depth);
-            HFONT intFont = CreateFontW(-intFontPx, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                                        DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-            HFONT oldFont = (HFONT)SelectObject(hdc, intFont);
-            SIZE intGlyphSz{};
-            GetTextExtentPoint32W(hdc, L"\u222B", 1, &intGlyphSz);
-            TEXTMETRICW intTm{};
-            GetTextMetricsW(hdc, &intTm);
-
-            SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, theme.operatorColor);
-            TextOutW(hdc, x, baselineY - intTm.tmAscent / 2 - scaledPx(2, depth), L"\u222B", 1);
-            SelectObject(hdc, oldFont);
-            DeleteObject(intFont);
-
-            int limitsX = x + intGlyphSz.cx;
-            int limitsW = std::max(lower.width, upper.width);
             TEXTMETRICW tm = textMetricsForDepth(hdc, depth);
 
-            // Upper limit
-            int upperY = baselineY - (int)(tm.tmAscent * 0.7) - upper.descent;
-            drawRowImpl(hdc, it->c.get(), depth + 1, limitsX, upperY, theme, cursor, outCaret);
+            int intW = scaledPx(15, depth);
+            int baseH = tm.tmAscent + tm.tmDescent;
+            int ascent = std::max(integrand.ascent, upper.height() + scaledPx(4, depth));
+            int descent = std::max(integrand.descent, lower.height() + scaledPx(4, depth));
+            ascent = std::max(ascent, (int)(baseH * 1.05));
+            descent = std::max(descent, (int)(baseH * 1.05));
 
-            // Lower limit
-            int lowerY = baselineY + (int)(tm.tmDescent * 0.7) + lower.ascent;
-            drawRowImpl(hdc, it->b.get(), depth + 1, limitsX, lowerY, theme, cursor, outCaret);
+            int topY = baselineY - ascent;
+            int bottomY = baselineY + descent;
+            int limitsW = std::max(upper.width, lower.width);
+            int pad = scaledPx(4, depth);
 
-            // Integrand
-            int pad = scaledPx(3, depth);
-            int integrandX = limitsX + limitsW + pad;
+            // Draw smooth vector integral sign ∫ using PolyBezier
+            int penW = std::max(2, scaledPx(2, depth));
+            HPEN intPen = CreatePen(PS_SOLID, penW, theme.operatorColor);
+            HPEN oldPen = (HPEN)SelectObject(hdc, intPen);
+
+            int x0 = x + 1;
+            int x1 = x + intW - 1;
+            int xm = x + (intW * 46) / 100;
+            int y0 = topY + 2;
+            int y1 = bottomY - 2;
+            int ym = baselineY;
+            int hookR = std::min(13, (bottomY - topY) * 18 / 100);
+
+            POINT pts[7] = {
+                { (LONG)(x1 - 1), (LONG)(y0 + hookR) },
+                { (LONG)x1, (LONG)y0 },
+                { (LONG)(xm + (hookR * 45) / 100), (LONG)y0 },
+                { (LONG)xm, (LONG)ym },
+                { (LONG)(xm - (hookR * 45) / 100), (LONG)y1 },
+                { (LONG)x0, (LONG)y1 },
+                { (LONG)(x0 + 1), (LONG)(y1 - hookR) }
+            };
+            PolyBezier(hdc, pts, 7);
+            SelectObject(hdc, oldPen);
+            DeleteObject(intPen);
+
+            // Upper limit: sits cleanly at top-right of the top hook
+            int upperX = x + intW + scaledPx(2, depth);
+            int upperY = topY + upper.ascent;
+            drawRowImpl(hdc, it->c.get(), depth + 1, upperX, upperY, theme, cursor, outCaret);
+
+            // Lower limit: sits cleanly at lower-right of the bottom hook
+            int lowerX = x + intW + scaledPx(2, depth);
+            int lowerY = bottomY - lower.descent;
+            drawRowImpl(hdc, it->b.get(), depth + 1, lowerX, lowerY, theme, cursor, outCaret);
+
+            // Integrand: sits on baseline to the right of limits
+            int integrandX = x + intW + limitsW + pad;
             drawRowImpl(hdc, it->a.get(), depth, integrandX, baselineY, theme, cursor, outCaret);
 
-            // "dx"
-            int diffX = integrandX + integrand.width + pad;
-            std::wstring diffStr = L" d";
+            // Differential "dx"
+            int diffX = integrandX + integrand.width + scaledPx(6, depth);
+            std::wstring diffStr = L"d";
             diffStr.push_back(it->variableName ? (wchar_t)it->variableName : L'x');
             drawText(hdc, depth, diffX, baselineY, diffStr, theme.operatorColor);
             return;
@@ -838,29 +852,28 @@ void findItemHit(HDC hdc, Row* parent, int index, Item* item, int depth,
             Size integrand = measureRowImpl(hdc, item->a.get(), depth);
             Size lower = measureRowImpl(hdc, item->b.get(), depth + 1);
             Size upper = measureRowImpl(hdc, item->c.get(), depth + 1);
-
-            int contentH = std::max(integrand.height(), fontPxForDepth(depth) * 2);
-            int intFontPx = contentH + scaledPx(10, depth);
-            HFONT intFont = CreateFontW(-intFontPx, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                                        DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-            HFONT oldFont = (HFONT)SelectObject(hdc, intFont);
-            SIZE intGlyphSz{};
-            GetTextExtentPoint32W(hdc, L"\u222B", 1, &intGlyphSz);
-            SelectObject(hdc, oldFont);
-            DeleteObject(intFont);
-
-            int limitsX = x + intGlyphSz.cx;
-            int limitsW = std::max(lower.width, upper.width);
             TEXTMETRICW tm = textMetricsForDepth(hdc, depth);
 
-            int upperY = baselineY - (int)(tm.tmAscent * 0.7) - upper.descent;
-            int lowerY = baselineY + (int)(tm.tmDescent * 0.7) + lower.ascent;
-            int pad = scaledPx(3, depth);
-            int integrandX = limitsX + limitsW + pad;
+            int intW = scaledPx(15, depth);
+            int baseH = tm.tmAscent + tm.tmDescent;
+            int ascent = std::max(integrand.ascent, upper.height() + scaledPx(4, depth));
+            int descent = std::max(integrand.descent, lower.height() + scaledPx(4, depth));
+            ascent = std::max(ascent, (int)(baseH * 1.05));
+            descent = std::max(descent, (int)(baseH * 1.05));
 
-            findRowHit(hdc, item->c.get(), depth + 1, limitsX, upperY, pointX, pointY, best);
-            findRowHit(hdc, item->b.get(), depth + 1, limitsX, lowerY, pointX, pointY, best);
+            int topY = baselineY - ascent;
+            int bottomY = baselineY + descent;
+            int limitsW = std::max(upper.width, lower.width);
+            int pad = scaledPx(4, depth);
+
+            int upperX = x + intW + scaledPx(2, depth);
+            int upperY = topY + upper.ascent;
+            int lowerX = x + intW + scaledPx(2, depth);
+            int lowerY = bottomY - lower.descent;
+            int integrandX = x + intW + limitsW + pad;
+
+            findRowHit(hdc, item->c.get(), depth + 1, upperX, upperY, pointX, pointY, best);
+            findRowHit(hdc, item->b.get(), depth + 1, lowerX, lowerY, pointX, pointY, best);
             findRowHit(hdc, item->a.get(), depth, integrandX, baselineY, pointX, pointY, best);
             return;
         }
