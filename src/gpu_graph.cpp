@@ -83,7 +83,7 @@ VS_OUTPUT VSMain(uint id : SV_VertexID) {
 }
 )";
 
-std::string buildShaderSource(const std::string& mathExpr) {
+std::string buildShaderSource(const std::string& mathExpr, GraphEquationKind kind) {
     std::ostringstream oss;
     oss << R"(
 cbuffer Params : register(b0) {
@@ -109,10 +109,10 @@ float gpu_pow(float a, float b) {
     if (a == 0.0) {
         if (b == 0.0) return 1.0;
         if (b > 0.0) return 0.0;
-        return asfloat(0x7FC00000); // 0^-n is division by zero -> NaN/undefined
+        return asfloat(0x7FC00000);
     }
     if (a < 0.0) {
-        if (frac(b) != 0.0) return asfloat(0x7FC00000); // negative base with non-integer exp is undefined
+        if (frac(b) != 0.0) return asfloat(0x7FC00000);
         float res = pow(-a, b);
         return (fmod(abs(b), 2.0) >= 0.5) ? -res : res;
     }
@@ -123,60 +123,184 @@ float gpu_sinc(float v) {
     if (abs(v) < 1e-6) return 1.0;
     return sin(v) / v;
 }
+)";
 
+    if (kind == GraphEquationKind::ExplicitY) {
+        oss << R"(
+float evalCurve(float x) {
+    return )" << mathExpr << R"(;
+}
+)";
+    } else if (kind == GraphEquationKind::ExplicitX) {
+        oss << R"(
+float evalCurve(float y) {
+    return )" << mathExpr << R"(;
+}
+)";
+    } else {
+        oss << R"(
 float evalF(float x, float y) {
     return )" << mathExpr << R"(;
 }
+)";
+    }
 
+    oss << R"(
 float4 PSMain(VS_OUTPUT input) : SV_Target {
-    float mathX = lerp(uBounds.x, uBounds.y, input.uv.x);
-    float mathY = lerp(uBounds.w, uBounds.z, input.uv.y);
+    float2 center = float2((uBounds.x + uBounds.y) * 0.5, (uBounds.w + uBounds.z) * 0.5);
+    float2 halfSize = float2((uBounds.y - uBounds.x) * 0.5, (uBounds.w - uBounds.z) * 0.5);
+
+    // High precision relative coordinates to prevent float32 underflow at high zoom depths
+    float relX = (input.uv.x - 0.5) * (2.0 * halfSize.x);
+    float relY = (0.5 - input.uv.y) * (2.0 * halfSize.y);
+
+    float mathX = center.x + relX;
+    float mathY = center.y + relY;
+
+    float dx = max((2.0 * halfSize.x) / uScreen.x, 1e-7);
+    float dy = max((2.0 * halfSize.y) / uScreen.y, 1e-7);
 
     float4 color = uBgCol;
 
-    // Background Grid
+    // 1. Desmos-grade Adaptive Grid (Major + Minor Subdivisions)
     if (uSteps.x > 0.0 && uSteps.y > 0.0) {
-        float2 cell = float2(mathX / uSteps.x, mathY / uSteps.y);
-        float2 gridDist = abs(frac(cell + 0.5) - 0.5);
-        float2 pixGrid = gridDist / float2(max(abs(ddx(cell.x)), 1e-5), max(abs(ddy(cell.y)), 1e-5));
-        float gridLine = min(pixGrid.x, pixGrid.y);
-        float gridAlpha = saturate(1.0 - gridLine * 0.8) * uGridCol.a;
-        color = lerp(color, float4(uGridCol.rgb, 1.0), gridAlpha);
+        float offsetX = fmod(center.x, uSteps.x);
+        float offsetY = fmod(center.y, uSteps.y);
+        float2 gridCoord = float2((relX + offsetX) / uSteps.x, (relY + offsetY) / uSteps.y);
+
+        float2 majorDist = abs(frac(gridCoord + 0.5) - 0.5);
+        float2 pixPerMajor = float2(uSteps.x / dx, uSteps.y / dy);
+        float2 distPixMajor = majorDist * pixPerMajor;
+        float majorLine = min(distPixMajor.x, distPixMajor.y);
+        float majorAlpha = saturate(1.2 - majorLine) * uGridCol.a;
+
+        float minorStepX = uSteps.x * 0.2;
+        float minorStepY = uSteps.y * 0.2;
+        float minorOffX = fmod(center.x, minorStepX);
+        float minorOffY = fmod(center.y, minorStepY);
+        float2 minorCoord = float2((relX + minorOffX) / minorStepX, (relY + minorOffY) / minorStepY);
+        float2 minorDist = abs(frac(minorCoord + 0.5) - 0.5);
+        float2 pixPerMinor = pixPerMajor * 0.2;
+        float2 distPixMinor = minorDist * pixPerMinor;
+        float minorLine = min(distPixMinor.x, distPixMinor.y);
+        float minorAlpha = saturate(1.0 - minorLine) * (uGridCol.a * 0.35);
+
+        float totalGridAlpha = max(majorAlpha, minorAlpha);
+        color = lerp(color, float4(uGridCol.rgb, 1.0), totalGridAlpha);
     }
 
-    // Main Axes
-    float2 axisDistPix = float2(abs(mathX) / max(abs(ddx(mathX)), 1e-5), abs(mathY) / max(abs(ddy(mathY)), 1e-5));
+    // 2. Bold Coordinate Axes (x=0, y=0)
+    float2 axisDistPix = float2(abs(mathX) / dx, abs(mathY) / dy);
     float axisLine = min(axisDistPix.x, axisDistPix.y);
-    float axisAlpha = saturate(1.2 - axisLine * 0.7) * uAxisCol.a;
+    float axisAlpha = saturate(1.3 - axisLine * 0.8) * uAxisCol.a;
     color = lerp(color, float4(uAxisCol.rgb, 1.0), axisAlpha);
+)";
 
-    // Math Curve / Implicit Contour with Zoom-Invariant Pole & Asymptote Rejection
-    float f = evalF(mathX, mathY);
-    float df_dx = ddx(f);
-    float df_dy = ddy(f);
-    float grad = length(float2(df_dx, df_dy));
+    if (kind == GraphEquationKind::ExplicitY) {
+        oss << R"(
+    // 3. Explicit Y = f(x) with Subpixel Tangent Distance and Dotted Vertical Asymptotes
+    float y0 = evalCurve(mathX);
+    float yLeft = evalCurve(mathX - dx);
+    float yRight = evalCurve(mathX + dx);
 
-    if (isfinite(f) && grad > 1e-7) {
-        float distPix = abs(f) / grad;
-        float f_right = f + df_dx;
-        float f_down  = f + df_dy;
-        float minF = min(f, min(f_right, f_down));
-        float maxF = max(f, max(f_right, f_down));
-        bool signChange = (minF <= 0.0 && maxF >= 0.0);
+    float jump = max(abs(y0 - yLeft), abs(yRight - y0));
+    bool isPole = false;
+    if (jump > dy * 35.0) {
+        if ((y0 * yLeft < 0.0) || (y0 * yRight < 0.0) || (yLeft * yRight < 0.0)) {
+            isPole = true;
+        }
+    }
 
-        // Zoom-invariant pole rejection: across a pole (e.g. 1/x, tan(x)), f jumps between large
-        // positive and negative values. A real curve in the viewport has |f| bounded near 0.
-        float mathHeight = max(uBounds.w - uBounds.z, 1e-4);
-        bool isPole = signChange && (abs(f) > mathHeight * 3.0);
+    if (isPole) {
+        // Dotted vertical line down the asymptote
+        float dotPhase = fmod(input.uv.y * uScreen.y, 8.0);
+        if (dotPhase < 4.0) {
+            float asymAlpha = saturate(0.65) * uCurveCol.a;
+            color = lerp(color, float4(uCurveCol.rgb, 1.0), asymAlpha);
+        }
+    } else if (isfinite(y0)) {
+        float distY = abs(mathY - y0) / dy;
+        float slope = (yRight - yLeft) / (2.0 * dx);
+        float slopePix = slope * (dx / dy);
+        float distPix = distY / sqrt(1.0 + slopePix * slopePix);
 
-        if (distPix <= 2.2 && !isPole) {
-            float core = saturate(1.7 - distPix);
-            float glow = saturate(1.0 - distPix * 0.32) * 0.4;
+        if (distPix <= 2.2) {
+            float core = saturate(1.6 - distPix);
+            float glow = saturate(1.0 - distPix * 0.35) * 0.35;
             float alpha = saturate(core + glow) * uCurveCol.a;
             color = lerp(color, float4(uCurveCol.rgb, 1.0), alpha);
         }
     }
+)";
+    } else if (kind == GraphEquationKind::ExplicitX) {
+        oss << R"(
+    // 3. Explicit X = f(y) with Subpixel Tangent Distance and Dotted Horizontal Asymptotes
+    float x0 = evalCurve(mathY);
+    float xUp = evalCurve(mathY + dy);
+    float xDown = evalCurve(mathY - dy);
 
+    float jump = max(abs(x0 - xDown), abs(xUp - x0));
+    bool isPole = false;
+    if (jump > dx * 35.0) {
+        if ((x0 * xDown < 0.0) || (x0 * xUp < 0.0) || (xDown * xUp < 0.0)) {
+            isPole = true;
+        }
+    }
+
+    if (isPole) {
+        float dotPhase = fmod(input.uv.x * uScreen.x, 8.0);
+        if (dotPhase < 4.0) {
+            float asymAlpha = saturate(0.65) * uCurveCol.a;
+            color = lerp(color, float4(uCurveCol.rgb, 1.0), asymAlpha);
+        }
+    } else if (isfinite(x0)) {
+        float distX = abs(mathX - x0) / dx;
+        float slope = (xUp - xDown) / (2.0 * dy);
+        float slopePix = slope * (dy / dx);
+        float distPix = distX / sqrt(1.0 + slopePix * slopePix);
+
+        if (distPix <= 2.2) {
+            float core = saturate(1.6 - distPix);
+            float glow = saturate(1.0 - distPix * 0.35) * 0.35;
+            float alpha = saturate(core + glow) * uCurveCol.a;
+            color = lerp(color, float4(uCurveCol.rgb, 1.0), alpha);
+        }
+    }
+)";
+    } else if (kind == GraphEquationKind::ImplicitXY) {
+        oss << R"(
+    // 3. Implicit F(x, y) = 0 with Strict Zero-Crossing Gate (Eliminates Exterior Blobs)
+    float f0 = evalF(mathX, mathY);
+    if (isfinite(f0)) {
+        float fR = evalF(mathX + dx, mathY);
+        float fL = evalF(mathX - dx, mathY);
+        float fU = evalF(mathX, mathY + dy);
+        float fD = evalF(mathX, mathY - dy);
+
+        float minVal = min(f0, min(min(fR, fL), min(fU, fD)));
+        float maxVal = max(f0, max(max(fR, fL), max(fU, fD)));
+
+        // Strict Zero-Crossing Verification
+        if (minVal <= 0.0 && maxVal >= 0.0) {
+            float df_dx = (fR - fL) * 0.5;
+            float df_dy = (fU - fD) * 0.5;
+            float grad = length(float2(df_dx / dx, df_dy / dy));
+
+            if (grad > 1e-6) {
+                float distPix = abs(f0) / (grad * max(dx, dy));
+                if (distPix <= 2.2) {
+                    float core = saturate(1.6 - distPix);
+                    float glow = saturate(1.0 - distPix * 0.35) * 0.35;
+                    float alpha = saturate(core + glow) * uCurveCol.a;
+                    color = lerp(color, float4(uCurveCol.rgb, 1.0), alpha);
+                }
+            }
+        }
+    }
+)";
+    }
+
+    oss << R"(
     return color;
 }
 )";
@@ -184,7 +308,7 @@ float4 PSMain(VS_OUTPUT input) : SV_Target {
 }
 
 std::string buildDefaultShaderSource() {
-    return buildShaderSource("1.0"); // Evaluates to non-zero -> no curve drawn, only grid and axes
+    return buildShaderSource("1.0", GraphEquationKind::None);
 }
 
 // Float formatting for HLSL literals
@@ -312,7 +436,9 @@ bool itemToHLSL(const Item* it, std::string& out) {
     }
 }
 
-// Convert GraphAnalysis to an implicit HLSL zero equation F(x, y) = 0
+} // namespace
+
+// Convert GraphAnalysis to HLSL expression
 bool analysisToHLSL(const GraphAnalysis& analysis, std::string& outExpr) {
     if (!analysis.isValid) return false;
 
@@ -320,13 +446,13 @@ bool analysisToHLSL(const GraphAnalysis& analysis, std::string& outExpr) {
         std::string rightStr;
         const Row* right = analysis.rightRow ? analysis.rightRow.get() : analysis.leftRow.get();
         if (!rowToHLSL(right, rightStr)) return false;
-        outExpr = "y - (" + rightStr + ")";
+        outExpr = "(" + rightStr + ")";
         return true;
     } else if (analysis.kind == GraphEquationKind::ExplicitX) {
         std::string rightStr;
         const Row* right = analysis.rightRow ? analysis.rightRow.get() : analysis.leftRow.get();
         if (!rowToHLSL(right, rightStr)) return false;
-        outExpr = "x - (" + rightStr + ")";
+        outExpr = "(" + rightStr + ")";
         return true;
     } else if (analysis.kind == GraphEquationKind::ImplicitXY) {
         std::string leftStr, rightStr;
@@ -341,6 +467,8 @@ bool analysisToHLSL(const GraphAnalysis& analysis, std::string& outExpr) {
     }
     return false;
 }
+
+namespace {
 
 void colorrefToFloat4(COLORREF c, float a, float* out) {
     out[0] = (float)GetRValue(c) / 255.0f;
@@ -392,11 +520,12 @@ bool resizeTargets(int width, int height) {
     return true;
 }
 
-ID3D11PixelShader* getOrCreatePixelShader(const std::string& mathExpr) {
-    auto it = s_gpu.shaderCache.find(mathExpr);
+ID3D11PixelShader* getOrCreatePixelShader(const std::string& mathExpr, GraphEquationKind kind) {
+    std::string cacheKey = std::to_string(static_cast<int>(kind)) + ":" + mathExpr;
+    auto it = s_gpu.shaderCache.find(cacheKey);
     if (it != s_gpu.shaderCache.end()) return it->second;
 
-    std::string hlslSource = buildShaderSource(mathExpr);
+    std::string hlslSource = buildShaderSource(mathExpr, kind);
     ID3DBlob* codeBlob = nullptr;
     ID3DBlob* errorBlob = nullptr;
 
@@ -437,7 +566,7 @@ ID3D11PixelShader* getOrCreatePixelShader(const std::string& mathExpr) {
         s_gpu.shaderCache.clear();
     }
 
-    s_gpu.shaderCache[mathExpr] = ps;
+    s_gpu.shaderCache[cacheKey] = ps;
     return ps;
 }
 
@@ -612,7 +741,7 @@ bool renderGraphGpu(HDC hdc, const RECT& graphRect, const GraphAnalysis& analysi
     if (analysis.isValid) {
         std::string hlslExpr;
         if (analysisToHLSL(analysis, hlslExpr)) {
-            activePS = getOrCreatePixelShader(hlslExpr);
+            activePS = getOrCreatePixelShader(hlslExpr, analysis.kind);
         }
         if (!activePS) {
             // Expression contains non-GPU scalar construct (e.g. limit/matrix), fallback to CPU
@@ -786,7 +915,7 @@ bool renderGraphGpu(HDC hdc, const RECT& graphRect, const GraphAnalysis& analysi
     double startX = std::floor(state.minX / xStep) * xStep;
     for (double x = startX; x <= state.maxX + xStep * 0.5; x += xStep) {
         if (std::fabs(x) > 1e-9) {
-            std::string label = formatNumberShort(x);
+            std::string label = formatAxisNumber(x, xStep);
             POINT axisPt = state.mathToPixel(x, 0.0, localRect);
             int labelY = std::clamp((int)axisPt.y + 4, 18, h - 18);
             RECT lr = { graphRect.left + axisPt.x - 30, graphRect.top + labelY,
@@ -799,7 +928,7 @@ bool renderGraphGpu(HDC hdc, const RECT& graphRect, const GraphAnalysis& analysi
     double startY = std::floor(state.minY / yStep) * yStep;
     for (double y = startY; y <= state.maxY + yStep * 0.5; y += yStep) {
         if (std::fabs(y) > 1e-9) {
-            std::string label = formatNumberShort(y);
+            std::string label = formatAxisNumber(y, yStep);
             POINT axisPt = state.mathToPixel(0.0, y, localRect);
             int labelX = std::clamp((int)axisPt.x + 6, 6, w - 44);
             RECT lr = { graphRect.left + labelX, graphRect.top + axisPt.y - 8,
@@ -815,41 +944,6 @@ bool renderGraphGpu(HDC hdc, const RECT& graphRect, const GraphAnalysis& analysi
                      graphRect.left + originPt.x - 2,  graphRect.top + originPt.y + 17 };
         DrawTextA(hdc, "0", -1, &orr, DT_RIGHT | DT_SINGLELINE);
     }
-
-    // Header Title
-    std::string titleText = analysis.isValid ? analysis.title : "Graph Engine (Direct3D 11)";
-    RECT titleRect = { graphRect.left + 12, graphRect.top + 10, graphRect.left + 260, graphRect.top + 34 };
-    HBRUSH tagBrush = CreateSolidBrush(theme.isDark ? RGB(0x28, 0x2C, 0x34) : RGB(0xEA, 0xEE, 0xF2));
-    HPEN tagPen = CreatePen(PS_SOLID, 1, theme.isDark ? RGB(0x3E, 0x44, 0x51) : RGB(0xCF, 0xD4, 0xDA));
-    HBRUSH oldB = (HBRUSH)SelectObject(hdc, tagBrush);
-    HPEN oldP = (HPEN)SelectObject(hdc, tagPen);
-    RoundRect(hdc, titleRect.left, titleRect.top, titleRect.right, titleRect.bottom, 8, 8);
-
-    // Hardware Accelerated Pill Badge: "[GPU]"
-    RECT gpuBadge = { titleRect.right + 6, graphRect.top + 10, titleRect.right + 66, graphRect.top + 34 };
-    HBRUSH gpuBrush = CreateSolidBrush(theme.isDark ? RGB(0x1B, 0x38, 0x28) : RGB(0xD4, 0xF0, 0xDF));
-    HPEN gpuPen = CreatePen(PS_SOLID, 1, theme.isDark ? RGB(0x2E, 0x7D, 0x48) : RGB(0x63, 0xC4, 0x86));
-    SelectObject(hdc, gpuBrush);
-    SelectObject(hdc, gpuPen);
-    RoundRect(hdc, gpuBadge.left, gpuBadge.top, gpuBadge.right, gpuBadge.bottom, 8, 8);
-
-    SelectObject(hdc, oldB);
-    SelectObject(hdc, oldP);
-    DeleteObject(tagBrush);
-    DeleteObject(tagPen);
-    DeleteObject(gpuBrush);
-    DeleteObject(gpuPen);
-
-    SetTextColor(hdc, theme.isDark ? RGB(0xF0, 0xF2, 0xF5) : RGB(0x21, 0x25, 0x29));
-    SelectObject(hdc, font ? font : smallFont);
-    RECT titleTextRect = { titleRect.left + 8, titleRect.top, titleRect.right - 8, titleRect.bottom };
-    DrawTextA(hdc, titleText.c_str(), -1, &titleTextRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-
-    // Draw GPU / WARP label inside badge
-    SetTextColor(hdc, theme.isDark ? RGB(0x5A, 0xDE, 0x8B) : RGB(0x19, 0x87, 0x54));
-    SelectObject(hdc, smallFont ? smallFont : font);
-    const char* badgeText = s_gpu.isWarp ? "WARP D3D11" : "GPU D3D11";
-    DrawTextA(hdc, badgeText, -1, &gpuBadge, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
     // Zoom Buttons
     int btnSize = 24;
@@ -878,6 +972,46 @@ bool renderGraphGpu(HDC hdc, const RECT& graphRect, const GraphAnalysis& analysi
     drawGraphButton(resetBtn, "Reset");
     drawGraphButton(zoomOutBtn, "-");
     drawGraphButton(zoomInBtn, "+");
+
+    // Hardware Accelerated Pill Badge: "[GPU D3D11]" / "[WARP D3D11]"
+    int badgeW = 78;
+    RECT gpuBadge = { resetBtn.left - badgeW - 8, by, resetBtn.left - 8, by + btnSize };
+    HBRUSH gpuBrush = CreateSolidBrush(theme.isDark ? RGB(0x1B, 0x38, 0x28) : RGB(0xD4, 0xF0, 0xDF));
+    HPEN gpuPen = CreatePen(PS_SOLID, 1, theme.isDark ? RGB(0x2E, 0x7D, 0x48) : RGB(0x63, 0xC4, 0x86));
+    HBRUSH oldB = (HBRUSH)SelectObject(hdc, gpuBrush);
+    HPEN oldP = (HPEN)SelectObject(hdc, gpuPen);
+    RoundRect(hdc, gpuBadge.left, gpuBadge.top, gpuBadge.right, gpuBadge.bottom, 8, 8);
+    SelectObject(hdc, oldB);
+    SelectObject(hdc, oldP);
+    DeleteObject(gpuBrush);
+    DeleteObject(gpuPen);
+
+    SetTextColor(hdc, theme.isDark ? RGB(0x5A, 0xDE, 0x8B) : RGB(0x19, 0x87, 0x54));
+    SelectObject(hdc, smallFont ? smallFont : font);
+    const char* badgeText = s_gpu.isWarp ? "WARP D3D11" : "GPU D3D11";
+    DrawTextA(hdc, badgeText, -1, &gpuBadge, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    // Header Title
+    int titleMaxRight = gpuBadge.left - 8;
+    int titleLeft = graphRect.left + 12;
+    if (titleMaxRight > titleLeft + 30) {
+        std::string titleText = analysis.isValid ? analysis.title : "Graph Engine (Direct3D 11)";
+        RECT titleRect = { titleLeft, by, titleMaxRight, by + btnSize };
+        HBRUSH tagBrush = CreateSolidBrush(theme.isDark ? RGB(0x28, 0x2C, 0x34) : RGB(0xEA, 0xEE, 0xF2));
+        HPEN tagPen = CreatePen(PS_SOLID, 1, theme.isDark ? RGB(0x3E, 0x44, 0x51) : RGB(0xCF, 0xD4, 0xDA));
+        oldB = (HBRUSH)SelectObject(hdc, tagBrush);
+        oldP = (HPEN)SelectObject(hdc, tagPen);
+        RoundRect(hdc, titleRect.left, titleRect.top, titleRect.right, titleRect.bottom, 8, 8);
+        SelectObject(hdc, oldB);
+        SelectObject(hdc, oldP);
+        DeleteObject(tagBrush);
+        DeleteObject(tagPen);
+
+        SetTextColor(hdc, theme.isDark ? RGB(0xF0, 0xF2, 0xF5) : RGB(0x21, 0x25, 0x29));
+        SelectObject(hdc, font ? font : smallFont);
+        RECT titleTextRect = { titleRect.left + 8, titleRect.top, titleRect.right - 8, titleRect.bottom };
+        DrawTextA(hdc, titleText.c_str(), -1, &titleTextRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
 
     // Right-Click Probe Tooltip
     if (state.isRightProbing) {

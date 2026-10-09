@@ -21,4 +21,9 @@ Thumbs.db
 # Test/scratch files
 test*.cpp
 test*.hlsl
+test*.py
+tests/
+scratch*.*
+__pycache__/
+*.pyc
 

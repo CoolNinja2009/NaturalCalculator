@@ -29,6 +29,9 @@ bool initGpuGraph();
 // Release all GPU resources on shutdown
 void shutdownGpuGraph();
 
+// Convert GraphAnalysis to HLSL math expression for GPU shader compilation
+bool analysisToHLSL(const GraphAnalysis& analysis, std::string& outExpr);
+
 // Render graph onto hdc within graphRect using Direct3D 11 hardware acceleration.
 // Returns true on successful GPU render, or false if CPU fallback is needed.
 bool renderGraphGpu(HDC hdc, const RECT& graphRect, const GraphAnalysis& analysis,

@@ -123,6 +123,7 @@ GraphPalette getGraphPalette(const Theme& theme);
 // Shared numeric formatting and step-size calculation for coordinate grids.
 double chooseStep(double range, int targetDivisions);
 std::string formatNumberShort(double v);
+std::string formatAxisNumber(double v, double step);
 
 // Analyzes a row (e.g. from current Expression or history) to determine
 // if it is a graph-valid equation or expression.

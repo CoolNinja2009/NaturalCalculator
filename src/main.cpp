@@ -1963,7 +1963,7 @@ void paint(HDC hdc, RECT client) {
                 }
 
                 GraphAnalysis analysis = analyzeGraphExpression(g.workspace.current().root.get(), g.values);
-                if (!analysis.isValid && !g.workspace.history().empty()) {
+                if (!analysis.isValid && g.workspace.current().root->items.empty() && !g.workspace.history().empty()) {
                     analysis = analyzeGraphExpression(g.workspace.history().back()->expr->root.get(), g.values);
                 }
                 RECT localRect = { 0, 0, gw, gh };

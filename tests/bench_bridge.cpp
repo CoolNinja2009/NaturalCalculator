@@ -236,4 +236,38 @@ __declspec(dllexport) double bench_graph_eval_ast() {
     return evaluate(expr->root.get(), ctx);
 }
 
+__declspec(dllexport) void bench_test_analyze_graph(const char* text, int* outKind, int* outIsValid) {
+    Expression expr;
+    insertFromText(expr, text);
+    EvaluationContext ctx;
+    ctx.degrees = false;
+    GraphAnalysis ga = analyzeGraphExpression(expr.root.get(), ctx);
+    if (outKind) *outKind = static_cast<int>(ga.kind);
+    if (outIsValid) *outIsValid = ga.isValid ? 1 : 0;
+}
+
+__declspec(dllexport) void bench_test_format_axis_number(double val, double step, char* outBuf, int maxLen) {
+    if (!outBuf || maxLen <= 0) return;
+    std::string s = formatAxisNumber(val, step);
+    strncpy_s(outBuf, maxLen, s.c_str(), _TRUNCATE);
+}
+
+__declspec(dllexport) double bench_test_cardioid_eval(double x, double y) {
+    Expression expr;
+    insertFromText(expr, "(((x)^(2) + (y)^(2) - 2x))^(2) = (2)^(2)*((x)^(2) + (y)^(2))");
+    EvaluationContext ctx;
+    ctx.degrees = false;
+    GraphAnalysis ga = analyzeGraphExpression(expr.root.get(), ctx);
+    if (!ga.isValid) return -999999.0;
+    return ga.evalImplicit(x, y);
+}
+
+__declspec(dllexport) void bench_test_zoom_bounds(double zoomFactor, double* outMinX, double* outMaxX) {
+    GraphState state;
+    state.resetView(10.0);
+    state.zoom(zoomFactor, 0.0, 0.0);
+    if (outMinX) *outMinX = state.minX;
+    if (outMaxX) *outMaxX = state.maxX;
+}
+
 } // extern "C"

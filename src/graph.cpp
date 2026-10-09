@@ -64,39 +64,51 @@ void collectVars(const Row* row, bool& hasX, bool& hasY) {
 
 } // namespace
 
-std::string formatNumberShort(double v) {
-    char buf[32];
-    double av = std::fabs(v);
-    if (av < 1e-12) return "0";
-    if (std::floor(v) == v && av < 1e6) {
-        std::snprintf(buf, sizeof(buf), "%.0f", v);
-    } else if (av >= 1e4 || av <= 1e-3) {
-        std::snprintf(buf, sizeof(buf), "%.1e", v);
-    } else {
-        std::snprintf(buf, sizeof(buf), "%.2f", v);
-        // trim trailing zeros
-        std::string s(buf);
-        size_t dot = s.find('.');
-        if (dot != std::string::npos) {
-            size_t last = s.find_last_not_of('0');
-            if (last == dot) last--;
-            s.erase(last + 1);
-        }
-        return s;
+std::string formatAxisNumber(double v, double step) {
+    if (std::fabs(v) < 1e-12 || (step > 0.0 && std::fabs(v) < step * 1e-4)) return "0";
+
+    // Dynamic decimal precision matching step resolution
+    int decimals = 0;
+    if (step < 1.0 && step > 0.0) {
+        decimals = (int)std::ceil(-std::log10(step) + 1e-6);
+        if (decimals < 0) decimals = 0;
+        if (decimals > 7) decimals = 7;
     }
-    return std::string(buf);
+
+    char buf[64];
+    double av = std::fabs(v);
+    if (av >= 1e7 || (av <= 1e-4 && av > 0.0)) {
+        std::snprintf(buf, sizeof(buf), "%.2e", v);
+    } else {
+        std::snprintf(buf, sizeof(buf), "%.*f", decimals, v);
+    }
+
+    std::string s(buf);
+    if (s.find('.') != std::string::npos && s.find('e') == std::string::npos) {
+        while (!s.empty() && s.back() == '0') s.pop_back();
+        if (!s.empty() && s.back() == '.') s.pop_back();
+    }
+    return s.empty() ? "0" : s;
+}
+
+std::string formatNumberShort(double v) {
+    return formatAxisNumber(v, 0.01);
 }
 
 double chooseStep(double range, int targetDivisions) {
+    if (range <= 0.0 || !std::isfinite(range)) return 1.0;
+    if (targetDivisions <= 0) targetDivisions = 8;
     double rawStep = range / targetDivisions;
+    if (rawStep <= 0.0 || !std::isfinite(rawStep)) return 1.0;
     double mag = std::pow(10.0, std::floor(std::log10(rawStep)));
+    if (mag <= 0.0 || !std::isfinite(mag)) return 1.0;
     double normalized = rawStep / mag;
     double step;
     if (normalized < 1.5) step = 1.0 * mag;
     else if (normalized < 3.5) step = 2.0 * mag;
     else if (normalized < 7.5) step = 5.0 * mag;
     else step = 10.0 * mag;
-    return step;
+    return (step > 0.0 && std::isfinite(step)) ? step : 1.0;
 }
 
 GraphPalette getGraphPalette(const Theme& theme) {
@@ -749,14 +761,22 @@ static GraphAnalysis analyzeGraphExpressionInner(const Row* root, const Evaluati
             return result;
         }
 
-        // Case 5: General implicit equation F(x, y) = G(x, y) (e.g. x + y = tan(x), 3x + y = 2, x^2 + y^2 = 25)
-        if (lx || ly || rx || ry) {
+        // Case 5: General implicit 2D equation F(x, y) = G(x, y) (e.g. x + y = tan(x), x^2 + y^2 = 25)
+        // Strictly requires BOTH x and y across the equation!
+        // Rejects 1-variable equations (e.g. x^2 - 7x + 12 = 0, x = 5) which are scalar algebra, not 2D planar curves.
+        if ((lx || rx) && (ly || ry)) {
             result.kind = GraphEquationKind::ImplicitXY;
             result.isValid = true;
             result.title = rawTitle;
             return result;
         }
         return result;
+    }
+
+    // Reject incomplete trailing operators (e.g. "x + ", "y - ")
+    if (!root->items.empty()) {
+        const Item* last = root->items.back().get();
+        if (last->type == ItemType::Operator && last->opChar != '!') return result;
     }
 
     // No equals: check variables in expression
@@ -811,21 +831,40 @@ void GraphState::resetView(double range) {
 }
 
 void GraphState::zoom(double factor, double centerMathX, double centerMathY) {
-    if (factor <= 0.0) return;
-    double w = (maxX - minX) * factor;
-    double h = (maxY - minY) * factor;
-    double xRatio = (centerMathX - minX) / (maxX - minX);
-    double yRatio = (centerMathY - minY) / (maxY - minY);
-    minX = centerMathX - w * xRatio;
-    maxX = minX + w;
-    minY = centerMathY - h * yRatio;
-    maxY = minY + h;
+    if (factor <= 0.0 || !std::isfinite(factor)) return;
+    double curW = maxX - minX;
+    double curH = maxY - minY;
+    if (curW <= 0.0 || curH <= 0.0) return;
+
+    double newW = curW * factor;
+    double newH = curH * factor;
+
+    // Desmos-grade zoom clamps:
+    // Min viewport width 1e-5: prevents 32-bit GPU float underflow/cancellation
+    // Max viewport width 1e7: prevents float overflow and extreme frequency aliasing
+    if (newW < 1e-5) {
+        newW = 1e-5;
+        newH = 1e-5 * (curH / curW);
+    } else if (newW > 1e7) {
+        newW = 1e7;
+        newH = 1e7 * (curH / curW);
+    }
+
+    double xRatio = (centerMathX - minX) / curW;
+    double yRatio = (centerMathY - minY) / curH;
+    minX = centerMathX - newW * xRatio;
+    maxX = minX + newW;
+    minY = centerMathY - newH * yRatio;
+    maxY = minY + newH;
 }
 
 void GraphState::pan(double dxPixels, double dyPixels, int pixelWidth, int pixelHeight) {
     if (pixelWidth <= 0 || pixelHeight <= 0) return;
     double mathDx = (dxPixels / pixelWidth) * (maxX - minX);
     double mathDy = (dyPixels / pixelHeight) * (maxY - minY);
+    if (!std::isfinite(mathDx) || !std::isfinite(mathDy)) return;
+    if (std::fabs(minX - mathDx) > 1e8 || std::fabs(maxX - mathDx) > 1e8) return;
+    if (std::fabs(minY + mathDy) > 1e8 || std::fabs(maxY + mathDy) > 1e8) return;
     minX -= mathDx;
     maxX -= mathDx;
     minY += mathDy;
@@ -1229,7 +1268,7 @@ void renderGraph(HDC hdc, const RECT& graphRect, const GraphAnalysis& analysis,
         LineTo(mem, pt.x, h);
 
         if (std::fabs(x) > 1e-9) {
-            std::string label = formatNumberShort(x);
+            std::string label = formatAxisNumber(x, xStep);
             POINT axisPt = state.mathToPixel(x, 0.0, localRect);
             int labelY = std::clamp((int)axisPt.y + 4, 18, h - 18);
             RECT lr = { pt.x - 30, labelY, pt.x + 30, labelY + 16 };
@@ -1245,7 +1284,7 @@ void renderGraph(HDC hdc, const RECT& graphRect, const GraphAnalysis& analysis,
         LineTo(mem, w, pt.y);
 
         if (std::fabs(y) > 1e-9) {
-            std::string label = formatNumberShort(y);
+            std::string label = formatAxisNumber(y, yStep);
             POINT axisPt = state.mathToPixel(0.0, y, localRect);
             int labelX = std::clamp((int)axisPt.x + 6, 6, w - 44);
             RECT lr = { labelX, pt.y - 8, labelX + 38, pt.y + 8 };
@@ -1301,7 +1340,20 @@ void renderGraph(HDC hdc, const RECT& graphRect, const GraphAnalysis& analysis,
                     // Check for vertical asymptote jump (e.g. tan(x), 1/x)
                     double mathDiff = std::fabs(my - lastMathY);
                     int pixelDiff = std::abs(py - lastPy);
-                    if (pixelDiff > h * 0.75 && mathDiff > (state.maxY - state.minY) * 0.5) {
+                    bool isPoleJump = (pixelDiff > h * 0.4 && mathDiff > (state.maxY - state.minY) * 0.35 && (my * lastMathY < 0.0));
+                    if (isPoleJump) {
+                        // Draw crisp dotted vertical line down the asymptote
+                        HPEN dotPen = CreatePen(PS_DOT, 1, RGB(
+                            (GetRValue(curveColor) * 2 + GetRValue(gridColor)) / 3,
+                            (GetGValue(curveColor) * 2 + GetGValue(gridColor)) / 3,
+                            (GetBValue(curveColor) * 2 + GetBValue(gridColor)) / 3
+                        ));
+                        HPEN prevPen = (HPEN)SelectObject(mem, dotPen);
+                        MoveToEx(mem, px, 0, nullptr);
+                        LineTo(mem, px, h);
+                        SelectObject(mem, prevPen);
+                        DeleteObject(dotPen);
+
                         MoveToEx(mem, px, py, nullptr);
                     } else {
                         LineTo(mem, px, py);
@@ -1334,7 +1386,19 @@ void renderGraph(HDC hdc, const RECT& graphRect, const GraphAnalysis& analysis,
                 } else {
                     double mathDiff = std::fabs(mx - lastMathX);
                     int pixelDiff = std::abs(px - lastPx);
-                    if (pixelDiff > w * 0.75 && mathDiff > (state.maxX - state.minX) * 0.5) {
+                    bool isPoleJump = (pixelDiff > w * 0.4 && mathDiff > (state.maxX - state.minX) * 0.35 && (mx * lastMathX < 0.0));
+                    if (isPoleJump) {
+                        HPEN dotPen = CreatePen(PS_DOT, 1, RGB(
+                            (GetRValue(curveColor) * 2 + GetRValue(gridColor)) / 3,
+                            (GetGValue(curveColor) * 2 + GetGValue(gridColor)) / 3,
+                            (GetBValue(curveColor) * 2 + GetBValue(gridColor)) / 3
+                        ));
+                        HPEN prevPen = (HPEN)SelectObject(mem, dotPen);
+                        MoveToEx(mem, 0, py, nullptr);
+                        LineTo(mem, w, py);
+                        SelectObject(mem, prevPen);
+                        DeleteObject(dotPen);
+
                         MoveToEx(mem, px, py, nullptr);
                     } else {
                         LineTo(mem, px, py);
