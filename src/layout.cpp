@@ -2,6 +2,7 @@
 #include "layout.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <unordered_map>
 
@@ -213,20 +214,32 @@ Size measureOperator(HDC hdc, const Item* it, int depth) {
     return s;
 }
 
+static std::unordered_map<int, HFONT> g_parenFontCache;
+static std::unordered_map<uint32_t, int> g_parenWidthCache;
+
 HFONT createParenFont(int depth, int innerHeight) {
     int height = std::max(fontPxForDepth(depth), innerHeight + scaledPx(6, depth));
-    return CreateFontW(-height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                       DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
-                       CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    auto it = g_parenFontCache.find(height);
+    if (it != g_parenFontCache.end()) return it->second;
+    HFONT f = CreateFontW(-height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                          DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                          CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    g_parenFontCache[height] = f;
+    return f;
 }
 
 int measureParenWidth(HDC hdc, int depth, int innerHeight) {
+    int height = std::max(fontPxForDepth(depth), innerHeight + scaledPx(6, depth));
+    uint32_t key = ((uint32_t)depth << 20) ^ (uint32_t)height;
+    auto it = g_parenWidthCache.find(key);
+    if (it != g_parenWidthCache.end()) return it->second;
+
     HFONT font = createParenFont(depth, innerHeight);
     HFONT old = (HFONT)SelectObject(hdc, font);
     SIZE size{};
     GetTextExtentPoint32W(hdc, L"(", 1, &size);
     SelectObject(hdc, old);
-    DeleteObject(font);
+    g_parenWidthCache[key] = size.cx;
     return size.cx;
 }
 
@@ -243,6 +256,9 @@ Size measureEquals(HDC hdc, int depth) {
 
 Size measureRowImpl(HDC hdc, const Row* row, int depth) {
     if (rowIsEmpty(row)) return placeholderSize(depth);
+    if (!row->layoutDirty && row->cachedDepth == depth) {
+        return { row->cachedWidth, row->cachedAscent, row->cachedDescent };
+    }
     Size total;
     for (auto& it : row->items) {
         Size s = measureItemImpl(hdc, it.get(), depth);
@@ -250,6 +266,11 @@ Size measureRowImpl(HDC hdc, const Row* row, int depth) {
         total.ascent = std::max(total.ascent, s.ascent);
         total.descent = std::max(total.descent, s.descent);
     }
+    row->cachedWidth = total.width;
+    row->cachedAscent = total.ascent;
+    row->cachedDescent = total.descent;
+    row->cachedDepth = depth;
+    row->layoutDirty = false;
     return total;
 }
 
@@ -376,7 +397,6 @@ Size measureItemImpl(HDC hdc, const Item* it, int depth) {
             TEXTMETRICW tm{};
             GetTextMetricsW(hdc, &tm);
             SelectObject(hdc, oldFont);
-            DeleteObject(symFont);
             
             int symW = symSz.cx;
             int centerW = std::max(symW, limitsW);
@@ -576,7 +596,6 @@ void drawItemImpl(HDC hdc, const Item* it, int depth, int x, int baselineY,
             drawRowImpl(hdc, it->a.get(), depth, px + glyphW, baselineY, theme, cursor, outCaret);
             TextOutW(hdc, px + glyphW + inner.width, baselineY - metrics.tmAscent, L")", 1);
             SelectObject(hdc, oldFont);
-            DeleteObject(parenFont);
             return;
         }
         case ItemType::Fraction: {
@@ -627,7 +646,6 @@ void drawItemImpl(HDC hdc, const Item* it, int depth, int x, int baselineY,
             drawRowImpl(hdc, it->a.get(), depth, x + glyphW, baselineY, theme, cursor, outCaret);
             TextOutW(hdc, x + glyphW + inner.width, baselineY - metrics.tmAscent, closeG, 1);
             SelectObject(hdc, oldFont);
-            DeleteObject(parenFont);
             return;
         }
         case ItemType::Summation:
@@ -656,7 +674,6 @@ void drawItemImpl(HDC hdc, const Item* it, int depth, int x, int baselineY,
             SetTextColor(hdc, theme.operatorColor);
             TextOutW(hdc, symX, symTop, symStr.c_str(), 1);
             SelectObject(hdc, oldFont);
-            DeleteObject(symFont);
             
             int upperX = x + (centerW - upper.width) / 2;
             int upperY = symTop - gap;
@@ -757,7 +774,6 @@ void drawItemImpl(HDC hdc, const Item* it, int depth, int x, int baselineY,
             drawRowImpl(hdc, it->a.get(), depth, px + glyphW, baselineY, theme, cursor, outCaret);
             TextOutW(hdc, px + glyphW + inner.width, baselineY - metrics.tmAscent, L")", 1);
             SelectObject(hdc, oldFont);
-            DeleteObject(parenFont);
 
             int barX = px + 2 * glyphW + inner.width + scaledPx(2, depth);
             std::wstring atStr = L"|_";
@@ -931,7 +947,6 @@ void findItemHit(HDC hdc, Row* parent, int index, Item* item, int depth,
             TEXTMETRICW tm{};
             GetTextMetricsW(hdc, &tm);
             SelectObject(hdc, oldFont);
-            DeleteObject(symFont);
             
             int symW = symSz.cx;
             int centerW = std::max(symW, limitsW);
@@ -1058,6 +1073,7 @@ bool placeCursorAtPoint(Expression& expression, HDC hdc, int originX,
         hit.row->items[hit.index] = std::move(leftItem);
         hit.row->items.insert(hit.row->items.begin() + hit.index + 1,
                               std::move(rightItem));
+        hit.row->invalidateLayout();
         expression.cursor.row = hit.row;
         expression.cursor.index = hit.index + 1;
     } else {
@@ -1072,5 +1088,8 @@ int fontHeightForDepth(int depth) { return fontPxForDepth(depth); }
 void shutdownFonts() {
     for (auto& kv : g_fontCache) DeleteObject(kv.second);
     g_fontCache.clear();
+    for (auto& kv : g_parenFontCache) DeleteObject(kv.second);
+    g_parenFontCache.clear();
+    g_parenWidthCache.clear();
     g_tmCache.clear();
 }

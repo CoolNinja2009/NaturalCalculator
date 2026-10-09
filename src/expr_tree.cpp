@@ -239,6 +239,7 @@ static void collapseStructuralItem(Expression& expr, Row* parent, int ownerIndex
         if (itemPtr->d) itemPtr->d->ownerParentRow = parent;
         parent->items.insert(parent->items.begin() + ownerIndex + i, std::move(spliced[i]));
     }
+    parent->invalidateLayout();
     expr.cursor.row = parent;
     expr.cursor.index = cursorAfterSpliced ? (ownerIndex + count) : ownerIndex;
 }
@@ -452,6 +453,7 @@ void deleteRange(Expression& expression, Cursor first, Cursor last) {
     if (begin >= end) return;
     first.row->items.erase(first.row->items.begin() + begin,
                            first.row->items.begin() + end);
+    first.row->invalidateLayout();
     expression.cursor.row = first.row;
     expression.cursor.index = begin;
 }
@@ -461,6 +463,11 @@ std::unique_ptr<Row> cloneRow(const Row* source, Item* owner, Row* parent) {
     copy->owner = owner;
     copy->ownerParentRow = parent;
     if (!source) return copy;
+    copy->cachedWidth = source->cachedWidth;
+    copy->cachedAscent = source->cachedAscent;
+    copy->cachedDescent = source->cachedDescent;
+    copy->cachedDepth = source->cachedDepth;
+    copy->layoutDirty = source->layoutDirty;
     for (const auto& sourceItem : source->items) {
         auto item = std::make_unique<Item>(sourceItem->type);
         item->numText = sourceItem->numText;
@@ -500,12 +507,14 @@ void insertDigit(Expression& expr, char digit) {
         if (digit == '.' && prev->numText.find('.') != std::string::npos)
             return; // only one decimal point per number
         prev->numText += digit;
+        row->invalidateLayout();
         return;
     }
 
     auto item = std::make_unique<Item>(ItemType::Number);
     item->numText = std::string(1, digit);
     row->items.insert(row->items.begin() + idx, std::move(item));
+    row->invalidateLayout();
     expr.cursor.index = idx + 1;
 }
 
@@ -516,6 +525,7 @@ void insertVariable(Expression& expr, char name) {
     auto item = std::make_unique<Item>(ItemType::Variable);
     item->variableName = name;
     row->items.insert(row->items.begin() + idx, std::move(item));
+    row->invalidateLayout();
     expr.cursor.index = idx + 1;
 }
 
@@ -539,6 +549,7 @@ void insertOperator(Expression& expr, char op) {
     auto item = std::make_unique<Item>(ItemType::Operator);
     item->opChar = op;
     row->items.insert(row->items.begin() + idx, std::move(item));
+    row->invalidateLayout();
     expr.cursor.index = idx + 1;
 }
 
@@ -552,6 +563,7 @@ void insertEquals(Expression& expr) {
     int idx = expr.cursor.index;
     auto item = std::make_unique<Item>(ItemType::Equals);
     row->items.insert(row->items.begin() + idx, std::move(item));
+    row->invalidateLayout();
     expr.cursor.index = idx + 1;
 }
 
@@ -608,6 +620,7 @@ void insertFraction(Expression& expr) {
     }
 
     row->items.insert(row->items.begin() + insertPos, std::move(fracItem));
+    row->invalidateLayout();
 
     // cursor -> start of denominator
     expr.cursor.row = fracPtr->b.get();
@@ -637,6 +650,7 @@ void insertPower(Expression& expr) {
     }
 
     row->items.insert(row->items.begin() + insertPos, std::move(powItem));
+    row->invalidateLayout();
 
     // cursor -> start of exponent
     expr.cursor.row = powPtr->b.get();
@@ -668,6 +682,7 @@ void insertPermutation(Expression& expr) {
     }
 
     row->items.insert(row->items.begin() + insertPos, std::move(pItem));
+    row->invalidateLayout();
 
     // cursor -> start of subscript r
     expr.cursor.row = pPtr->b.get();
@@ -699,6 +714,7 @@ void insertCombination(Expression& expr) {
     }
 
     row->items.insert(row->items.begin() + insertPos, std::move(cItem));
+    row->invalidateLayout();
 
     // cursor -> start of subscript r
     expr.cursor.row = cPtr->b.get();
@@ -714,6 +730,7 @@ void insertSqrt(Expression& expr) {
     attachRow(sqItem->a, sqPtr, row);
 
     row->items.insert(row->items.begin() + idx, std::move(sqItem));
+    row->invalidateLayout();
     expr.cursor.row = sqPtr->a.get();
     expr.cursor.index = 0;
 }
@@ -727,6 +744,7 @@ void insertOpenParen(Expression& expr) {
     attachRow(pItem->a, pPtr, row);
 
     row->items.insert(row->items.begin() + idx, std::move(pItem));
+    row->invalidateLayout();
     expr.cursor.row = pPtr->a.get();
     expr.cursor.index = 0;
 }
@@ -741,6 +759,7 @@ void insertOpenBracket(Expression& expr) {
     attachRow(pItem->a, pPtr, row);
 
     row->items.insert(row->items.begin() + idx, std::move(pItem));
+    row->invalidateLayout();
     expr.cursor.row = pPtr->a.get();
     expr.cursor.index = 0;
 }
@@ -755,6 +774,7 @@ void insertOpenBrace(Expression& expr) {
     attachRow(pItem->a, pPtr, row);
 
     row->items.insert(row->items.begin() + idx, std::move(pItem));
+    row->invalidateLayout();
     expr.cursor.row = pPtr->a.get();
     expr.cursor.index = 0;
 }
@@ -771,6 +791,7 @@ void insertIntegral(Expression& expr) {
     attachRow(item->c, ptr, row); // upper limit
 
     row->items.insert(row->items.begin() + idx, std::move(item));
+    row->invalidateLayout();
     expr.cursor.row = ptr->a.get();
     expr.cursor.index = 0;
 }
@@ -786,6 +807,7 @@ void insertDerivative(Expression& expr) {
     attachRow(item->b, ptr, row); // eval point (optional)
 
     row->items.insert(row->items.begin() + idx, std::move(item));
+    row->invalidateLayout();
     expr.cursor.row = ptr->a.get();
     expr.cursor.index = 0;
 }
@@ -801,6 +823,7 @@ void insertSummation(Expression& expr) {
     attachRow(item->c, ptr, row); // upper limit
 
     row->items.insert(row->items.begin() + idx, std::move(item));
+    row->invalidateLayout();
     expr.cursor.row = ptr->b.get();
     expr.cursor.index = 0;
 }
@@ -816,6 +839,7 @@ void insertProduct(Expression& expr) {
     attachRow(item->c, ptr, row); // upper limit
 
     row->items.insert(row->items.begin() + idx, std::move(item));
+    row->invalidateLayout();
     expr.cursor.row = ptr->b.get();
     expr.cursor.index = 0;
 }
@@ -842,6 +866,7 @@ void insertCloseParen(Expression& expr) {
     }
     auto close = std::make_unique<Item>(ItemType::CloseParen);
     insertionRow->items.insert(insertionRow->items.begin() + insertionIndex, std::move(close));
+    insertionRow->invalidateLayout();
     expr.cursor.row = insertionRow;
     expr.cursor.index = insertionIndex + 1;
 }
@@ -1057,6 +1082,7 @@ void backspace(Expression& expr) {
                 // Nothing anywhere in the structure: it was just opened
                 // (or is otherwise fully empty) -- safe to remove outright.
                 parent->items.erase(parent->items.begin() + ownerIndex);
+                parent->invalidateLayout();
                 expr.cursor.row = parent;
                 expr.cursor.index = ownerIndex;
             } else {
@@ -1085,6 +1111,7 @@ void backspace(Expression& expr) {
             row->items.erase(row->items.begin() + (idx - 1));
             expr.cursor.index = idx - 1;
         }
+        row->invalidateLayout();
         return;
     }
     if (target->type == ItemType::Name) {
@@ -1095,16 +1122,19 @@ void backspace(Expression& expr) {
             row->items.erase(row->items.begin() + (idx - 1));
             expr.cursor.index = idx - 1;
         }
+        row->invalidateLayout();
         return;
     }
     if (target->type == ItemType::Variable) {
         row->items.erase(row->items.begin() + (idx - 1));
+        row->invalidateLayout();
         expr.cursor.index = idx - 1;
         return;
     }
     if (target->type == ItemType::Operator || target->type == ItemType::CloseParen ||
         target->type == ItemType::Equals) {
         row->items.erase(row->items.begin() + (idx - 1));
+        row->invalidateLayout();
         expr.cursor.index = idx - 1;
         return;
     }
@@ -1116,6 +1146,7 @@ void backspace(Expression& expr) {
                       : true;
     if (aEmpty && bEmpty) {
         row->items.erase(row->items.begin() + (idx - 1));
+        row->invalidateLayout();
         expr.cursor.index = idx - 1;
         return;
     }
@@ -1170,6 +1201,7 @@ void doDelete(Expression& expr) {
         // its end.
         if (rowIsEmpty(row)) {
             parent->items.erase(parent->items.begin() + ownerIndex);
+            parent->invalidateLayout();
             expr.cursor.row = parent;
             expr.cursor.index = ownerIndex;
         } else {
@@ -1187,6 +1219,7 @@ void doDelete(Expression& expr) {
         } else {
             row->items.erase(row->items.begin() + idx);
         }
+        row->invalidateLayout();
         return;
     }
     if (target->type == ItemType::Name) {
@@ -1195,15 +1228,18 @@ void doDelete(Expression& expr) {
         } else {
             row->items.erase(row->items.begin() + idx);
         }
+        row->invalidateLayout();
         return;
     }
     if (target->type == ItemType::Variable) {
         row->items.erase(row->items.begin() + idx);
+        row->invalidateLayout();
         return;
     }
     if (target->type == ItemType::Operator || target->type == ItemType::CloseParen ||
         target->type == ItemType::Equals) {
         row->items.erase(row->items.begin() + idx);
+        row->invalidateLayout();
         return;
     }
 
@@ -1213,6 +1249,7 @@ void doDelete(Expression& expr) {
                       : true;
     if (aEmpty && bEmpty) {
         row->items.erase(row->items.begin() + idx);
+        row->invalidateLayout();
         return;
     }
 
@@ -1235,6 +1272,7 @@ void insertFunction(Expression& expr, int functionId) {
     attachRow(item->a, ptr, row);
 
     row->items.insert(row->items.begin() + idx, std::move(item));
+    row->invalidateLayout();
     expr.cursor.row = ptr->a.get();
     expr.cursor.index = 0;
 }
@@ -1246,6 +1284,7 @@ void insertConstant(Expression& expr, char which) {
     auto item = std::make_unique<Item>(ItemType::Constant);
     item->constantName = which;
     row->items.insert(row->items.begin() + idx, std::move(item));
+    row->invalidateLayout();
     expr.cursor.index = idx + 1;
 }
 
@@ -1257,11 +1296,13 @@ void insertNameLetter(Expression& expr, char letter) {
 
     if (idx > 0 && row->items[idx - 1]->type == ItemType::Name) {
         row->items[idx - 1]->nameText += letter;
+        row->invalidateLayout();
         return; // cursor stays right after the word
     }
     auto item = std::make_unique<Item>(ItemType::Name);
     item->nameText = std::string(1, letter);
     row->items.insert(row->items.begin() + idx, std::move(item));
+    row->invalidateLayout();
     expr.cursor.index = idx + 1;
 }
 
@@ -1383,6 +1424,7 @@ static bool normalizeRowNames(Expression& expr, Row* row) {
             }
         }
     }
+    if (changed) row->invalidateLayout();
     return changed;
 }
 
@@ -1400,6 +1442,7 @@ void normalizeNames(Expression& expr) {
         normalizeRowNames(expr, row);
     };
     walk(expr.root.get());
+    if (expr.root) expr.root->invalidateLayout();
     if (expr.cursor.row)
         expr.cursor.index = std::clamp(expr.cursor.index, 0, (int)expr.cursor.row->items.size());
 }

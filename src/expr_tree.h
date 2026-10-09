@@ -137,6 +137,18 @@ struct Row {
     // a structure and to find sibling rows for vertical (up/down) motion.
     Item* owner = nullptr;
     Row*  ownerParentRow = nullptr; // the row that `owner` itself lives in
+
+    // Hierarchical layout cache: avoids redundant GDI text metrics and recursion
+    mutable int cachedWidth = 0;
+    mutable int cachedAscent = 0;
+    mutable int cachedDescent = 0;
+    mutable int cachedDepth = -1;
+    mutable bool layoutDirty = true;
+
+    void invalidateLayout() {
+        layoutDirty = true;
+        if (ownerParentRow) ownerParentRow->invalidateLayout();
+    }
 };
 
 // A cursor is a (row, index) gap position: it sits *before* items[index]
