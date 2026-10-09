@@ -11,6 +11,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <memory>
@@ -26,6 +27,69 @@ enum class GraphEquationKind {
     ImplicitXY    // F(x, y) = G(x, y) e.g. x^2 + y^2 = 25
 };
 
+enum class ByteOp : uint8_t {
+    PushConst,
+    PushVarX,
+    PushVarY,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Neg,
+    Pow,
+    Sqrt,
+    Cbrt,
+    Sin,
+    Cos,
+    Tan,
+    Asin,
+    Acos,
+    Atan,
+    Sec,
+    Csc,
+    Cot,
+    Asec,
+    Acsc,
+    Acot,
+    Sinh,
+    Cosh,
+    Tanh,
+    Asinh,
+    Acosh,
+    Atanh,
+    Sech,
+    Csch,
+    Coth,
+    Asech,
+    Acsch,
+    Acoth,
+    Exp,
+    Expm1,
+    Ln,
+    Log10,
+    Log2,
+    Log1p,
+    Abs,
+    Floor,
+    Ceil,
+    Round,
+    Trunc,
+    Sgn,
+    Fact
+};
+
+struct BytecodeProgram {
+    std::vector<ByteOp> ops;
+    std::vector<double> consts;
+    bool isValid = false;
+
+    double execute(double x, double y) const;
+};
+
+// Compiles a Row AST into flat bytecode; returns true if fully compiled.
+bool compileRowToBytecode(const Row* row, BytecodeProgram& outProg);
+
 struct GraphAnalysis {
     GraphEquationKind kind = GraphEquationKind::None;
     bool isValid = false;
@@ -35,6 +99,10 @@ struct GraphAnalysis {
     std::unique_ptr<Row> leftRow;
     std::unique_ptr<Row> rightRow;
     EvaluationContext baseContext;
+
+    // Compiled flat bytecode programs for sub-microsecond evaluation
+    BytecodeProgram leftProgram;
+    BytecodeProgram rightProgram;
 
     double evalExplicit(double x) const;
     double evalExplicitX(double y) const;

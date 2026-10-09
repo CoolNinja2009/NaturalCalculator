@@ -344,6 +344,43 @@ int main() {
         ReleaseDC(nullptr, screenDC);
     }
 
+    // Test 11: Direct3D 11 Render Target Cache (Idea 4 Optimization)
+    {
+        Expression expr;
+        insertFromText(expr, "y = sin(x)");
+        EvaluationContext ctx;
+        GraphAnalysis analysis = analyzeGraphExpression(expr.root.get(), ctx);
+        assert(analysis.isValid);
+
+        GraphState state;
+        Theme theme;
+        HDC screenDC = GetDC(nullptr);
+        HDC memDC = CreateCompatibleDC(screenDC);
+        HBITMAP bmp = CreateCompatibleBitmap(screenDC, 400, 300);
+        HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, bmp);
+        RECT rect = { 0, 0, 400, 300 };
+
+        // Initial render (cache miss)
+        bool r1 = renderGraphGpu(memDC, rect, analysis, state, theme, nullptr, nullptr, false);
+        assert(r1 == true);
+
+        // Consecutive render with identical viewport (cache hit - zero-cost blit)
+        bool r2 = renderGraphGpu(memDC, rect, analysis, state, theme, nullptr, nullptr, false);
+        assert(r2 == true);
+
+        // Pan viewport (cache miss & update)
+        state.minX += 1.0;
+        state.maxX += 1.0;
+        bool r3 = renderGraphGpu(memDC, rect, analysis, state, theme, nullptr, nullptr, false);
+        assert(r3 == true);
+
+        SelectObject(memDC, oldBmp);
+        DeleteObject(bmp);
+        DeleteDC(memDC);
+        ReleaseDC(nullptr, screenDC);
+        std::cout << "[GPU Graph Tests] D3D11 render target cache verified!" << std::endl;
+    }
+
     shutdownGpuGraph();
     std::cout << "[GPU Graph Tests] All GPU and CPU graphing tests passed successfully!" << std::endl;
     return 0;

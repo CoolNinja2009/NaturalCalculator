@@ -213,6 +213,10 @@ def main():
     results.append(benchmark_function("Math Evaluation", "Definite Summation (1 to 100)", 2000, lib.bench_evaluate_summation))
     results.append(benchmark_function("Math Evaluation", "Definite Integral (Simpson's)", 2000, lib.bench_evaluate_integral))
 
+    # 4. Graph Engine & Point Probing (Idea 3 Optimization)
+    results.append(benchmark_function("Graph Engine", "Bytecode VM Point Eval", 10000, lib.bench_graph_eval_bytecode))
+    results.append(benchmark_function("Graph Engine", "Traditional AST Tree Eval", 10000, lib.bench_graph_eval_ast))
+
     lib.bench_cleanup()
 
     # Print Table

@@ -534,7 +534,38 @@ bool initGpuGraph() {
     return true;
 }
 
+namespace {
+
+struct GpuGraphCacheKey {
+    std::string title;
+    int w = 0, h = 0;
+    double minX = 0.0, maxX = 0.0, minY = 0.0, maxY = 0.0;
+    COLORREF bg = 0, curve = 0, grid = 0, axis = 0;
+    bool isDark = false;
+    bool degreesMode = false;
+    bool isValid = false;
+
+    bool operator==(const GpuGraphCacheKey& o) const {
+        return w == o.w && h == o.h &&
+               minX == o.minX && maxX == o.maxX &&
+               minY == o.minY && maxY == o.maxY &&
+               bg == o.bg && curve == o.curve && grid == o.grid && axis == o.axis &&
+               isDark == o.isDark && degreesMode == o.degreesMode &&
+               isValid == o.isValid && title == o.title;
+    }
+};
+
+static GpuGraphCacheKey s_lastCacheKey;
+static std::vector<uint32_t> s_cachedPixels;
+static bool s_hasCachedPixels = false;
+
+} // namespace
+
 void shutdownGpuGraph() {
+    s_cachedPixels.clear();
+    s_hasCachedPixels = false;
+    s_lastCacheKey = {};
+
     for (auto& pair : s_gpu.shaderCache) {
         if (pair.second) pair.second->Release();
     }
@@ -580,65 +611,28 @@ bool renderGraphGpu(HDC hdc, const RECT& graphRect, const GraphAnalysis& analysi
         activePS = s_gpu.psDefault;
     }
 
-    if (!resizeTargets(w, h)) return false;
-
     // Grid steps
     double rangeX = state.maxX - state.minX;
     double rangeY = state.maxY - state.minY;
     double xStep = chooseStep(rangeX, 8);
     double yStep = chooseStep(rangeY, 8);
 
-    // Set constant buffer
-    D3D11_MAPPED_SUBRESOURCE mapped;
-    HRESULT hr = s_gpu.context->Map(s_gpu.constantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-    if (FAILED(hr)) return false;
-
-    ShaderConstantParams* params = (ShaderConstantParams*)mapped.pData;
-    params->bounds[0] = (float)state.minX;
-    params->bounds[1] = (float)state.maxX;
-    params->bounds[2] = (float)state.minY;
-    params->bounds[3] = (float)state.maxY;
-
-    params->screen[0] = (float)w;
-    params->screen[1] = (float)h;
-    params->screen[2] = theme.isDark ? 1.0f : 0.0f;
-    params->screen[3] = degreesMode ? 1.0f : 0.0f;
-
     GraphPalette pal = getGraphPalette(theme);
-    colorrefToFloat4(pal.curve, 1.0f, params->curveCol);
-    colorrefToFloat4(pal.grid, 0.65f, params->gridCol);
-    colorrefToFloat4(pal.axis, 0.95f, params->axisCol);
-    colorrefToFloat4(pal.bg, 1.0f, params->bgCol);
-
-    params->steps[0] = (float)xStep;
-    params->steps[1] = (float)yStep;
-    params->steps[2] = 0.0f;
-    params->steps[3] = 0.0f;
-
-    s_gpu.context->Unmap(s_gpu.constantBuffer, 0);
-
-    // Viewport & Render Target
-    D3D11_VIEWPORT vp = {};
-    vp.Width = (float)w;
-    vp.Height = (float)h;
-    vp.MinDepth = 0.0f;
-    vp.MaxDepth = 1.0f;
-
-    s_gpu.context->RSSetViewports(1, &vp);
-    s_gpu.context->OMSetRenderTargets(1, &s_gpu.rtView, nullptr);
-    s_gpu.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-    s_gpu.context->VSSetShader(s_gpu.vsQuad, nullptr, 0);
-    s_gpu.context->PSSetShader(activePS, nullptr, 0);
-    s_gpu.context->PSSetConstantBuffers(0, 1, &s_gpu.constantBuffer);
-
-    // Draw fullscreen GPU quad
-    s_gpu.context->Draw(4, 0);
-
-    // Copy to staging texture and read back into GDI DC
-    s_gpu.context->CopyResource(s_gpu.stagingTexture, s_gpu.rtTexture);
-
-    hr = s_gpu.context->Map(s_gpu.stagingTexture, 0, D3D11_MAP_READ, 0, &mapped);
-    if (FAILED(hr)) return false;
+    GpuGraphCacheKey currentKey;
+    currentKey.title = analysis.isValid ? analysis.title : "";
+    currentKey.w = w;
+    currentKey.h = h;
+    currentKey.minX = state.minX;
+    currentKey.maxX = state.maxX;
+    currentKey.minY = state.minY;
+    currentKey.maxY = state.maxY;
+    currentKey.bg = pal.bg;
+    currentKey.curve = pal.curve;
+    currentKey.grid = pal.grid;
+    currentKey.axis = pal.axis;
+    currentKey.isDark = theme.isDark;
+    currentKey.degreesMode = degreesMode;
+    currentKey.isValid = analysis.isValid;
 
     BITMAPINFO bmi = {};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -648,40 +642,101 @@ bool renderGraphGpu(HDC hdc, const RECT& graphRect, const GraphAnalysis& analysi
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
 
-    if (mapped.RowPitch == (UINT)(w * 4)) {
+    bool cacheHit = s_hasCachedPixels && (currentKey == s_lastCacheKey) &&
+                    (s_cachedPixels.size() >= (size_t)(w * h));
+    if (cacheHit) {
         SetDIBitsToDevice(
             hdc,
             graphRect.left, graphRect.top,
             w, h,
             0, 0,
             0, h,
-            mapped.pData,
+            s_cachedPixels.data(),
             &bmi,
             DIB_RGB_COLORS
         );
     } else {
-        static std::vector<uint32_t> s_pixelBuffer;
-        if (s_pixelBuffer.size() < (size_t)(w * h)) {
-            s_pixelBuffer.resize(w * h);
+        if (!resizeTargets(w, h)) return false;
+
+        // Set constant buffer
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        HRESULT hr = s_gpu.context->Map(s_gpu.constantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+        if (FAILED(hr)) return false;
+
+        ShaderConstantParams* params = (ShaderConstantParams*)mapped.pData;
+        params->bounds[0] = (float)state.minX;
+        params->bounds[1] = (float)state.maxX;
+        params->bounds[2] = (float)state.minY;
+        params->bounds[3] = (float)state.maxY;
+
+        params->screen[0] = (float)w;
+        params->screen[1] = (float)h;
+        params->screen[2] = theme.isDark ? 1.0f : 0.0f;
+        params->screen[3] = degreesMode ? 1.0f : 0.0f;
+
+        colorrefToFloat4(pal.curve, 1.0f, params->curveCol);
+        colorrefToFloat4(pal.grid, 0.65f, params->gridCol);
+        colorrefToFloat4(pal.axis, 0.95f, params->axisCol);
+        colorrefToFloat4(pal.bg, 1.0f, params->bgCol);
+
+        params->steps[0] = (float)xStep;
+        params->steps[1] = (float)yStep;
+        params->steps[2] = 0.0f;
+        params->steps[3] = 0.0f;
+
+        s_gpu.context->Unmap(s_gpu.constantBuffer, 0);
+
+        // Viewport & Render Target
+        D3D11_VIEWPORT vp = {};
+        vp.Width = (float)w;
+        vp.Height = (float)h;
+        vp.MinDepth = 0.0f;
+        vp.MaxDepth = 1.0f;
+
+        s_gpu.context->RSSetViewports(1, &vp);
+        s_gpu.context->OMSetRenderTargets(1, &s_gpu.rtView, nullptr);
+        s_gpu.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        s_gpu.context->VSSetShader(s_gpu.vsQuad, nullptr, 0);
+        s_gpu.context->PSSetShader(activePS, nullptr, 0);
+        s_gpu.context->PSSetConstantBuffers(0, 1, &s_gpu.constantBuffer);
+
+        // Draw fullscreen GPU quad
+        s_gpu.context->Draw(4, 0);
+
+        // Copy to staging texture and read back into GDI DC
+        s_gpu.context->CopyResource(s_gpu.stagingTexture, s_gpu.rtTexture);
+
+        hr = s_gpu.context->Map(s_gpu.stagingTexture, 0, D3D11_MAP_READ, 0, &mapped);
+        if (FAILED(hr)) return false;
+
+        if (s_cachedPixels.size() < (size_t)(w * h)) {
+            s_cachedPixels.resize(w * h);
         }
         const uint8_t* src = (const uint8_t*)mapped.pData;
-        uint8_t* dst = (uint8_t*)s_pixelBuffer.data();
-        for (int y = 0; y < h; ++y) {
-            memcpy(dst + y * w * 4, src + y * mapped.RowPitch, w * 4);
+        uint8_t* dst = (uint8_t*)s_cachedPixels.data();
+        if (mapped.RowPitch == (UINT)(w * 4)) {
+            memcpy(dst, src, (size_t)(w * h * 4));
+        } else {
+            for (int y = 0; y < h; ++y) {
+                memcpy(dst + y * w * 4, src + y * mapped.RowPitch, w * 4);
+            }
         }
+        s_gpu.context->Unmap(s_gpu.stagingTexture, 0);
+
         SetDIBitsToDevice(
             hdc,
             graphRect.left, graphRect.top,
             w, h,
             0, 0,
             0, h,
-            dst,
+            s_cachedPixels.data(),
             &bmi,
             DIB_RGB_COLORS
         );
-    }
 
-    s_gpu.context->Unmap(s_gpu.stagingTexture, 0);
+        s_lastCacheKey = currentKey;
+        s_hasCachedPixels = true;
+    }
 
     // -------------------------------------------------------------
     // GDI Chrome Overlay: Coordinate Numbers, Title, GPU Badge, Zoom Controls

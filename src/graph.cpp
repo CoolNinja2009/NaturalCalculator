@@ -109,8 +109,508 @@ GraphPalette getGraphPalette(const Theme& theme) {
     return p;
 }
 
+static bool mapSciFunctionToByteOp(int fnId, ByteOp& outOp) {
+    switch (fnId) {
+        case SciSin: outOp = ByteOp::Sin; return true;
+        case SciCos: outOp = ByteOp::Cos; return true;
+        case SciTan: outOp = ByteOp::Tan; return true;
+        case SciAsin: outOp = ByteOp::Asin; return true;
+        case SciAcos: outOp = ByteOp::Acos; return true;
+        case SciAtan: outOp = ByteOp::Atan; return true;
+        case SciSec: outOp = ByteOp::Sec; return true;
+        case SciCsc: outOp = ByteOp::Csc; return true;
+        case SciCot: outOp = ByteOp::Cot; return true;
+        case SciAsec: outOp = ByteOp::Asec; return true;
+        case SciAcsc: outOp = ByteOp::Acsc; return true;
+        case SciAcot: outOp = ByteOp::Acot; return true;
+        case SciSinh: outOp = ByteOp::Sinh; return true;
+        case SciCosh: outOp = ByteOp::Cosh; return true;
+        case SciTanh: outOp = ByteOp::Tanh; return true;
+        case SciAsinh: outOp = ByteOp::Asinh; return true;
+        case SciAcosh: outOp = ByteOp::Acosh; return true;
+        case SciAtanh: outOp = ByteOp::Atanh; return true;
+        case SciSech: outOp = ByteOp::Sech; return true;
+        case SciCsch: outOp = ByteOp::Csch; return true;
+        case SciCoth: outOp = ByteOp::Coth; return true;
+        case SciAsech: outOp = ByteOp::Asech; return true;
+        case SciAcsch: outOp = ByteOp::Acsch; return true;
+        case SciAcoth: outOp = ByteOp::Acoth; return true;
+        case SciExp: outOp = ByteOp::Exp; return true;
+        case SciExpm1: outOp = ByteOp::Expm1; return true;
+        case SciLn: outOp = ByteOp::Ln; return true;
+        case SciLog: outOp = ByteOp::Log10; return true;
+        case SciLog2: outOp = ByteOp::Log2; return true;
+        case SciLog1p: outOp = ByteOp::Log1p; return true;
+        case SciCbrt: outOp = ByteOp::Cbrt; return true;
+        case SciAbs: outOp = ByteOp::Abs; return true;
+        case SciFloor: outOp = ByteOp::Floor; return true;
+        case SciCeil: outOp = ByteOp::Ceil; return true;
+        case SciRound: outOp = ByteOp::Round; return true;
+        case SciTrunc: outOp = ByteOp::Trunc; return true;
+        case SciSgn: outOp = ByteOp::Sgn; return true;
+        case SciFact: outOp = ByteOp::Fact; return true;
+        default: return false;
+    }
+}
+
+double BytecodeProgram::execute(double x, double y) const {
+    if (!isValid || ops.empty()) return NAN;
+    double stack[64];
+    int sp = 0;
+    size_t constIdx = 0;
+    for (ByteOp op : ops) {
+        switch (op) {
+            case ByteOp::PushConst:
+                if (sp < 64 && constIdx < consts.size()) stack[sp++] = consts[constIdx++];
+                else return NAN;
+                break;
+            case ByteOp::PushVarX:
+                if (sp < 64) stack[sp++] = x;
+                else return NAN;
+                break;
+            case ByteOp::PushVarY:
+                if (sp < 64) stack[sp++] = y;
+                else return NAN;
+                break;
+            case ByteOp::Add:
+                if (sp >= 2) { double b = stack[--sp]; stack[sp - 1] += b; }
+                else return NAN;
+                break;
+            case ByteOp::Sub:
+                if (sp >= 2) { double b = stack[--sp]; stack[sp - 1] -= b; }
+                else return NAN;
+                break;
+            case ByteOp::Mul:
+                if (sp >= 2) { double b = stack[--sp]; stack[sp - 1] *= b; }
+                else return NAN;
+                break;
+            case ByteOp::Div:
+                if (sp >= 2) {
+                    double b = stack[--sp];
+                    stack[sp - 1] = (b == 0.0) ? NAN : (stack[sp - 1] / b);
+                } else return NAN;
+                break;
+            case ByteOp::Mod:
+                if (sp >= 2) {
+                    double b = stack[--sp];
+                    stack[sp - 1] = (b == 0.0) ? NAN : std::fmod(stack[sp - 1], b);
+                } else return NAN;
+                break;
+            case ByteOp::Neg:
+                if (sp >= 1) stack[sp - 1] = -stack[sp - 1];
+                else return NAN;
+                break;
+            case ByteOp::Pow:
+                if (sp >= 2) {
+                    double b = stack[--sp];
+                    double a = stack[sp - 1];
+                    if (a == 0.0) {
+                        stack[sp - 1] = (b == 0.0) ? 1.0 : ((b < 0.0) ? NAN : 0.0);
+                    } else if (a < 0.0 && std::floor(b) != b) {
+                        stack[sp - 1] = NAN;
+                    } else {
+                        stack[sp - 1] = std::pow(a, b);
+                    }
+                } else return NAN;
+                break;
+            case ByteOp::Sqrt:
+                if (sp >= 1) {
+                    double a = stack[sp - 1];
+                    stack[sp - 1] = (a < 0.0) ? NAN : std::sqrt(a);
+                } else return NAN;
+                break;
+            case ByteOp::Cbrt:
+                if (sp >= 1) stack[sp - 1] = std::cbrt(stack[sp - 1]);
+                else return NAN;
+                break;
+            case ByteOp::Sin:
+                if (sp >= 1) stack[sp - 1] = std::sin(stack[sp - 1]);
+                else return NAN;
+                break;
+            case ByteOp::Cos:
+                if (sp >= 1) stack[sp - 1] = std::cos(stack[sp - 1]);
+                else return NAN;
+                break;
+            case ByteOp::Tan:
+                if (sp >= 1) stack[sp - 1] = std::tan(stack[sp - 1]);
+                else return NAN;
+                break;
+            case ByteOp::Asin:
+                if (sp >= 1) {
+                    double a = stack[sp - 1];
+                    stack[sp - 1] = (a < -1.0 || a > 1.0) ? NAN : std::asin(a);
+                } else return NAN;
+                break;
+            case ByteOp::Acos:
+                if (sp >= 1) {
+                    double a = stack[sp - 1];
+                    stack[sp - 1] = (a < -1.0 || a > 1.0) ? NAN : std::acos(a);
+                } else return NAN;
+                break;
+            case ByteOp::Atan:
+                if (sp >= 1) stack[sp - 1] = std::atan(stack[sp - 1]);
+                else return NAN;
+                break;
+            case ByteOp::Sec:
+                if (sp >= 1) {
+                    double c = std::cos(stack[sp - 1]);
+                    stack[sp - 1] = (c == 0.0) ? NAN : (1.0 / c);
+                } else return NAN;
+                break;
+            case ByteOp::Csc:
+                if (sp >= 1) {
+                    double s = std::sin(stack[sp - 1]);
+                    stack[sp - 1] = (s == 0.0) ? NAN : (1.0 / s);
+                } else return NAN;
+                break;
+            case ByteOp::Cot:
+                if (sp >= 1) {
+                    double t = std::tan(stack[sp - 1]);
+                    stack[sp - 1] = (t == 0.0) ? NAN : (1.0 / t);
+                } else return NAN;
+                break;
+            case ByteOp::Asec:
+                if (sp >= 1) {
+                    double a = stack[sp - 1];
+                    stack[sp - 1] = (std::fabs(a) < 1.0) ? NAN : std::acos(1.0 / a);
+                } else return NAN;
+                break;
+            case ByteOp::Acsc:
+                if (sp >= 1) {
+                    double a = stack[sp - 1];
+                    stack[sp - 1] = (std::fabs(a) < 1.0) ? NAN : std::asin(1.0 / a);
+                } else return NAN;
+                break;
+            case ByteOp::Acot:
+                if (sp >= 1) {
+                    double a = stack[sp - 1];
+                    constexpr double kPi = 3.14159265358979323846;
+                    stack[sp - 1] = (a == 0.0) ? (kPi * 0.5) : std::atan(1.0 / a);
+                } else return NAN;
+                break;
+            case ByteOp::Sinh:
+                if (sp >= 1) stack[sp - 1] = std::sinh(stack[sp - 1]);
+                else return NAN;
+                break;
+            case ByteOp::Cosh:
+                if (sp >= 1) stack[sp - 1] = std::cosh(stack[sp - 1]);
+                else return NAN;
+                break;
+            case ByteOp::Tanh:
+                if (sp >= 1) stack[sp - 1] = std::tanh(stack[sp - 1]);
+                else return NAN;
+                break;
+            case ByteOp::Asinh:
+                if (sp >= 1) stack[sp - 1] = std::asinh(stack[sp - 1]);
+                else return NAN;
+                break;
+            case ByteOp::Acosh:
+                if (sp >= 1) {
+                    double a = stack[sp - 1];
+                    stack[sp - 1] = (a < 1.0) ? NAN : std::acosh(a);
+                } else return NAN;
+                break;
+            case ByteOp::Atanh:
+                if (sp >= 1) {
+                    double a = stack[sp - 1];
+                    stack[sp - 1] = (std::fabs(a) >= 1.0) ? NAN : std::atanh(a);
+                } else return NAN;
+                break;
+            case ByteOp::Sech:
+                if (sp >= 1) stack[sp - 1] = 1.0 / std::cosh(stack[sp - 1]);
+                else return NAN;
+                break;
+            case ByteOp::Csch:
+                if (sp >= 1) {
+                    double s = std::sinh(stack[sp - 1]);
+                    stack[sp - 1] = (s == 0.0) ? NAN : (1.0 / s);
+                } else return NAN;
+                break;
+            case ByteOp::Coth:
+                if (sp >= 1) {
+                    double t = std::tanh(stack[sp - 1]);
+                    stack[sp - 1] = (t == 0.0) ? NAN : (1.0 / t);
+                } else return NAN;
+                break;
+            case ByteOp::Asech:
+                if (sp >= 1) {
+                    double a = stack[sp - 1];
+                    stack[sp - 1] = (a <= 0.0 || a > 1.0) ? NAN : std::acosh(1.0 / a);
+                } else return NAN;
+                break;
+            case ByteOp::Acsch:
+                if (sp >= 1) {
+                    double a = stack[sp - 1];
+                    stack[sp - 1] = (a == 0.0) ? NAN : std::asinh(1.0 / a);
+                } else return NAN;
+                break;
+            case ByteOp::Acoth:
+                if (sp >= 1) {
+                    double a = stack[sp - 1];
+                    stack[sp - 1] = (std::fabs(a) <= 1.0) ? NAN : std::atanh(1.0 / a);
+                } else return NAN;
+                break;
+            case ByteOp::Exp:
+                if (sp >= 1) stack[sp - 1] = std::exp(stack[sp - 1]);
+                else return NAN;
+                break;
+            case ByteOp::Expm1:
+                if (sp >= 1) stack[sp - 1] = std::expm1(stack[sp - 1]);
+                else return NAN;
+                break;
+            case ByteOp::Ln:
+                if (sp >= 1) {
+                    double a = stack[sp - 1];
+                    stack[sp - 1] = (a <= 0.0) ? NAN : std::log(a);
+                } else return NAN;
+                break;
+            case ByteOp::Log10:
+                if (sp >= 1) {
+                    double a = stack[sp - 1];
+                    stack[sp - 1] = (a <= 0.0) ? NAN : std::log10(a);
+                } else return NAN;
+                break;
+            case ByteOp::Log2:
+                if (sp >= 1) {
+                    double a = stack[sp - 1];
+                    stack[sp - 1] = (a <= 0.0) ? NAN : std::log2(a);
+                } else return NAN;
+                break;
+            case ByteOp::Log1p:
+                if (sp >= 1) {
+                    double a = stack[sp - 1];
+                    stack[sp - 1] = (a <= -1.0) ? NAN : std::log1p(a);
+                } else return NAN;
+                break;
+            case ByteOp::Abs:
+                if (sp >= 1) stack[sp - 1] = std::fabs(stack[sp - 1]);
+                else return NAN;
+                break;
+            case ByteOp::Floor:
+                if (sp >= 1) stack[sp - 1] = std::floor(stack[sp - 1]);
+                else return NAN;
+                break;
+            case ByteOp::Ceil:
+                if (sp >= 1) stack[sp - 1] = std::ceil(stack[sp - 1]);
+                else return NAN;
+                break;
+            case ByteOp::Round:
+                if (sp >= 1) stack[sp - 1] = std::round(stack[sp - 1]);
+                else return NAN;
+                break;
+            case ByteOp::Trunc:
+                if (sp >= 1) stack[sp - 1] = std::trunc(stack[sp - 1]);
+                else return NAN;
+                break;
+            case ByteOp::Sgn:
+                if (sp >= 1) {
+                    double a = stack[sp - 1];
+                    stack[sp - 1] = (a > 0.0) ? 1.0 : ((a < 0.0) ? -1.0 : 0.0);
+                } else return NAN;
+                break;
+            case ByteOp::Fact:
+                if (sp >= 1) {
+                    double a = stack[sp - 1];
+                    stack[sp - 1] = (a < 0.0) ? NAN : std::tgamma(a + 1.0);
+                } else return NAN;
+                break;
+        }
+    }
+    return (sp == 1) ? stack[0] : NAN;
+}
+
+namespace {
+
+class BytecodeCompiler {
+public:
+    const std::vector<std::unique_ptr<Item>>& items;
+    size_t pos = 0;
+    size_t end = 0;
+    BytecodeProgram prog;
+
+    explicit BytecodeCompiler(const Row* row)
+        : items(row->items), pos(0), end(row ? row->items.size() : 0) {}
+
+    bool compile() {
+        if (!compileRow()) return false;
+        if (pos < end) return false;
+        prog.isValid = true;
+        return true;
+    }
+
+private:
+    bool atEnd() const { return pos >= end; }
+    const Item* peek() const { return atEnd() ? nullptr : items[pos].get(); }
+    bool peekIsOperatorChar(char c) const {
+        const Item* it = peek();
+        return it && it->type == ItemType::Operator && it->opChar == c;
+    }
+
+    void appendProg(const BytecodeProgram& other) {
+        for (ByteOp op : other.ops) prog.ops.push_back(op);
+        for (double c : other.consts) prog.consts.push_back(c);
+    }
+
+    bool compileRow() {
+        if (atEnd()) {
+            prog.ops.push_back(ByteOp::PushConst);
+            prog.consts.push_back(0.0);
+            return true;
+        }
+        if (!compileTerm()) return false;
+        while (!atEnd()) {
+            if (peekIsOperatorChar('+')) {
+                pos++;
+                if (!compileTerm()) return false;
+                prog.ops.push_back(ByteOp::Add);
+            } else if (peekIsOperatorChar('-')) {
+                pos++;
+                if (!compileTerm()) return false;
+                prog.ops.push_back(ByteOp::Sub);
+            } else {
+                break;
+            }
+        }
+        return true;
+    }
+
+    bool compileTerm() {
+        if (!compileFactor()) return false;
+        while (!atEnd()) {
+            if (peekIsOperatorChar('*')) {
+                pos++;
+                if (!compileFactor()) return false;
+                prog.ops.push_back(ByteOp::Mul);
+            } else if (peekIsOperatorChar('%')) {
+                pos++;
+                if (!compileFactor()) return false;
+                prog.ops.push_back(ByteOp::Mod);
+            } else {
+                const Item* nxt = peek();
+                if (nxt && nxt->type != ItemType::Operator &&
+                    nxt->type != ItemType::Equals && nxt->type != ItemType::CloseParen) {
+                    if (!compileFactor()) return false;
+                    prog.ops.push_back(ByteOp::Mul);
+                } else {
+                    break;
+                }
+            }
+        }
+        return true;
+    }
+
+    bool compileFactor() {
+        bool neg = false;
+        while (peekIsOperatorChar('-') || peekIsOperatorChar('+')) {
+            if (peekIsOperatorChar('-')) neg = !neg;
+            pos++;
+        }
+        if (!compileAtom()) return false;
+        while (peekIsOperatorChar('!')) {
+            pos++;
+            prog.ops.push_back(ByteOp::Fact);
+        }
+        if (neg) {
+            prog.ops.push_back(ByteOp::Neg);
+        }
+        return true;
+    }
+
+    bool compileAtom() {
+        if (atEnd()) return false;
+        const Item* it = peek();
+        pos++;
+        switch (it->type) {
+            case ItemType::Number: {
+                try {
+                    double val = std::stod(it->numText);
+                    prog.ops.push_back(ByteOp::PushConst);
+                    prog.consts.push_back(val);
+                    return true;
+                } catch (...) { return false; }
+            }
+            case ItemType::Constant: {
+                double val = (it->constantName == 'p') ? 3.14159265358979323846 :
+                             (it->constantName == 'e') ? 2.71828182845904523536 : 1.61803398874989484820;
+                prog.ops.push_back(ByteOp::PushConst);
+                prog.consts.push_back(val);
+                return true;
+            }
+            case ItemType::Variable: {
+                if (it->variableName == 'x') { prog.ops.push_back(ByteOp::PushVarX); return true; }
+                if (it->variableName == 'y') { prog.ops.push_back(ByteOp::PushVarY); return true; }
+                return false;
+            }
+            case ItemType::Fraction: {
+                BytecodeCompiler nCompiler(it->a.get());
+                if (!nCompiler.compile()) return false;
+                BytecodeCompiler dCompiler(it->b.get());
+                if (!dCompiler.compile()) return false;
+                appendProg(nCompiler.prog);
+                appendProg(dCompiler.prog);
+                prog.ops.push_back(ByteOp::Div);
+                return true;
+            }
+            case ItemType::Power: {
+                BytecodeCompiler baseCompiler(it->a.get());
+                if (!baseCompiler.compile()) return false;
+                BytecodeCompiler expCompiler(it->b.get());
+                if (!expCompiler.compile()) return false;
+                appendProg(baseCompiler.prog);
+                appendProg(expCompiler.prog);
+                prog.ops.push_back(ByteOp::Pow);
+                return true;
+            }
+            case ItemType::Sqrt: {
+                BytecodeCompiler radCompiler(it->a.get());
+                if (!radCompiler.compile()) return false;
+                appendProg(radCompiler.prog);
+                prog.ops.push_back(ByteOp::Sqrt);
+                return true;
+            }
+            case ItemType::Paren: {
+                if (it->isBrace || it->isBracket) return false;
+                BytecodeCompiler innerCompiler(it->a.get());
+                if (!innerCompiler.compile()) return false;
+                appendProg(innerCompiler.prog);
+                return true;
+            }
+            case ItemType::Function: {
+                ByteOp fnOp;
+                if (!mapSciFunctionToByteOp(it->functionId, fnOp)) return false;
+                BytecodeCompiler argCompiler(it->a.get());
+                if (!argCompiler.compile()) return false;
+                appendProg(argCompiler.prog);
+                prog.ops.push_back(fnOp);
+                return true;
+            }
+            default:
+                return false;
+        }
+    }
+};
+
+} // namespace
+
+bool compileRowToBytecode(const Row* row, BytecodeProgram& outProg) {
+    if (!row) return false;
+    BytecodeCompiler compiler(row);
+    if (compiler.compile()) {
+        outProg = std::move(compiler.prog);
+        return true;
+    }
+    return false;
+}
+
 double GraphAnalysis::evalExplicit(double x) const {
     if (!isValid) return NAN;
+    if (rightProgram.isValid) {
+        double v = rightProgram.execute(x, 0.0);
+        if (std::isfinite(v)) return v;
+    } else if (leftProgram.isValid && !rightRow) {
+        double v = leftProgram.execute(x, 0.0);
+        if (std::isfinite(v)) return v;
+    }
     EvaluationContext ctx = baseContext;
     ctx.degrees = false; // Cartesian mathematical graphing always operates in radians
     ctx.x = x;
@@ -123,6 +623,13 @@ double GraphAnalysis::evalExplicit(double x) const {
 
 double GraphAnalysis::evalExplicitX(double y) const {
     if (!isValid) return NAN;
+    if (rightProgram.isValid) {
+        double v = rightProgram.execute(0.0, y);
+        if (std::isfinite(v)) return v;
+    } else if (leftProgram.isValid && !rightRow) {
+        double v = leftProgram.execute(0.0, y);
+        if (std::isfinite(v)) return v;
+    }
     EvaluationContext ctx = baseContext;
     ctx.degrees = false; // Cartesian mathematical graphing always operates in radians
     ctx.y = y;
@@ -135,6 +642,14 @@ double GraphAnalysis::evalExplicitX(double y) const {
 
 double GraphAnalysis::evalImplicit(double x, double y) const {
     if (!isValid) return NAN;
+    if (leftProgram.isValid && rightProgram.isValid) {
+        double l = leftProgram.execute(x, y);
+        double r = rightProgram.execute(x, y);
+        if (std::isfinite(l) && std::isfinite(r)) return l - r;
+    } else if (leftProgram.isValid && !rightRow) {
+        double l = leftProgram.execute(x, y);
+        if (std::isfinite(l)) return l;
+    }
     EvaluationContext ctx = baseContext;
     ctx.degrees = false; // Cartesian mathematical graphing always operates in radians
     ctx.x = x;
@@ -147,7 +662,7 @@ double GraphAnalysis::evalImplicit(double x, double y) const {
     return NAN;
 }
 
-GraphAnalysis analyzeGraphExpression(const Row* root, const EvaluationContext& context) {
+static GraphAnalysis analyzeGraphExpressionInner(const Row* root, const EvaluationContext& context) {
     GraphAnalysis result;
     result.baseContext = context;
     if (!root || root->items.empty()) return result;
@@ -275,6 +790,15 @@ GraphAnalysis analyzeGraphExpression(const Row* root, const EvaluationContext& c
         return result;
     }
 
+    return result;
+}
+
+GraphAnalysis analyzeGraphExpression(const Row* root, const EvaluationContext& context) {
+    GraphAnalysis result = analyzeGraphExpressionInner(root, context);
+    if (result.isValid) {
+        if (result.leftRow) compileRowToBytecode(result.leftRow.get(), result.leftProgram);
+        if (result.rightRow) compileRowToBytecode(result.rightRow.get(), result.rightProgram);
+    }
     return result;
 }
 

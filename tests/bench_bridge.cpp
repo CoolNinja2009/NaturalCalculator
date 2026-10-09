@@ -4,6 +4,8 @@
 #include "evaluator.h"
 #include "layout.h"
 #include "workspace.h"
+#include "graph.h"
+#include "gpu_graph.h"
 
 static HDC g_benchDC = nullptr;
 
@@ -199,6 +201,38 @@ __declspec(dllexport) double bench_evaluate_integral() {
         moveUp(*expr);
         insertDigit(*expr, '1');
     }
+    return evaluate(expr->root.get(), ctx);
+}
+
+__declspec(dllexport) double bench_graph_eval_bytecode() {
+    static GraphAnalysis ga;
+    static bool init = false;
+    static double x = 1.2345;
+    if (!init) {
+        Expression expr;
+        insertFromText(expr, "sin(x) + cos(x) * x^2");
+        EvaluationContext ctx;
+        ctx.degrees = false;
+        ga = analyzeGraphExpression(expr.root.get(), ctx);
+        init = true;
+    }
+    x += 0.001;
+    if (x > 10.0) x = 1.0;
+    return ga.evalExplicit(x);
+}
+
+__declspec(dllexport) double bench_graph_eval_ast() {
+    static Expression* expr = nullptr;
+    static EvaluationContext ctx;
+    ctx.degrees = false;
+    static double x = 1.2345;
+    if (!expr) {
+        expr = new Expression();
+        insertFromText(*expr, "sin(x) + cos(x) * x^2");
+    }
+    x += 0.001;
+    if (x > 10.0) x = 1.0;
+    ctx.x = x;
     return evaluate(expr->root.get(), ctx);
 }
 
