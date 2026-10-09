@@ -1,0 +1,43 @@
+name: Build Portable EXE
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup MSYS2 and MinGW-w64
+      # MinGW is already available in the default windows-latest image path, 
+      # but we can explicitly use the msys2 setup action if needed. 
+      # Actually, the built-in gcc works perfectly on GitHub's windows-latest.
+      run: g++ --version
+
+    - name: Create Build Directory
+      run: mkdir build
+      
+    - name: Compile Windows Resources
+      run: windres src/app.rc -o build/app_res.o
+
+    - name: Compile C++ Source Code
+      run: >
+        g++ src/*.cpp build/app_res.o -o build/NaturalCalculator.exe 
+        -std=c++17 -O2 -municode -mwindows -DUNICODE -D_UNICODE 
+        -lgdi32 -luser32 -lkernel32 -ldwmapi -ladvapi32 
+        -lcomctl32 -lcomdlg32 -lgdiplus -lole32 
+        -ld3d11 -ldxgi -ld3dcompiler
+
+    - name: Upload Portable EXE Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: NaturalCalculator-Portable
+        path: build/NaturalCalculator.exe
+        if-no-files-found: error
