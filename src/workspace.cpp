@@ -119,7 +119,9 @@ bool Workspace::commitCurrent(const EvaluationContext& context) {
         }
     } else {
         try {
-            if (context.bigNumbers) {
+            if (containsI) {
+                entry->result = evaluateComplexToString(entry->expr->root.get(), context);
+            } else if (context.bigNumbers) {
                 // Pro Mode: normal formatting while the result fits a
                 // double, log10-domain "m * 10^e" beyond that.
                 entry->result = evaluateProToString(entry->expr->root.get(), context);

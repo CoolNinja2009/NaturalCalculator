@@ -97,6 +97,7 @@ struct App {
     IStream* explosionStream = nullptr;
     UINT explosionFrameCount = 0;
     Gdiplus::Image* brickImage = nullptr;
+    Gdiplus::TextureBrush* brickBrush = nullptr;
     IStream* brickStream = nullptr;
     int petX = -1;
     int petY = -1;
@@ -274,6 +275,9 @@ void loadProBrickAsset() {
                         Gdiplus::Image* img = Gdiplus::Image::FromStream(g.brickStream, FALSE);
                         if (img && img->GetLastStatus() == Gdiplus::Ok) {
                             g.brickImage = img;
+                            g.brickBrush = new Gdiplus::TextureBrush(img, Gdiplus::WrapModeTile);
+                            Gdiplus::Matrix matrix; matrix.Scale(0.5f, 0.5f);
+                            g.brickBrush->SetTransform(&matrix);
                             return;
                         }
                         delete img;
@@ -291,6 +295,9 @@ void loadProBrickAsset() {
         Gdiplus::Image* fileImg = Gdiplus::Image::FromFile(p, FALSE);
         if (fileImg && fileImg->GetLastStatus() == Gdiplus::Ok) {
             g.brickImage = fileImg;
+            g.brickBrush = new Gdiplus::TextureBrush(fileImg, Gdiplus::WrapModeTile);
+            Gdiplus::Matrix matrix; matrix.Scale(0.5f, 0.5f);
+            g.brickBrush->SetTransform(&matrix);
             return;
         }
         delete fileImg;
@@ -298,6 +305,8 @@ void loadProBrickAsset() {
 }
 
 void releaseProBrickAsset() {
+    delete g.brickBrush;
+    g.brickBrush = nullptr;
     delete g.brickImage;
     g.brickImage = nullptr;
     if (g.brickStream) {
@@ -628,6 +637,8 @@ void doAction(int action) {
                 int sci = action - ActSciFirst;
                 if (sci == SciIntegrate) insertIntegral(cur);
                 else if (sci == SciDiff) insertDerivative(cur);
+                else if (sci == SciSum) insertSummation(cur);
+                else if (sci == SciProduct) insertProduct(cur);
                 else insertFunction(cur, sci);
             }
             break;
@@ -1229,7 +1240,8 @@ void drawProExplosion(HDC hdc, RECT client, const Theme& theme) {
         int sourceX = (frame % columns) * frameWidth;
         int sourceY = (frame / columns) * frameHeight;
         Gdiplus::Graphics graphics(hdc);
-        graphics.SetInterpolationMode(Gdiplus::InterpolationModeBilinear);
+        graphics.SetInterpolationMode(Gdiplus::InterpolationModeLowQuality);
+        graphics.SetSmoothingMode(Gdiplus::SmoothingModeNone);
         graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
         Gdiplus::Rect destination(centerX - drawWidth / 2,
                                   centerY - drawHeight / 2,
@@ -1394,7 +1406,33 @@ void paintButtonPro(HDC hdc, const ButtonDef& b, const Theme& theme, double proP
         graphics.FillPath(&shadowBrush, &shadowPath);
 
         // 2. Base texture & dulled obsidian wash
-        if (g.brickImage) {
+        if (g.brickBrush) {
+            graphics.FillPath(g.brickBrush, &btnPath);
+            
+            // Dull and darken the brick texture so it is less visually distracting
+            Gdiplus::SolidBrush obsidianDull(Gdiplus::Color(165, 10, 5, 7));
+            graphics.FillPath(&obsidianDull, &btnPath);
+
+            // High-tech infernal role tinting
+            if (b.isDanger) {
+                Gdiplus::SolidBrush dangerTint(Gdiplus::Color(85, 220, 28, 20));
+                graphics.FillPath(&dangerTint, &btnPath);
+                fg = RGB(0xFF, 0xFF, 0xFF);
+            } else if (b.isAccent || b.isOperator) {
+                Gdiplus::SolidBrush magmaTint(Gdiplus::Color(75, 235, 75, 12));
+                graphics.FillPath(&magmaTint, &btnPath);
+                fg = RGB(0xFF, 0xEE, 0x88);
+            } else if (b.isFunction) {
+                Gdiplus::SolidBrush fnTint(Gdiplus::Color(60, 65, 14, 18));
+                graphics.FillPath(&fnTint, &btnPath);
+                fg = RGB(0xFF, 0xBA, 0x48);
+            } else {
+                Gdiplus::SolidBrush numTint(Gdiplus::Color(45, 14, 6, 8));
+                graphics.FillPath(&numTint, &btnPath);
+                fg = RGB(0xF5, 0xEB, 0xE1);
+            }
+        } else if (g.brickImage) {
+            // Fallback just in case
             graphics.SetClip(&btnPath);
             int imgW = (int)g.brickImage->GetWidth();
             int imgH = (int)g.brickImage->GetHeight();
@@ -1409,11 +1447,9 @@ void paintButtonPro(HDC hdc, const ButtonDef& b, const Theme& theme, double proP
                                (INT)srcX, (INT)srcY, (INT)srcW, (INT)srcH,
                                Gdiplus::UnitPixel);
 
-            // Dull and darken the brick texture so it is less visually distracting
             Gdiplus::SolidBrush obsidianDull(Gdiplus::Color(165, 10, 5, 7));
             graphics.FillPath(&obsidianDull, &btnPath);
 
-            // High-tech infernal role tinting
             if (b.isDanger) {
                 Gdiplus::SolidBrush dangerTint(Gdiplus::Color(85, 220, 28, 20));
                 graphics.FillPath(&dangerTint, &btnPath);
@@ -2014,10 +2050,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 g.caretVisible = !g.caretVisible;
                 InvalidateRect(hwnd, &g.editorRect, FALSE);
             } else if (wParam == kProAnimationTimerId && g.proMode) {
+                int oldY = g.petY + petBounceOffset();
+                RECT oldPetRect = { g.petX - 20, oldY - 20, g.petX + 80, oldY + 80 };
                 clampPetToClient();
-                InvalidateRect(hwnd, nullptr, FALSE);
-                if (!g.explosionActive && proTransitionProgress() >= 1.0) {
-                    SetTimer(hwnd, kProAnimationTimerId, 33, nullptr);
+                int newY = g.petY + petBounceOffset();
+                RECT newPetRect = { g.petX - 20, newY - 20, g.petX + 80, newY + 80 };
+
+                if (g.explosionActive || proTransitionProgress() < 1.0) {
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                } else {
+                    InvalidateRect(hwnd, &oldPetRect, FALSE);
+                    InvalidateRect(hwnd, &newPetRect, FALSE);
                 }
             }
             return 0;

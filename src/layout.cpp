@@ -165,6 +165,8 @@ Size measureNameText(HDC hdc, const std::string& text, int depth) {
 std::wstring functionNameGlyph(const Item* it) {
     if (it->functionId == SciIntegrate) return L"\u222B";
     if (it->functionId == SciDiff) return L"d/dx";
+    if (it->functionId == SciSum) return L"\u03A3";
+    if (it->functionId == SciProduct) return L"\u220F";
     const char* name = sciFunctionName(it->functionId);
     return std::wstring(name, name + std::char_traits<char>::length(name));
 }
@@ -357,6 +359,33 @@ Size measureItemImpl(HDC hdc, const Item* it, int depth) {
             s.width = name.width + gap + inner.width + 2 * glyphW;
             s.ascent = std::max(inner.ascent + scaledPx(2, depth), name.ascent);
             s.descent = std::max(inner.descent + scaledPx(2, depth), name.descent);
+            return s;
+        }
+        case ItemType::Summation:
+        case ItemType::Product: {
+            Size body = measureRowImpl(hdc, it->a.get(), depth);
+            Size lower = measureRowImpl(hdc, it->b.get(), depth + 1);
+            Size upper = measureRowImpl(hdc, it->c.get(), depth + 1);
+            int limitsW = std::max(upper.width, lower.width);
+            
+            HFONT symFont = createParenFont(depth, std::max(scaledPx(40, depth), body.height() + scaledPx(10, depth)));
+            HFONT oldFont = (HFONT)SelectObject(hdc, symFont);
+            SIZE symSz{};
+            std::wstring symStr = (it->type == ItemType::Summation) ? L"\u03A3" : L"\u220F";
+            GetTextExtentPoint32W(hdc, symStr.c_str(), 1, &symSz);
+            TEXTMETRICW tm{};
+            GetTextMetricsW(hdc, &tm);
+            SelectObject(hdc, oldFont);
+            DeleteObject(symFont);
+            
+            int symW = symSz.cx;
+            int centerW = std::max(symW, limitsW);
+            int gap = scaledPx(4, depth);
+            
+            Size s;
+            s.width = centerW + gap + body.width + gap;
+            s.ascent = std::max(body.ascent, (int)(upper.height() + gap + tm.tmAscent));
+            s.descent = std::max(body.descent, (int)(lower.height() + gap + tm.tmDescent));
             return s;
         }
         case ItemType::Integral: {
@@ -599,6 +628,45 @@ void drawItemImpl(HDC hdc, const Item* it, int depth, int x, int baselineY,
             TextOutW(hdc, x + glyphW + inner.width, baselineY - metrics.tmAscent, closeG, 1);
             SelectObject(hdc, oldFont);
             DeleteObject(parenFont);
+            return;
+        }
+        case ItemType::Summation:
+        case ItemType::Product: {
+            Size body = measureRowImpl(hdc, it->a.get(), depth);
+            Size lower = measureRowImpl(hdc, it->b.get(), depth + 1);
+            Size upper = measureRowImpl(hdc, it->c.get(), depth + 1);
+            int limitsW = std::max(upper.width, lower.width);
+            
+            HFONT symFont = createParenFont(depth, std::max(scaledPx(40, depth), body.height() + scaledPx(10, depth)));
+            HFONT oldFont = (HFONT)SelectObject(hdc, symFont);
+            SIZE symSz{};
+            std::wstring symStr = (it->type == ItemType::Summation) ? L"\u03A3" : L"\u220F";
+            GetTextExtentPoint32W(hdc, symStr.c_str(), 1, &symSz);
+            TEXTMETRICW tm{};
+            GetTextMetricsW(hdc, &tm);
+            
+            int symW = symSz.cx;
+            int centerW = std::max(symW, limitsW);
+            int gap = scaledPx(4, depth);
+            
+            int symX = x + (centerW - symW) / 2;
+            int symTop = baselineY - tm.tmAscent;
+            
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, theme.operatorColor);
+            TextOutW(hdc, symX, symTop, symStr.c_str(), 1);
+            SelectObject(hdc, oldFont);
+            DeleteObject(symFont);
+            
+            int upperX = x + (centerW - upper.width) / 2;
+            int upperY = symTop - gap;
+            int lowerX = x + (centerW - lower.width) / 2;
+            int lowerY = baselineY + tm.tmDescent + gap;
+            
+            drawRowImpl(hdc, it->c.get(), depth + 1, upperX, upperY, theme, cursor, outCaret);
+            drawRowImpl(hdc, it->b.get(), depth + 1, lowerX, lowerY + lower.ascent, theme, cursor, outCaret);
+            
+            drawRowImpl(hdc, it->a.get(), depth, x + centerW + gap, baselineY, theme, cursor, outCaret);
             return;
         }
         case ItemType::Integral: {
@@ -846,6 +914,38 @@ void findItemHit(HDC hdc, Row* parent, int index, Item* item, int depth,
             int gap = scaledPx(2, depth);
             findRowHit(hdc, item->a.get(), depth, x + name.width + gap + glyphW,
                        baselineY, pointX, pointY, best);
+            return;
+        }
+        case ItemType::Summation:
+        case ItemType::Product: {
+            Size body = measureRowImpl(hdc, item->a.get(), depth);
+            Size lower = measureRowImpl(hdc, item->b.get(), depth + 1);
+            Size upper = measureRowImpl(hdc, item->c.get(), depth + 1);
+            int limitsW = std::max(upper.width, lower.width);
+            
+            HFONT symFont = createParenFont(depth, std::max(scaledPx(40, depth), body.height() + scaledPx(10, depth)));
+            HFONT oldFont = (HFONT)SelectObject(hdc, symFont);
+            SIZE symSz{};
+            std::wstring symStr = (item->type == ItemType::Summation) ? L"\u03A3" : L"\u220F";
+            GetTextExtentPoint32W(hdc, symStr.c_str(), 1, &symSz);
+            TEXTMETRICW tm{};
+            GetTextMetricsW(hdc, &tm);
+            SelectObject(hdc, oldFont);
+            DeleteObject(symFont);
+            
+            int symW = symSz.cx;
+            int centerW = std::max(symW, limitsW);
+            int gap = scaledPx(4, depth);
+            
+            int symTop = baselineY - tm.tmAscent;
+            int upperX = x + (centerW - upper.width) / 2;
+            int upperY = symTop - gap;
+            int lowerX = x + (centerW - lower.width) / 2;
+            int lowerY = baselineY + tm.tmDescent + gap;
+            
+            findRowHit(hdc, item->c.get(), depth + 1, upperX, upperY, pointX, pointY, best);
+            findRowHit(hdc, item->b.get(), depth + 1, lowerX, lowerY + lower.ascent, pointX, pointY, best);
+            findRowHit(hdc, item->a.get(), depth, x + centerW + gap, baselineY, pointX, pointY, best);
             return;
         }
         case ItemType::Integral: {

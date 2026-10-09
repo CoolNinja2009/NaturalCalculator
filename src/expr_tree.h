@@ -40,7 +40,9 @@ enum class ItemType {
     Permutation,// nPr: a = n (superscript), b = r (subscript)
     Combination,// nCr: a = n (superscript), b = r (subscript)
     Integral,   // \int: a = integrand, b = lower limit, c = upper limit
-    Derivative  // d/dx: a = expression, b = eval point (optional)
+    Derivative, // d/dx: a = expression, b = eval point (optional)
+    Summation,  // \Sigma: a = body, b = lower limit, c = upper limit
+    Product     // \Pi: a = body, b = lower limit, c = upper limit
 };
 
 // Scientific functions available in Calc Pro Max / Scientific mode.
@@ -204,6 +206,8 @@ void insertConstant(Expression& expr, char which); // 'p' = pi, 'e' = e, 'f' = p
 // Calculus: natural textbook integral and derivative
 void insertIntegral(Expression& expr);
 void insertDerivative(Expression& expr);
+void insertSummation(Expression& expr);
+void insertProduct(Expression& expr);
 
 // Combinatorics: nPr / nCr. Wrap atom to the left into n, cursor moves to r.
 void insertPermutation(Expression& expr);

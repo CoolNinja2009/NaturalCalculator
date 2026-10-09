@@ -169,7 +169,8 @@ bool rowIsEmpty(const Row* r) { return r == nullptr || r->items.empty(); }
 
 static bool isTwoRowStructure(ItemType t) {
     return t == ItemType::Fraction || t == ItemType::Power ||
-           t == ItemType::Permutation || t == ItemType::Combination;
+           t == ItemType::Permutation || t == ItemType::Combination ||
+           t == ItemType::Derivative;
 }
 
 bool hasEquals(const Row* r) {
@@ -355,6 +356,10 @@ static void serializeItem(const Item* it, std::string& out) {
                 out += "\xE2\x88\xAB(";
             } else if (it->functionId == SciDiff) {
                 out += "d/dx(";
+            } else if (it->functionId == SciSum) {
+                out += "\xCE\xA3(";
+            } else if (it->functionId == SciProduct) {
+                out += "\xE2\x88\x8F(";
             } else {
                 out += sciFunctionName(it->functionId);
                 out += '(';
@@ -381,8 +386,12 @@ static void serializeItem(const Item* it, std::string& out) {
             }
             break;
         }
+        case ItemType::Summation:
+        case ItemType::Product:
         case ItemType::Integral: {
-            out += "\xE2\x88\xAB";
+            if (it->type == ItemType::Summation) out += "\xCE\xA3";
+            else if (it->type == ItemType::Product) out += "\xE2\x88\x8F";
+            else out += "\xE2\x88\xAB";
             if (!rowIsEmpty(it->b.get()) || !rowIsEmpty(it->c.get())) {
                 out += "_(";
                 serializeRow(it->b.get(), out);
@@ -781,6 +790,36 @@ void insertDerivative(Expression& expr) {
     expr.cursor.index = 0;
 }
 
+void insertSummation(Expression& expr) {
+    Row* row = expr.cursor.row;
+    int idx = expr.cursor.index;
+
+    auto item = std::make_unique<Item>(ItemType::Summation);
+    Item* ptr = item.get();
+    attachRow(item->a, ptr, row); // body
+    attachRow(item->b, ptr, row); // lower limit
+    attachRow(item->c, ptr, row); // upper limit
+
+    row->items.insert(row->items.begin() + idx, std::move(item));
+    expr.cursor.row = ptr->b.get();
+    expr.cursor.index = 0;
+}
+
+void insertProduct(Expression& expr) {
+    Row* row = expr.cursor.row;
+    int idx = expr.cursor.index;
+
+    auto item = std::make_unique<Item>(ItemType::Product);
+    Item* ptr = item.get();
+    attachRow(item->a, ptr, row); // body
+    attachRow(item->b, ptr, row); // lower limit
+    attachRow(item->c, ptr, row); // upper limit
+
+    row->items.insert(row->items.begin() + idx, std::move(item));
+    expr.cursor.row = ptr->b.get();
+    expr.cursor.index = 0;
+}
+
 void insertCloseParen(Expression& expr) {
     Row* insertionRow = expr.cursor.row;
     int insertionIndex = expr.cursor.index;
@@ -792,6 +831,8 @@ void insertCloseParen(Expression& expr) {
             row->owner->type == ItemType::Function ||
             row->owner->type == ItemType::Sqrt ||
             row->owner->type == ItemType::Integral ||
+            row->owner->type == ItemType::Summation ||
+            row->owner->type == ItemType::Product ||
             row->owner->type == ItemType::Derivative) {
             expr.cursor.row = row->ownerParentRow;
             expr.cursor.index = k + 1;
@@ -827,6 +868,7 @@ void moveLeft(Expression& expr) {
             case ItemType::Power:
             case ItemType::Permutation:
             case ItemType::Combination:
+            case ItemType::Derivative:
                 // Entering a closed fraction/power from the right lands
                 // in its rightmost row -- the denominator/exponent --
                 // not the numerator/base. This mirrors how the caret
@@ -840,7 +882,8 @@ void moveLeft(Expression& expr) {
             case ItemType::Sqrt:
             case ItemType::Function:
             case ItemType::Integral:
-            case ItemType::Derivative:
+            case ItemType::Summation:
+            case ItemType::Product:
                 // These enter into their main row (a) from either side
                 expr.cursor.row = prev->a.get();
                 expr.cursor.index = (int)prev->a->items.size();
@@ -889,6 +932,8 @@ void moveRight(Expression& expr) {
             case ItemType::Sqrt:
             case ItemType::Function:
             case ItemType::Integral:
+            case ItemType::Summation:
+            case ItemType::Product:
             case ItemType::Derivative:
                 expr.cursor.row = next->a.get();
                 expr.cursor.index = 0;
@@ -922,7 +967,7 @@ bool moveUp(Expression& expr) {
             expr.cursor.index = (int)target->items.size();
         return true;
     }
-    if (isARow(row) && row->owner && row->owner->type == ItemType::Integral) {
+    if (isARow(row) && row->owner && (row->owner->type == ItemType::Integral || row->owner->type == ItemType::Summation || row->owner->type == ItemType::Product)) {
         // From integrand (a) -> go to upper limit (c)
         Item* owner = row->owner;
         Row* target = owner->c.get();
@@ -937,7 +982,7 @@ bool moveUp(Expression& expr) {
 // Mirror of moveUp: returns true if the cursor moved.
 bool moveDown(Expression& expr) {
     Row* row = expr.cursor.row;
-    if (isCRow(row) && row->owner && row->owner->type == ItemType::Integral) {
+    if (isCRow(row) && row->owner && (row->owner->type == ItemType::Integral || row->owner->type == ItemType::Summation || row->owner->type == ItemType::Product)) {
         // From upper limit (c) -> go to integrand (a)
         Item* owner = row->owner;
         Row* target = owner->a.get();
@@ -947,7 +992,7 @@ bool moveDown(Expression& expr) {
         return true;
     }
     if (isARow(row) && row->owner) {
-        if (row->owner->type == ItemType::Integral) {
+        if (row->owner->type == ItemType::Integral || row->owner->type == ItemType::Summation || row->owner->type == ItemType::Product) {
             // From integrand (a) -> go to lower limit (b)
             Item* owner = row->owner;
             Row* target = owner->b.get();
@@ -1489,6 +1534,30 @@ void insertFromText(Expression& expr, const std::string& text) {
             continue;
         }
         // UTF-8 Δ (\xCE\x94)
+        // UTF-8 Σ (\xCE\xA3)
+        if (i + 1 < text.size() && (unsigned char)text[i] == 0xCE &&
+            (unsigned char)text[i + 1] == 0xA3) {
+            i += 2;
+            if (i < text.size() && text[i] == '(') {
+                insertFunction(expr, SciSum);
+                ++i;
+            } else {
+                insertFunction(expr, SciSum);
+            }
+            continue;
+        }
+        // UTF-8 Π (\xE2\x88\x8F)
+        if (i + 2 < text.size() && (unsigned char)text[i] == 0xE2 &&
+            (unsigned char)text[i + 1] == 0x88 && (unsigned char)text[i + 2] == 0x8F) {
+            i += 3;
+            if (i < text.size() && text[i] == '(') {
+                insertFunction(expr, SciProduct);
+                ++i;
+            } else {
+                insertFunction(expr, SciProduct);
+            }
+            continue;
+        }
         if (i + 1 < text.size() && (unsigned char)text[i] == 0xCE &&
             (unsigned char)text[i + 1] == 0x94) {
             insertOperator(expr, 'D');
@@ -1562,6 +1631,15 @@ void insertFromText(Expression& expr, const std::string& text) {
                 insertConstant(expr, 'f');
             } else if (isSqrt) {
                 insertSqrt(expr);
+                if (i + fnLen < text.size() && text[i + fnLen] == '(') fnLen++;
+            } else if (functionId == SciSum) {
+                insertSummation(expr);
+                if (i + fnLen < text.size() && text[i + fnLen] == '(') fnLen++;
+            } else if (functionId == SciProduct) {
+                insertProduct(expr);
+                if (i + fnLen < text.size() && text[i + fnLen] == '(') fnLen++;
+            } else if (functionId == SciIntegrate) {
+                insertIntegral(expr);
                 if (i + fnLen < text.size() && text[i + fnLen] == '(') fnLen++;
             } else {
                 insertFunction(expr, functionId);

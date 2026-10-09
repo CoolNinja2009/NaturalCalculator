@@ -1145,6 +1145,49 @@ struct RowParser {
                 double r = evaluateValue(it->b.get(), context).asNumber();
                 return EvalValue(combination(n, r));
             }
+            case ItemType::Summation:
+            case ItemType::Product: {
+                pos++;
+                const Row* body = it->a.get();
+                const Row* lower = it->b.get();
+                const Row* upper = it->c.get();
+                
+                char var = 'x';
+                double startVal = 0.0;
+                if (!rowIsEmpty(lower)) {
+                    size_t eqIdx = 0;
+                    for (; eqIdx < lower->items.size(); ++eqIdx) {
+                        if (lower->items[eqIdx]->type == ItemType::Equals) break;
+                    }
+                    if (eqIdx < lower->items.size()) {
+                        if (eqIdx > 0 && lower->items[eqIdx-1]->type == ItemType::Variable) {
+                            var = lower->items[eqIdx-1]->variableName;
+                        }
+                        RowParser rp(lower, context, eqIdx + 1, lower->items.size());
+                        startVal = rp.parseRowValue().asNumber();
+                    } else {
+                        startVal = evaluateValue(lower, context).asNumber();
+                    }
+                }
+                
+                double endVal = rowIsEmpty(upper) ? 0.0 : evaluateValue(upper, context).asNumber();
+                long long a = static_cast<long long>(std::round(startVal));
+                long long b = static_cast<long long>(std::round(endVal));
+                if (std::abs(b - a) > 5000000) throw std::runtime_error("Range too large");
+                
+                double result = (it->type == ItemType::Summation) ? 0.0 : 1.0;
+                for (long long k = a; k <= b; ++k) {
+                    EvaluationContext sub = context;
+                    if (var == 'x') sub.x = static_cast<double>(k);
+                    else if (var == 'y') sub.y = static_cast<double>(k);
+                    else sub.x = static_cast<double>(k);
+                    
+                    double term = evaluateValue(body, sub).asNumber();
+                    if (it->type == ItemType::Summation) result += term;
+                    else result *= term;
+                }
+                return EvalValue(result);
+            }
             case ItemType::Integral: {
                 pos++;
                 const Row* integrand = it->a.get();
@@ -2147,6 +2190,8 @@ struct BigParser {
                 throw std::runtime_error("Unexpected operator");
             case ItemType::Equals:
                 throw std::runtime_error("Equation needs two lines");
+            case ItemType::Summation:
+            case ItemType::Product:
             case ItemType::Integral:
             case ItemType::Derivative:
                 throw std::runtime_error("Calculus not supported in Pro Big mode");
@@ -2350,6 +2395,8 @@ struct PolynomialParser {
             case ItemType::Function:
             case ItemType::Permutation:
             case ItemType::Combination:
+            case ItemType::Summation:
+            case ItemType::Product:
             case ItemType::Integral:
             case ItemType::Derivative:
                 return { { 0, 0, 0 }, false };
@@ -2475,6 +2522,8 @@ struct LinearParser {
             case ItemType::Function:
             case ItemType::Permutation:
             case ItemType::Combination:
+            case ItemType::Summation:
+            case ItemType::Product:
             case ItemType::Integral:
             case ItemType::Derivative:
                 return { 0, 0, 0, false };
@@ -3156,6 +3205,18 @@ struct ComplexEvaluator {
         } else if (it->type == ItemType::Sqrt) {
             ComplexEvaluator rad(it->a.get(), x_val, y_val, 0, it->a->items.size());
             return std::sqrt(rad.parseRowValue());
+        } else if (it->type == ItemType::Function) {
+            ComplexEvaluator argEv(it->a.get(), x_val, y_val, 0, it->a->items.size());
+            auto arg = argEv.parseRowValue();
+            if (it->functionId == 0) return std::sin(arg); // SciSin
+            if (it->functionId == 1) return std::cos(arg); // SciCos
+            if (it->functionId == 2) return std::tan(arg); // SciTan
+            if (it->functionId == 3) return std::asin(arg); // SciAsin
+            if (it->functionId == 4) return std::acos(arg); // SciAcos
+            if (it->functionId == 5) return std::atan(arg); // SciAtan
+            if (it->functionId == 6) return std::log10(arg); // SciLog
+            if (it->functionId == 7) return std::log(arg); // SciLn
+            throw std::runtime_error("Unsupported complex function");
         } else if (it->type == ItemType::Constant) {
             if (it->constantName == 'p') return {3.14159265358979323846, 0};
             if (it->constantName == 'e') return {2.71828182845904523536, 0};
@@ -3168,6 +3229,31 @@ struct ComplexEvaluator {
     }
 };
 } // namespace
+
+std::string evaluateComplexToString(const Row* expr, const EvaluationContext& context) {
+    if (!expr) return "";
+    ComplexEvaluator ev(expr, {context.x, 0}, {context.y, 0}, 0, expr->items.size());
+    std::complex<double> val = ev.parseRowValue();
+    if (!ev.atEnd()) throw std::runtime_error("Unexpected operator");
+    
+    char buf[128];
+    if (std::abs(val.imag()) < 1e-12) {
+        std::snprintf(buf, sizeof(buf), "%.10g", val.real());
+    } else if (std::abs(val.real()) < 1e-12) {
+        if (std::abs(val.imag() - 1.0) < 1e-12) std::snprintf(buf, sizeof(buf), "i");
+        else if (std::abs(val.imag() + 1.0) < 1e-12) std::snprintf(buf, sizeof(buf), "-i");
+        else std::snprintf(buf, sizeof(buf), "%.10gi", val.imag());
+    } else {
+        if (val.imag() > 0) {
+            if (std::abs(val.imag() - 1.0) < 1e-12) std::snprintf(buf, sizeof(buf), "%.10g + i", val.real());
+            else std::snprintf(buf, sizeof(buf), "%.10g + %.10gi", val.real(), val.imag());
+        } else {
+            if (std::abs(val.imag() + 1.0) < 1e-12) std::snprintf(buf, sizeof(buf), "%.10g - i", val.real());
+            else std::snprintf(buf, sizeof(buf), "%.10g - %.10gi", val.real(), -val.imag());
+        }
+    }
+    return std::string(buf);
+}
 
 bool solveComplexEquation(const Row* equation, double& x, double& y, std::string& message) {
     if (!equation) return false;

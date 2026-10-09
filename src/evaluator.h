@@ -140,6 +140,8 @@ bool solveTwoVariableSystem(const Row* first, const Row* second,
 
 bool solveComplexEquation(const Row* equation, double& x, double& y, std::string& message);
 
+std::string evaluateComplexToString(const Row* expr, const EvaluationContext& context);
+
 bool solveSingleVariableEquation(const Row* equation, char& variable,
 								 double& value, std::string& message);
 
