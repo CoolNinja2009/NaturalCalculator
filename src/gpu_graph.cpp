@@ -53,6 +53,8 @@ struct GpuContext {
 
     bool initialized = false;
     bool available = false;
+    bool isWarp = false;
+    std::string lastCompileError;
 } s_gpu;
 
 struct ShaderConstantParams {
@@ -102,12 +104,17 @@ float toRad(float a) {
 }
 
 float gpu_pow(float a, float b) {
-    if (a == 0.0) return 0.0;
-    if (frac(b) == 0.0) {
-        float res = pow(abs(a), b);
-        return (fmod(abs(b), 2.0) != 0.0 && a < 0.0) ? -res : res;
+    if (a == 0.0) {
+        if (b == 0.0) return 1.0;
+        if (b > 0.0) return 0.0;
+        return asfloat(0x7FC00000); // 0^-n is division by zero -> NaN/undefined
     }
-    return pow(abs(a), b);
+    if (a < 0.0) {
+        if (frac(b) != 0.0) return asfloat(0x7FC00000); // negative base with non-integer exp is undefined
+        float res = pow(-a, b);
+        return (fmod(abs(b), 2.0) >= 0.5) ? -res : res;
+    }
+    return pow(a, b);
 }
 
 float gpu_sinc(float v) {
@@ -141,7 +148,7 @@ float4 PSMain(VS_OUTPUT input) : SV_Target {
     float axisAlpha = saturate(1.2 - axisLine * 0.7) * uAxisCol.a;
     color = lerp(color, float4(uAxisCol.rgb, 1.0), axisAlpha);
 
-    // Math Curve / Implicit Contour with Pole & Asymptote Rejection
+    // Math Curve / Implicit Contour with Zoom-Invariant Pole & Asymptote Rejection
     float f = evalF(mathX, mathY);
     float df_dx = ddx(f);
     float df_dy = ddy(f);
@@ -154,9 +161,13 @@ float4 PSMain(VS_OUTPUT input) : SV_Target {
         float minF = min(f, min(f_right, f_down));
         float maxF = max(f, max(f_right, f_down));
         bool signChange = (minF <= 0.0 && maxF >= 0.0);
-        bool isPole = (abs(f) > 25.0 && (abs(df_dx) > 80.0 || abs(df_dy) > 80.0));
 
-        if (distPix <= 2.2 && !isPole && (signChange || abs(f) < 2.0)) {
+        // Zoom-invariant pole rejection: across a pole (e.g. 1/x, tan(x)), f jumps between large
+        // positive and negative values. A real curve in the viewport has |f| bounded near 0.
+        float mathHeight = max(uBounds.w - uBounds.z, 1e-4);
+        bool isPole = signChange && (abs(f) > mathHeight * 3.0);
+
+        if (distPix <= 2.2 && !isPole) {
             float core = saturate(1.7 - distPix);
             float glow = saturate(1.0 - distPix * 0.32) * 0.4;
             float alpha = saturate(core + glow) * uCurveCol.a;
@@ -222,10 +233,18 @@ bool itemToHLSL(const Item* it, std::string& out) {
             else out += "2.718281828459045";
             return true;
         case ItemType::Operator:
-            out += " ";
-            out += it->opChar;
-            out += " ";
-            return true;
+            if (it->opChar == '+' || it->opChar == '-' || it->opChar == '*') {
+                out += " ";
+                out += it->opChar;
+                out += " ";
+                return true;
+            }
+            if (it->opChar == '/') {
+                out += " / ";
+                return true;
+            }
+            // Reject any unhandled or illegal operator punctuation (e.g. ';', '!', ',')
+            return false;
         case ItemType::Fraction:
             out += " ((";
             if (!rowToHLSL(it->a.get(), out)) return false;
@@ -321,40 +340,6 @@ bool analysisToHLSL(const GraphAnalysis& analysis, std::string& outExpr) {
     return false;
 }
 
-double chooseStep(double range, int targetDivisions) {
-    double rawStep = range / targetDivisions;
-    double mag = std::pow(10.0, std::floor(std::log10(rawStep)));
-    double normalized = rawStep / mag;
-    double step;
-    if (normalized < 1.5) step = 1.0 * mag;
-    else if (normalized < 3.5) step = 2.0 * mag;
-    else if (normalized < 7.5) step = 5.0 * mag;
-    else step = 10.0 * mag;
-    return step;
-}
-
-std::string formatNumberShort(double v) {
-    char buf[32];
-    double av = std::fabs(v);
-    if (av < 1e-12) return "0";
-    if (std::floor(v) == v && av < 1e6) {
-        std::snprintf(buf, sizeof(buf), "%.0f", v);
-    } else if (av >= 1e4 || av <= 1e-3) {
-        std::snprintf(buf, sizeof(buf), "%.1e", v);
-    } else {
-        std::snprintf(buf, sizeof(buf), "%.2f", v);
-        std::string s(buf);
-        size_t dot = s.find('.');
-        if (dot != std::string::npos) {
-            size_t last = s.find_last_not_of('0');
-            if (last == dot) last--;
-            s.erase(last + 1);
-        }
-        return s;
-    }
-    return std::string(buf);
-}
-
 void colorrefToFloat4(COLORREF c, float a, float* out) {
     out[0] = (float)GetRValue(c) / 255.0f;
     out[1] = (float)GetGValue(c) / 255.0f;
@@ -416,7 +401,16 @@ ID3D11PixelShader* getOrCreatePixelShader(const std::string& mathExpr) {
     );
 
     if (FAILED(hr)) {
-        if (errorBlob) errorBlob->Release();
+        if (errorBlob) {
+            const char* errStr = static_cast<const char*>(errorBlob->GetBufferPointer());
+            s_gpu.lastCompileError = errStr ? errStr : "Unknown compile error";
+            OutputDebugStringA("[GPU Graph] HLSL compilation failed:\n");
+            OutputDebugStringA(s_gpu.lastCompileError.c_str());
+            OutputDebugStringA("\n");
+            errorBlob->Release();
+        } else {
+            s_gpu.lastCompileError = "D3DCompile failed without error blob";
+        }
         return nullptr;
     }
 
@@ -446,10 +440,20 @@ bool isGpuGraphAvailable() {
     return s_gpu.available;
 }
 
+bool isGpuGraphHardwareAdapter() {
+    if (!s_gpu.initialized) initGpuGraph();
+    return s_gpu.available && !s_gpu.isWarp;
+}
+
+const char* getGpuGraphLastError() {
+    return s_gpu.lastCompileError.c_str();
+}
+
 bool initGpuGraph() {
     if (s_gpu.initialized) return s_gpu.available;
     s_gpu.initialized = true;
     s_gpu.available = false;
+    s_gpu.isWarp = false;
 
     s_gpu.compilerDll = LoadLibraryW(L"d3dcompiler_47.dll");
     if (!s_gpu.compilerDll) return false;
@@ -471,7 +475,9 @@ bool initGpuGraph() {
         &s_gpu.context
     );
 
-    if (FAILED(hr)) {
+    if (SUCCEEDED(hr)) {
+        s_gpu.isWarp = false;
+    } else {
         // Fallback to WARP (software rasterizer on GPU architecture)
         hr = D3D11CreateDevice(
             nullptr,
@@ -486,6 +492,7 @@ bool initGpuGraph() {
             &s_gpu.context
         );
         if (FAILED(hr)) return false;
+        s_gpu.isWarp = true;
     }
 
     // Compile fullscreen quad vertex shader
@@ -597,13 +604,11 @@ bool renderGraphGpu(HDC hdc, const RECT& graphRect, const GraphAnalysis& analysi
     params->screen[2] = theme.isDark ? 1.0f : 0.0f;
     params->screen[3] = degreesMode ? 1.0f : 0.0f;
 
-    colorrefToFloat4(theme.accent, 1.0f, params->curveCol);
-    COLORREF gridColor = theme.isDark ? RGB(0x2E, 0x33, 0x3D) : RGB(0xDE, 0xE2, 0xE6);
-    colorrefToFloat4(gridColor, 0.65f, params->gridCol);
-    COLORREF axisColor = theme.isDark ? RGB(0x6A, 0x73, 0x82) : RGB(0x8A, 0x93, 0x9E);
-    colorrefToFloat4(axisColor, 0.95f, params->axisCol);
-    COLORREF bgColor = theme.isDark ? RGB(0x18, 0x1A, 0x1F) : RGB(0xF8, 0xF9, 0xFA);
-    colorrefToFloat4(bgColor, 1.0f, params->bgCol);
+    GraphPalette pal = getGraphPalette(theme);
+    colorrefToFloat4(pal.curve, 1.0f, params->curveCol);
+    colorrefToFloat4(pal.grid, 0.65f, params->gridCol);
+    colorrefToFloat4(pal.axis, 0.95f, params->axisCol);
+    colorrefToFloat4(pal.bg, 1.0f, params->bgCol);
 
     params->steps[0] = (float)xStep;
     params->steps[1] = (float)yStep;
@@ -643,7 +648,7 @@ bool renderGraphGpu(HDC hdc, const RECT& graphRect, const GraphAnalysis& analysi
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
 
-    if (mapped.RowPitch == w * 4) {
+    if (mapped.RowPitch == (UINT)(w * 4)) {
         SetDIBitsToDevice(
             hdc,
             graphRect.left, graphRect.top,
@@ -750,10 +755,11 @@ bool renderGraphGpu(HDC hdc, const RECT& graphRect, const GraphAnalysis& analysi
     RECT titleTextRect = { titleRect.left + 8, titleRect.top, titleRect.right - 8, titleRect.bottom };
     DrawTextA(hdc, titleText.c_str(), -1, &titleTextRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
-    // Draw GPU label inside badge
+    // Draw GPU / WARP label inside badge
     SetTextColor(hdc, theme.isDark ? RGB(0x5A, 0xDE, 0x8B) : RGB(0x19, 0x87, 0x54));
     SelectObject(hdc, smallFont ? smallFont : font);
-    DrawTextA(hdc, "GPU D3D11", -1, &gpuBadge, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    const char* badgeText = s_gpu.isWarp ? "WARP D3D11" : "GPU D3D11";
+    DrawTextA(hdc, badgeText, -1, &gpuBadge, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
     // Zoom Buttons
     int btnSize = 24;

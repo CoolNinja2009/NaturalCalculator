@@ -14,8 +14,14 @@
 #include <string>
 #include "graph.h"
 
-// Check if hardware GPU acceleration is active and available
+// Check if GPU acceleration (Hardware or WARP rasterizer) is active and available
 bool isGpuGraphAvailable();
+
+// Check if device is backed by true hardware adapter (false if WARP software rasterizer)
+bool isGpuGraphHardwareAdapter();
+
+// Returns the last shader compilation error message, if any
+const char* getGpuGraphLastError();
 
 // Explicitly initialize GPU graphing resources (called during app startup)
 bool initGpuGraph();

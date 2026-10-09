@@ -62,6 +62,8 @@ void collectVars(const Row* row, bool& hasX, bool& hasY) {
     }
 }
 
+} // namespace
+
 std::string formatNumberShort(double v) {
     char buf[32];
     double av = std::fabs(v);
@@ -97,7 +99,15 @@ double chooseStep(double range, int targetDivisions) {
     return step;
 }
 
-} // namespace
+GraphPalette getGraphPalette(const Theme& theme) {
+    GraphPalette p;
+    p.bg = theme.isDark ? RGB(0x18, 0x1A, 0x1F) : RGB(0xF8, 0xF9, 0xFA);
+    p.grid = theme.isDark ? RGB(0x28, 0x2D, 0x36) : RGB(0xEB, 0xEE, 0xF2);
+    p.axis = theme.isDark ? RGB(0x5A, 0x62, 0x70) : RGB(0x9E, 0xA8, 0xB6);
+    p.text = theme.isDark ? RGB(0x8C, 0x94, 0xA0) : RGB(0x73, 0x7D, 0x8C);
+    p.curve = theme.accent;
+    return p;
+}
 
 double GraphAnalysis::evalExplicit(double x) const {
     if (!isValid) return NAN;
@@ -476,15 +486,23 @@ void drawProbeTooltip(HDC hdc, const RECT& localRect, const GraphState& state,
                 double currX = startX + i * dx;
                 double currY = analysis.evalExplicit(currX);
                 
-                // Root (X-Intercept)
+                // Root (X-Intercept): verify genuine zero crossing, rejecting asymptote poles (e.g. 1/x, tan(x))
                 if (prevY * currY <= 0.0 && prevY != currY) {
                     double rootX = startX + (i - 1) * dx - prevY * dx / (currY - prevY);
-                    trySnap(rootX, 0.0);
+                    double rootVal = analysis.evalExplicit(rootX);
+                    double mathH = state.maxY - state.minY;
+                    double jump = std::abs(currY - prevY);
+                    if (std::isfinite(rootVal) && std::abs(rootVal) < std::max(0.5, (mathH / (double)h) * 4.0) && jump < mathH * 2.0) {
+                        trySnap(rootX, 0.0);
+                    }
                 }
                 
                 // Y-Intercept
                 if ((startX + (i - 1) * dx) <= 0.0 && currX >= 0.0) {
-                    trySnap(0.0, analysis.evalExplicit(0.0));
+                    double yAtZero = analysis.evalExplicit(0.0);
+                    if (std::isfinite(yAtZero)) {
+                        trySnap(0.0, yAtZero);
+                    }
                 }
                 
                 // Extremum (Minima/Maxima)
@@ -492,7 +510,10 @@ void drawProbeTooltip(HDC hdc, const RECT& localRect, const GraphState& state,
                     double currDy = currY - prevY;
                     if (prevDy * currDy <= 0.0) {
                         double extX = currX - dx;
-                        trySnap(extX, analysis.evalExplicit(extX));
+                        double extVal = analysis.evalExplicit(extX);
+                        if (std::isfinite(extVal) && std::abs(extVal) < (state.maxY - state.minY) * 5.0) {
+                            trySnap(extX, extVal);
+                        }
                     }
                     prevDy = currDy;
                 }
@@ -516,16 +537,27 @@ void drawProbeTooltip(HDC hdc, const RECT& localRect, const GraphState& state,
                 double currX = analysis.evalExplicitX(currY);
                 if (prevX * currX <= 0.0 && prevX != currX) {
                     double rootY = startY + (i - 1) * dy_step - prevX * dy_step / (currX - prevX);
-                    trySnap(0.0, rootY);
+                    double rootVal = analysis.evalExplicitX(rootY);
+                    double mathW = state.maxX - state.minX;
+                    double jump = std::abs(currX - prevX);
+                    if (std::isfinite(rootVal) && std::abs(rootVal) < std::max(0.5, (mathW / (double)w) * 4.0) && jump < mathW * 2.0) {
+                        trySnap(0.0, rootY);
+                    }
                 }
                 if ((startY + (i - 1) * dy_step) <= 0.0 && currY >= 0.0) {
-                    trySnap(analysis.evalExplicitX(0.0), 0.0);
+                    double xAtZero = analysis.evalExplicitX(0.0);
+                    if (std::isfinite(xAtZero)) {
+                        trySnap(xAtZero, 0.0);
+                    }
                 }
                 if (i > 1) {
                     double currDx = currX - prevX;
                     if (prevDx * currDx <= 0.0) {
                         double extY = currY - dy_step;
-                        trySnap(analysis.evalExplicitX(extY), extY);
+                        double extVal = analysis.evalExplicitX(extY);
+                        if (std::isfinite(extVal) && std::abs(extVal) < (state.maxX - state.minX) * 5.0) {
+                            trySnap(extVal, extY);
+                        }
                     }
                     prevDx = currDx;
                 }
@@ -647,18 +679,12 @@ void renderGraph(HDC hdc, const RECT& graphRect, const GraphAnalysis& analysis,
     FillRect(mem, &localRect, bgBrush);
     DeleteObject(bgBrush);
 
-    // Graph colors based on theme
-    COLORREF gridColor = theme.isDark ? RGB(0x28, 0x2D, 0x36) : RGB(0xEB, 0xEE, 0xF2);
-    COLORREF axisColor = theme.isDark ? RGB(0x5A, 0x62, 0x70) : RGB(0x9E, 0xA8, 0xB6);
-    COLORREF textColor = theme.isDark ? RGB(0x8C, 0x94, 0xA0) : RGB(0x73, 0x7D, 0x8C);
-    COLORREF curveColor = theme.isDark ? RGB(0x00, 0xD4, 0xFF) : RGB(0x00, 0x66, 0xD6);
-    if (theme.accent == RGB(0xD9, 0x10, 0x32) || theme.accent == RGB(0xDA, 0x0A, 0x31)) {
-        // Pro Mode theme
-        gridColor = RGB(0x2A, 0x0E, 0x16);
-        axisColor = RGB(0x6D, 0x18, 0x2A);
-        textColor = RGB(0xBB, 0x63, 0x76);
-        curveColor = RGB(0xFF, 0x33, 0x55);
-    }
+    // Unified graph colors based on theme
+    GraphPalette pal = getGraphPalette(theme);
+    COLORREF gridColor = pal.grid;
+    COLORREF axisColor = pal.axis;
+    COLORREF textColor = pal.text;
+    COLORREF curveColor = pal.curve;
 
     // 3. Grid lines & numeric ticks
     double xStep = chooseStep(state.maxX - state.minX, 8);

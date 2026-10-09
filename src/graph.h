@@ -31,7 +31,7 @@ struct GraphAnalysis {
     bool isValid = false;
     std::string title;
     std::string description;
-    // Shared cloned rows for thread-safe/reentrant evaluation
+    // Cloned AST rows isolated from active editor state for reentrant evaluation
     std::unique_ptr<Row> leftRow;
     std::unique_ptr<Row> rightRow;
     EvaluationContext baseContext;
@@ -40,6 +40,21 @@ struct GraphAnalysis {
     double evalExplicitX(double y) const;
     double evalImplicit(double x, double y) const;
 };
+
+struct GraphPalette {
+    COLORREF bg;
+    COLORREF grid;
+    COLORREF axis;
+    COLORREF text;
+    COLORREF curve;
+};
+
+// Returns unified palette matching the active theme for both CPU and GPU render paths.
+GraphPalette getGraphPalette(const Theme& theme);
+
+// Shared numeric formatting and step-size calculation for coordinate grids.
+double chooseStep(double range, int targetDivisions);
+std::string formatNumberShort(double v);
 
 // Analyzes a row (e.g. from current Expression or history) to determine
 // if it is a graph-valid equation or expression.

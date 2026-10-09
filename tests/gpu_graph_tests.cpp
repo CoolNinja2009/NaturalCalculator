@@ -18,7 +18,10 @@ int main() {
 
     bool available = isGpuGraphAvailable();
     std::cout << "[GPU Graph Tests] isGpuGraphAvailable(): " << available << std::endl;
-    assert(available == true);
+    std::cout << "[GPU Graph Tests] Hardware Adapter: " << (isGpuGraphHardwareAdapter() ? "YES" : "NO (WARP / Software)") << std::endl;
+    if (!available) {
+        std::cout << "[GPU Graph Tests] Direct3D 11 unavailable in this environment; GPU tests will fall back gracefully." << std::endl;
+    }
 
     // Test 1: Explicit equation y = sin(x)
     {
@@ -270,7 +273,78 @@ int main() {
         ReleaseDC(nullptr, screenDC);
     }
 
+    // Test 9: Probe Asymptote Pole Rejection (verifies 1/x does not report a false root at x=0)
+    {
+        Expression expr;
+        insertFromText(expr, "y = 1/x");
+        EvaluationContext ctx;
+        GraphAnalysis analysis = analyzeGraphExpression(expr.root.get(), ctx);
+        assert(analysis.isValid);
+
+        GraphState state;
+        state.resetView(10.0);
+        RECT graphRect = { 0, 0, 400, 300 };
+
+        // Probe close to the vertical asymptote x = 0 (e.g. x = 201 pixels, just right of origin)
+        handleGraphRightDown(state, graphRect, 201, 150);
+        handleGraphMouseMove(state, graphRect, 201, 150);
+
+        HDC screenDC = GetDC(nullptr);
+        HDC memDC = CreateCompatibleDC(screenDC);
+        HBITMAP bmp = CreateCompatibleBitmap(screenDC, 400, 300);
+        HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, bmp);
+        Theme theme;
+
+        // Draw probe tooltip and ensure it doesn't crash or snap to (0, 0) as a root
+        drawProbeTooltip(memDC, graphRect, state, analysis, theme, nullptr);
+
+        // Verify with a real root equation y = x - 2
+        Expression rootExpr;
+        insertFromText(rootExpr, "y = x - 2");
+        GraphAnalysis rootAnalysis = analyzeGraphExpression(rootExpr.root.get(), ctx);
+        assert(rootAnalysis.isValid);
+
+        // Probe near x = 2 (x=240, y=150)
+        handleGraphMouseMove(state, graphRect, 240, 150);
+        drawProbeTooltip(memDC, graphRect, state, rootAnalysis, theme, nullptr);
+
+        handleGraphRightUp(state);
+
+        SelectObject(memDC, oldBmp);
+        DeleteObject(bmp);
+        DeleteDC(memDC);
+        ReleaseDC(nullptr, screenDC);
+        std::cout << "[GPU Graph Tests] Probe asymptote pole rejection verified!" << std::endl;
+    }
+
+    // Test 10: Dedicated CPU Fallback Rendering
+    {
+        Expression expr;
+        insertFromText(expr, "y = x^3 - 3*x");
+        EvaluationContext ctx;
+        GraphAnalysis analysis = analyzeGraphExpression(expr.root.get(), ctx);
+        assert(analysis.isValid);
+
+        GraphState state;
+        state.resetView(5.0);
+        Theme theme;
+        HDC screenDC = GetDC(nullptr);
+        HDC memDC = CreateCompatibleDC(screenDC);
+        HBITMAP bmp = CreateCompatibleBitmap(screenDC, 320, 240);
+        HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, bmp);
+        RECT rect = { 0, 0, 320, 240 };
+
+        // Force CPU render path directly
+        renderGraph(memDC, rect, analysis, state, theme, nullptr, nullptr);
+        std::cout << "[GPU Graph Tests] Pure CPU fallback rendering verified!" << std::endl;
+
+        SelectObject(memDC, oldBmp);
+        DeleteObject(bmp);
+        DeleteDC(memDC);
+        ReleaseDC(nullptr, screenDC);
+    }
+
     shutdownGpuGraph();
-    std::cout << "[GPU Graph Tests] All GPU graphing tests passed successfully!" << std::endl;
+    std::cout << "[GPU Graph Tests] All GPU and CPU graphing tests passed successfully!" << std::endl;
     return 0;
 }

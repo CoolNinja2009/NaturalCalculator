@@ -1632,15 +1632,6 @@ void insertFromText(Expression& expr, const std::string& text) {
             } else if (isSqrt) {
                 insertSqrt(expr);
                 if (i + fnLen < text.size() && text[i + fnLen] == '(') fnLen++;
-            } else if (functionId == SciSum) {
-                insertSummation(expr);
-                if (i + fnLen < text.size() && text[i + fnLen] == '(') fnLen++;
-            } else if (functionId == SciProduct) {
-                insertProduct(expr);
-                if (i + fnLen < text.size() && text[i + fnLen] == '(') fnLen++;
-            } else if (functionId == SciIntegrate) {
-                insertIntegral(expr);
-                if (i + fnLen < text.size() && text[i + fnLen] == '(') fnLen++;
             } else {
                 insertFunction(expr, functionId);
                 if (i + fnLen < text.size() && text[i + fnLen] == '(') fnLen++;
