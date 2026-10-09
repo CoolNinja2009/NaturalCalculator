@@ -23,16 +23,16 @@ No Electron. No .NET. No WebView2. No external runtime dependencies. Instant lau
   - Solves linear equations with complex numbers and real variables $x$ and $y$ natively (e.g., $2xi + 5y = -6 - 24i$ or $-6 + 24i = 3x + 5yi + i(5x - 3y)$).
   - Dynamically extracts real and imaginary parts using complex multi-point sampling and solves the resulting system using Cramer's rule.
 - **Calculus, Matrix & Set Theory ("Calc Pro Max")**:
-  - **Calculus**: Integrals ($\int$), derivatives ($d/dx$ with evaluation bars $|_x=a$), limits ($\lim$), summations ($\sum$), products ($\prod$).
-  - **Linear Algebra**: Matrix dimensions, determinants, inverses, transpositions, traces, and scalar arithmetic.
+  - **Structural Calculus Layout**: Integrals ($\int$), derivatives ($d/dx$ with evaluation bars $|_x=a$), summations ($\sum$), and products ($\prod$) are rendered as fully **vertical 2D structural blocks**. Arrow keys dynamically navigate into upper and lower limits, completely abandoning inline parenthesis functions.
+  - **Linear Algebra**: Matrix dimensions, determinants, inverses, transpositions, traces, cross/dot products, RREF, and scalar arithmetic.
   - **Set Theory**: Unions ($\cup$), intersections ($\cap$), symmetric differences ($\Delta$), and Cartesian products.
   - **Combinatorics & Stats**: $^nP_r$, $^nC_r$, mean, variance, and standard deviation.
   - **Special Functions**: Bessel functions ($J_0, J_1, Y_0, Y_1$), Lambert $W$, and asymptotic gamma.
   - **Astronomic Log-Space Arithmetic**: Pro Mode handles factorials and powers beyond double precision (e.g. $10000000000!$ or $2^{10000000000}$) formatted in scientific notation ($m \times 10^e$) without overflow errors.
-- **Fast Startup & Minimal Resource Footprint**:
+- **Fast Startup & Native UI Optimization**:
   - Direct Win32 API (`CreateWindowExW`, GDI, Direct3D 11).
   - Sub-millisecond cold start with minimal memory footprint (~20-30 MB RAM with D3D11 device active).
-  - Handcrafted dark/light theme options with custom textured keypads and fluid scrolling history.
+  - Immersive "Calc Pro Max" visual styling with hardware-accelerated **Magma and Hell Brick textures**, completely jitter-free window resizing, and a 60 FPS animated **Hellcat Pet** embedded directly into the native Win32 message loop without stalling math execution.
 
 ---
 
