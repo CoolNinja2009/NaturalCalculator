@@ -23,10 +23,40 @@ bool Workspace::commitCurrent(const EvaluationContext& context) {
         entry->isError = false;
     } else {
     bool hasEquation = hasEquals(entry->expr->root.get());
+
+    auto hasI = [](const Row* row, auto&& self) -> bool {
+        if (!row) return false;
+        for (const auto& item : row->items) {
+            if (item->type == ItemType::Name && item->nameText == "i") return true;
+            if (item->type == ItemType::Variable && item->variableName == 'i') return true;
+            if (self(item->a.get(), self)) return true;
+            if (self(item->b.get(), self)) return true;
+            if (self(item->c.get(), self)) return true;
+            if (self(item->d.get(), self)) return true;
+        }
+        return false;
+    };
+    bool containsI = hasI(entry->expr->root.get(), hasI);
+
     QuadraticResult quadratic;
     char variable = 0;
     double value = 0.0;
     std::string message;
+
+    if (hasEquation && containsI) {
+        double x_val = 0.0, y_val = 0.0;
+        if (solveComplexEquation(entry->expr->root.get(), x_val, y_val, message)) {
+            char result[128];
+            std::snprintf(result, sizeof(result), "x = %.10g, y = %.10g (Complex)", x_val, y_val);
+            entry->result = result;
+            entry->isError = false;
+            solvedValues_.x = x_val;
+            solvedValues_.y = y_val;
+        } else {
+            entry->result = message;
+            entry->isError = false;
+        }
+    } else {
     bool isQuadratic = solveQuadraticEquation(entry->expr->root.get(), quadratic, message);
     if (hasEquation || isQuadratic) {
         if (isQuadratic) {
@@ -101,6 +131,7 @@ bool Workspace::commitCurrent(const EvaluationContext& context) {
             entry->result = e.what();
             entry->isError = true;
         }
+    }
     }
     }
 

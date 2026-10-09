@@ -1900,7 +1900,10 @@ void paint(HDC hdc, RECT client) {
             stateHash ^= hashDouble(g.graphState.minY) + 0x9e3779b9 + (stateHash << 6) + (stateHash >> 2);
             stateHash ^= hashDouble(g.graphState.maxY) + 0x9e3779b9 + (stateHash << 6) + (stateHash >> 2);
             stateHash ^= ((uint64_t)g.graphState.hoverPos.x << 32) | (uint32_t)g.graphState.hoverPos.y;
-            stateHash ^= (uint64_t)(g.degrees ? 1 : 0) | ((uint64_t)(g.graphState.isHovering ? 1 : 0) << 1);
+            stateHash ^= ((uint64_t)g.graphState.probePos.x << 32) | (uint32_t)g.graphState.probePos.y;
+            stateHash ^= (uint64_t)(g.degrees ? 1 : 0) |
+                         ((uint64_t)(g.graphState.isHovering ? 1 : 0) << 1) |
+                         ((uint64_t)(g.graphState.isRightProbing ? 1 : 0) << 2);
 
             bool needGraphRender = !g.graphCacheValid ||
                                    g.graphCacheW != gw ||
@@ -2118,7 +2121,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (handleGraphMouseMove(g.graphState, g.graphRect, (int)point.x, (int)point.y)) {
                     invalidateGraphCache();
                     InvalidateRect(hwnd, &g.graphRect, FALSE);
-                    if (g.graphState.isDragging) return 0;
+                    if (g.graphState.isDragging || g.graphState.isRightProbing) return 0;
                 }
             }
             if (g.editorSelecting) {
@@ -2166,6 +2169,44 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 return 0;
             }
             break;
+
+        case WM_RBUTTONDOWN: {
+            POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            if (g.proMode && PtInRect(&g.graphRect, pt)) {
+                if (handleGraphRightDown(g.graphState, g.graphRect, (int)pt.x, (int)pt.y)) {
+                    invalidateGraphCache();
+                    SetCapture(hwnd);
+                    InvalidateRect(hwnd, &g.graphRect, FALSE);
+                    return 0;
+                }
+            }
+            break;
+        }
+
+        case WM_RBUTTONUP: {
+            if (g.proMode && g.graphState.isRightProbing) {
+                handleGraphRightUp(g.graphState);
+                invalidateGraphCache();
+                ReleaseCapture();
+                InvalidateRect(hwnd, &g.graphRect, FALSE);
+                return 0;
+            }
+            break;
+        }
+
+        case WM_CANCELMODE:
+        case WM_CAPTURECHANGED: {
+            if (g.petDragging) g.petDragging = false;
+            if (g.editorSelecting) g.editorSelecting = false;
+            if (g.outputSelecting) g.outputSelecting = false;
+            if (g.proMode) {
+                if (g.graphState.isDragging) handleGraphMouseUp(g.graphState);
+                if (g.graphState.isRightProbing) handleGraphRightUp(g.graphState);
+                invalidateGraphCache();
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+            break;
+        }
 
         case WM_MOUSEWHEEL: {
             int delta = GET_WHEEL_DELTA_WPARAM(wParam);

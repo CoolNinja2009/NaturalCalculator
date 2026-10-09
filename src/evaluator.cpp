@@ -8,6 +8,7 @@
 #include <vector>
 #include <numeric>
 #include <functional>
+#include <complex>
 
 bool MathSet::contains(const std::string& s) const {
     return std::find(elements.begin(), elements.end(), s) != elements.end();
@@ -3062,4 +3063,182 @@ bool isProModeTrigger(const Row* expression) {
            items[2]->type == ItemType::Operator && items[2]->opChar == '-' &&
            items[3]->type == ItemType::Number && items[3]->numText == "1999" &&
            items[4]->type == ItemType::Operator && items[4]->opChar == '!';
+}
+
+namespace {
+struct ComplexEvaluator {
+    const std::vector<std::unique_ptr<Item>>& items;
+    std::complex<double> x_val, y_val;
+    size_t pos = 0;
+    size_t end = 0;
+
+    ComplexEvaluator(const Row* row, std::complex<double> x, std::complex<double> y, size_t begin, size_t finish) 
+      : items(row->items), x_val(x), y_val(y), pos(begin), end(finish) {}
+
+    bool atEnd() const { return pos >= end; }
+    const Item* peek() const { return atEnd() ? nullptr : items[pos].get(); }
+
+    bool peekIsOperatorChar(char c) const {
+        const Item* it = peek();
+        return it && it->type == ItemType::Operator && it->opChar == c;
+    }
+
+    std::complex<double> parseRowValue() {
+        if (atEnd()) return {0, 0};
+        auto val = parseTerm();
+        while (!atEnd()) {
+            if (peekIsOperatorChar('+')) {
+                pos++;
+                val += parseTerm();
+            } else if (peekIsOperatorChar('-')) {
+                pos++;
+                val -= parseTerm();
+            } else {
+                break;
+            }
+        }
+        return val;
+    }
+
+    std::complex<double> parseTerm() {
+        auto val = parseFactor();
+        while (!atEnd()) {
+            if (peekIsOperatorChar('*')) {
+                pos++;
+                val *= parseFactor();
+            } else if (peekIsOperatorChar('%')) {
+                throw std::runtime_error("Modulo not supported in complex equation");
+            } else if (peek() && peek()->type != ItemType::Operator && peek()->type != ItemType::Equals) {
+                val *= parseFactor();
+            } else {
+                break;
+            }
+        }
+        return val;
+    }
+
+    std::complex<double> parseFactor() {
+        bool neg = false;
+        while (peekIsOperatorChar('-') || peekIsOperatorChar('+')) {
+            if (peekIsOperatorChar('-')) neg = !neg;
+            pos++;
+        }
+        auto val = parseAtom();
+        if (neg) val = -val;
+        return val;
+    }
+
+    std::complex<double> parseAtom() {
+        const Item* it = peek();
+        if (!it) throw std::runtime_error("Unexpected end of expression");
+        pos++;
+        if (it->type == ItemType::Number) {
+            return {std::stod(it->numText), 0.0};
+        } else if (it->type == ItemType::Variable) {
+            if (it->variableName == 'x') return x_val;
+            if (it->variableName == 'y') return y_val;
+            if (it->variableName == 'i') return {0.0, 1.0};
+            throw std::runtime_error(std::string("Unknown variable: ") + it->variableName);
+        } else if (it->type == ItemType::Name) {
+            if (it->nameText == "i") return {0.0, 1.0};
+            throw std::runtime_error("Unknown name: " + it->nameText);
+        } else if (it->type == ItemType::Paren) {
+            ComplexEvaluator sub(it->a.get(), x_val, y_val, 0, it->a->items.size());
+            return sub.parseRowValue();
+        } else if (it->type == ItemType::Fraction) {
+            ComplexEvaluator num(it->a.get(), x_val, y_val, 0, it->a->items.size());
+            ComplexEvaluator den(it->b.get(), x_val, y_val, 0, it->b->items.size());
+            return num.parseRowValue() / den.parseRowValue();
+        } else if (it->type == ItemType::Power) {
+            ComplexEvaluator base(it->a.get(), x_val, y_val, 0, it->a->items.size());
+            ComplexEvaluator exp(it->b.get(), x_val, y_val, 0, it->b->items.size());
+            return std::pow(base.parseRowValue(), exp.parseRowValue());
+        } else if (it->type == ItemType::Sqrt) {
+            ComplexEvaluator rad(it->a.get(), x_val, y_val, 0, it->a->items.size());
+            return std::sqrt(rad.parseRowValue());
+        } else if (it->type == ItemType::Constant) {
+            if (it->constantName == 'p') return {3.14159265358979323846, 0};
+            if (it->constantName == 'e') return {2.71828182845904523536, 0};
+            if (it->constantName == 'f') return {1.61803398874989484820, 0};
+            throw std::runtime_error("Unknown constant");
+        } else if (it->type == ItemType::CloseParen) {
+            throw std::runtime_error("Unexpected closing parenthesis");
+        }
+        throw std::runtime_error("Unsupported item type in complex equation");
+    }
+};
+} // namespace
+
+bool solveComplexEquation(const Row* equation, double& x, double& y, std::string& message) {
+    if (!equation) return false;
+    size_t equals = equation->items.size();
+    for (size_t i = 0; i < equation->items.size(); ++i) {
+        if (equation->items[i]->type == ItemType::Equals) {
+            if (equals != equation->items.size()) {
+                message = "Error: Multiple '=' found.";
+                return false;
+            }
+            equals = i;
+        }
+    }
+    if (equals == equation->items.size() || equals == 0 || equals + 1 >= equation->items.size()) {
+        message = "Error: Invalid equation format.";
+        return false;
+    }
+
+    bool has_other_vars = false;
+    auto checkVars = [&](const Row* row, auto&& self) -> void {
+        if (!row) return;
+        for (const auto& item : row->items) {
+            if (item->type == ItemType::Variable) {
+                if (item->variableName != 'x' && item->variableName != 'y' && item->variableName != 'i') {
+                    has_other_vars = true;
+                }
+            } else if (item->type == ItemType::Name) {
+                if (item->nameText != "i") {
+                    has_other_vars = true;
+                }
+            }
+            self(item->a.get(), self);
+            self(item->b.get(), self);
+            self(item->c.get(), self);
+            self(item->d.get(), self);
+        }
+    };
+    checkVars(equation, checkVars);
+    if (has_other_vars) {
+        message = "Equation must only contain x, y, and i";
+        return false;
+    }
+
+    auto evalFor = [&](std::complex<double> xv, std::complex<double> yv) -> std::complex<double> {
+        ComplexEvaluator left(equation, xv, yv, 0, equals);
+        ComplexEvaluator right(equation, xv, yv, equals + 1, equation->items.size());
+        return left.parseRowValue() - right.parseRowValue();
+    };
+
+    try {
+        std::complex<double> C = evalFor({0,0}, {0,0});
+        std::complex<double> Ax_plus_C = evalFor({1,0}, {0,0});
+        std::complex<double> By_plus_C = evalFor({0,0}, {1,0});
+        
+        std::complex<double> A = Ax_plus_C - C;
+        std::complex<double> B = By_plus_C - C;
+
+        double a11 = A.real(), a12 = B.real(), b1 = -C.real();
+        double a21 = A.imag(), a22 = B.imag(), b2 = -C.imag();
+        
+        double det = a11 * a22 - a12 * a21;
+        if (std::abs(det) < 1e-12) {
+            message = "Error: System is singular (cannot find unique x, y).";
+            return false;
+        }
+        
+        x = (b1 * a22 - a12 * b2) / det;
+        y = (a11 * b2 - b1 * a21) / det;
+        return true;
+    } catch (const std::exception& e) {
+        message = e.what();
+        return false;
+    }
 }

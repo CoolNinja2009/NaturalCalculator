@@ -501,7 +501,7 @@ void insertDigit(Expression& expr, char digit) {
 }
 
 void insertVariable(Expression& expr, char name) {
-    if (name != 'x' && name != 'y') return;
+    if (name != 'x' && name != 'y' && name != 'i') return;
     Row* row = expr.cursor.row;
     int idx = expr.cursor.index;
     auto item = std::make_unique<Item>(ItemType::Variable);
@@ -1281,6 +1281,9 @@ static bool normalizeRowNames(Expression& expr, Row* row) {
         } else if (lower == "y") {
             it->type = ItemType::Variable; it->variableName = 'y'; it->nameText.clear();
             changed = true;
+        } else if (lower == "i") {
+            it->type = ItemType::Variable; it->variableName = 'i'; it->nameText.clear();
+            changed = true;
         } else if (lower == "union") {
             it->type = ItemType::Operator; it->opChar = 'U'; it->nameText.clear();
             changed = true;
@@ -1569,7 +1572,7 @@ void insertFromText(Expression& expr, const std::string& text) {
         }
 
         char lc = lowerChar(c);
-        if (lc == 'x' || lc == 'y') {
+        if (lc == 'x' || lc == 'y' || lc == 'i') {
             insertVariable(expr, lc);
             ++i;
             continue;

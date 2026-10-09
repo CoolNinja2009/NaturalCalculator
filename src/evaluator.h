@@ -138,6 +138,8 @@ QuadraticResult solveQuadratic(double a, double b, double c);
 bool solveTwoVariableSystem(const Row* first, const Row* second,
 							double& x, double& y, std::string& message);
 
+bool solveComplexEquation(const Row* equation, double& x, double& y, std::string& message);
+
 bool solveSingleVariableEquation(const Row* equation, char& variable,
 								 double& value, std::string& message);
 

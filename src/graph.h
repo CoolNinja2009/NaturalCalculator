@@ -22,6 +22,7 @@
 enum class GraphEquationKind {
     None,
     ExplicitY,    // y = f(x) or bare expression in x
+    ExplicitX,    // x = f(y) e.g. x = y^2
     ImplicitXY    // F(x, y) = G(x, y) e.g. x^2 + y^2 = 25
 };
 
@@ -36,6 +37,7 @@ struct GraphAnalysis {
     EvaluationContext baseContext;
 
     double evalExplicit(double x) const;
+    double evalExplicitX(double y) const;
     double evalImplicit(double x, double y) const;
 };
 
@@ -58,6 +60,12 @@ struct GraphState {
     double hoverMathX = 0.0;
     double hoverMathY = 0.0;
 
+    // Right-click probe state
+    bool isRightProbing = false;
+    POINT probePos{ 0, 0 };
+    double probeMathX = 0.0;
+    double probeMathY = 0.0;
+
     void resetView(double range = 10.0);
     void zoom(double factor, double centerMathX, double centerMathY);
     void pan(double dxPixels, double dyPixels, int pixelWidth, int pixelHeight);
@@ -70,8 +78,14 @@ struct GraphState {
 void renderGraph(HDC hdc, const RECT& graphRect, const GraphAnalysis& analysis,
                  GraphState& state, const Theme& theme, HFONT font, HFONT smallFont);
 
+// Draw floating tooltip beside probed coordinate
+void drawProbeTooltip(HDC hdc, const RECT& localRect, const GraphState& state,
+                      const GraphAnalysis& analysis, const Theme& theme, HFONT font);
+
 // Mouse interaction handlers
 bool handleGraphMouseDown(GraphState& state, const RECT& graphRect, int x, int y);
 bool handleGraphMouseMove(GraphState& state, const RECT& graphRect, int x, int y);
 bool handleGraphMouseUp(GraphState& state);
 bool handleGraphMouseWheel(GraphState& state, const RECT& graphRect, int x, int y, short delta);
+bool handleGraphRightDown(GraphState& state, const RECT& graphRect, int x, int y);
+bool handleGraphRightUp(GraphState& state);

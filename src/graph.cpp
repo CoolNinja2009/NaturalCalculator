@@ -6,8 +6,10 @@
 // and hover coordinates.
 
 #include "graph.h"
+#include "gpu_graph.h"
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <algorithm>
 #include <sstream>
 #include <iomanip>
@@ -24,6 +26,28 @@ std::unique_ptr<Row> cloneRowSlice(const Row* sourceRow, size_t start, size_t en
     Expression expr;
     insertFromText(expr, text);
     return std::move(expr.root);
+}
+
+int countVarInItem(const Item* it, char v);
+
+int countVar(const Row* r, char v) {
+    if (!r) return 0;
+    int count = 0;
+    for (const auto& it : r->items) {
+        count += countVarInItem(it.get(), v);
+    }
+    return count;
+}
+
+int countVarInItem(const Item* it, char v) {
+    if (!it) return 0;
+    int count = 0;
+    if (it->type == ItemType::Variable && it->variableName == v) count++;
+    if (it->a) count += countVar(it->a.get(), v);
+    if (it->b) count += countVar(it->b.get(), v);
+    if (it->c) count += countVar(it->c.get(), v);
+    if (it->d) count += countVar(it->d.get(), v);
+    return count;
 }
 
 void collectVars(const Row* row, bool& hasX, bool& hasY) {
@@ -87,6 +111,18 @@ double GraphAnalysis::evalExplicit(double x) const {
     return NAN;
 }
 
+double GraphAnalysis::evalExplicitX(double y) const {
+    if (!isValid) return NAN;
+    EvaluationContext ctx = baseContext;
+    ctx.degrees = false; // Cartesian mathematical graphing always operates in radians
+    ctx.y = y;
+    try {
+        if (rightRow) return evaluate(rightRow.get(), ctx);
+        if (leftRow) return evaluate(leftRow.get(), ctx);
+    } catch (...) {}
+    return NAN;
+}
+
 double GraphAnalysis::evalImplicit(double x, double y) const {
     if (!isValid) return NAN;
     EvaluationContext ctx = baseContext;
@@ -106,6 +142,22 @@ GraphAnalysis analyzeGraphExpression(const Row* root, const EvaluationContext& c
     result.baseContext = context;
     if (!root || root->items.empty()) return result;
 
+    // Reject complex equations from the grapher to avoid artifacts
+    bool hasI = false;
+    auto checkI = [&](const Row* r, auto&& self) -> void {
+        if (!r) return;
+        for (const auto& it : r->items) {
+            if (it->type == ItemType::Variable && it->variableName == 'i') hasI = true;
+            if (it->type == ItemType::Name && it->nameText == "i") hasI = true;
+            if (it->a) self(it->a.get(), self);
+            if (it->b) self(it->b.get(), self);
+            if (it->c) self(it->c.get(), self);
+            if (it->d) self(it->d.get(), self);
+        }
+    };
+    checkI(root, checkI);
+    if (hasI) return result;
+
     // Check for equals
     size_t equalsPos = root->items.size();
     size_t equalsCount = 0;
@@ -124,38 +176,59 @@ GraphAnalysis analyzeGraphExpression(const Row* root, const EvaluationContext& c
         result.leftRow = cloneRowSlice(root, 0, equalsPos);
         result.rightRow = cloneRowSlice(root, equalsPos + 1, root->items.size());
 
+        std::string rawTitle = serializeRow(root);
+
         bool lx = false, ly = false, rx = false, ry = false;
         collectVars(result.leftRow.get(), lx, ly);
         collectVars(result.rightRow.get(), rx, ry);
 
-        bool leftIsOnlyY = (result.leftRow->items.size() == 1 &&
-                            result.leftRow->items[0]->type == ItemType::Variable &&
-                            result.leftRow->items[0]->variableName == 'y');
-        bool rightIsOnlyY = (result.rightRow->items.size() == 1 &&
-                             result.rightRow->items[0]->type == ItemType::Variable &&
-                             result.rightRow->items[0]->variableName == 'y');
-
-        if (leftIsOnlyY && !ry) {
-            // y = f(x)
+        // Case 1: left side is a lone 'y', and right side has no 'y' -> ExplicitY
+        if (result.leftRow->items.size() == 1 &&
+            result.leftRow->items[0]->type == ItemType::Variable &&
+            result.leftRow->items[0]->variableName == 'y' && !ry) {
             result.kind = GraphEquationKind::ExplicitY;
             result.isValid = true;
-            result.title = "y = " + serializeRow(result.rightRow.get());
+            result.title = rawTitle;
             return result;
         }
-        if (rightIsOnlyY && !ly) {
-            // f(x) = y -> swap left and right so rightRow is f(x)
-            result.kind = GraphEquationKind::ExplicitY;
-            result.isValid = true;
+
+        // Case 2: right side is a lone 'y', and left side has no 'y' -> ExplicitY
+        if (result.rightRow->items.size() == 1 &&
+            result.rightRow->items[0]->type == ItemType::Variable &&
+            result.rightRow->items[0]->variableName == 'y' && !ly) {
             std::swap(result.leftRow, result.rightRow);
-            result.title = "y = " + serializeRow(result.rightRow.get());
+            result.kind = GraphEquationKind::ExplicitY;
+            result.isValid = true;
+            result.title = rawTitle;
             return result;
         }
 
-        // Implicit equation with x and/or y
+        // Case 3: left side is a lone 'x', and right side has no 'x' -> ExplicitX
+        if (result.leftRow->items.size() == 1 &&
+            result.leftRow->items[0]->type == ItemType::Variable &&
+            result.leftRow->items[0]->variableName == 'x' && !rx) {
+            result.kind = GraphEquationKind::ExplicitX;
+            result.isValid = true;
+            result.title = rawTitle;
+            return result;
+        }
+
+        // Case 4: right side is a lone 'x', and left side has no 'x' -> ExplicitX
+        if (result.rightRow->items.size() == 1 &&
+            result.rightRow->items[0]->type == ItemType::Variable &&
+            result.rightRow->items[0]->variableName == 'x' && !lx) {
+            std::swap(result.leftRow, result.rightRow);
+            result.kind = GraphEquationKind::ExplicitX;
+            result.isValid = true;
+            result.title = rawTitle;
+            return result;
+        }
+
+        // Case 5: General implicit equation F(x, y) = G(x, y) (e.g. x + y = tan(x), 3x + y = 2, x^2 + y^2 = 25)
         if (lx || ly || rx || ry) {
             result.kind = GraphEquationKind::ImplicitXY;
             result.isValid = true;
-            result.title = serializeRow(result.leftRow.get()) + " = " + serializeRow(result.rightRow.get());
+            result.title = rawTitle;
             return result;
         }
         return result;
@@ -171,6 +244,15 @@ GraphAnalysis analyzeGraphExpression(const Row* root, const EvaluationContext& c
         result.isValid = true;
         result.rightRow = cloneRowSlice(root, 0, root->items.size());
         result.title = "y = " + serializeRow(result.rightRow.get());
+        return result;
+    }
+
+    if (!hasX && hasY) {
+        // Single expression in y: interpreted as x = f(y)
+        result.kind = GraphEquationKind::ExplicitX;
+        result.isValid = true;
+        result.rightRow = cloneRowSlice(root, 0, root->items.size());
+        result.title = "x = " + serializeRow(result.rightRow.get());
         return result;
     }
 
@@ -265,6 +347,13 @@ bool handleGraphMouseDown(GraphState& state, const RECT& graphRect, int x, int y
 
 bool handleGraphMouseMove(GraphState& state, const RECT& graphRect, int x, int y) {
     POINT pt = { x, y };
+    if (state.isRightProbing) {
+        state.probePos = { std::clamp(x - (int)graphRect.left, 0, (int)(graphRect.right - graphRect.left)),
+                           std::clamp(y - (int)graphRect.top, 0, (int)(graphRect.bottom - graphRect.top)) };
+        RECT localRect = { 0, 0, graphRect.right - graphRect.left, graphRect.bottom - graphRect.top };
+        state.pixelToMath(state.probePos.x, state.probePos.y, localRect, state.probeMathX, state.probeMathY);
+        return true;
+    }
     if (state.isDragging) {
         int dx = x - state.lastMousePos.x;
         int dy = y - state.lastMousePos.y;
@@ -274,8 +363,9 @@ bool handleGraphMouseMove(GraphState& state, const RECT& graphRect, int x, int y
     }
     if (PtInRect(&graphRect, pt)) {
         state.isHovering = true;
-        state.hoverPos = pt;
-        state.pixelToMath(x, y, graphRect, state.hoverMathX, state.hoverMathY);
+        state.hoverPos = { x - graphRect.left, y - graphRect.top };
+        RECT localRect = { 0, 0, graphRect.right - graphRect.left, graphRect.bottom - graphRect.top };
+        state.pixelToMath(state.hoverPos.x, state.hoverPos.y, localRect, state.hoverMathX, state.hoverMathY);
         return true;
     }
     if (state.isHovering) {
@@ -293,6 +383,25 @@ bool handleGraphMouseUp(GraphState& state) {
     return false;
 }
 
+bool handleGraphRightDown(GraphState& state, const RECT& graphRect, int x, int y) {
+    POINT pt = { x, y };
+    if (!PtInRect(&graphRect, pt)) return false;
+    state.isRightProbing = true;
+    state.probePos = { std::clamp(x - (int)graphRect.left, 0, (int)(graphRect.right - graphRect.left)),
+                       std::clamp(y - (int)graphRect.top, 0, (int)(graphRect.bottom - graphRect.top)) };
+    RECT localRect = { 0, 0, graphRect.right - graphRect.left, graphRect.bottom - graphRect.top };
+    state.pixelToMath(state.probePos.x, state.probePos.y, localRect, state.probeMathX, state.probeMathY);
+    return true;
+}
+
+bool handleGraphRightUp(GraphState& state) {
+    if (state.isRightProbing) {
+        state.isRightProbing = false;
+        return true;
+    }
+    return false;
+}
+
 bool handleGraphMouseWheel(GraphState& state, const RECT& graphRect, int x, int y, short delta) {
     POINT pt = { x, y };
     if (!PtInRect(&graphRect, pt)) return false;
@@ -303,6 +412,214 @@ bool handleGraphMouseWheel(GraphState& state, const RECT& graphRect, int x, int 
     return true;
 }
 
+void drawProbeTooltip(HDC hdc, const RECT& localRect, const GraphState& state,
+                      const GraphAnalysis& analysis, const Theme& theme, HFONT font) {
+    if (!state.isRightProbing) return;
+
+    int w = localRect.right - localRect.left;
+    int h = localRect.bottom - localRect.top;
+    int px = std::clamp((int)state.probePos.x, 0, w);
+    int py = std::clamp((int)state.probePos.y, 0, h);
+
+    // Dotted crosshairs
+    HPEN dotPen = CreatePen(PS_DOT, 1, theme.isDark ? RGB(0x60, 0x68, 0x78) : RGB(0x9E, 0xA8, 0xB6));
+    HPEN oldPen = (HPEN)SelectObject(hdc, dotPen);
+    MoveToEx(hdc, localRect.left, localRect.top + py, nullptr);
+    LineTo(hdc, localRect.left + w, localRect.top + py);
+    MoveToEx(hdc, localRect.left + px, localRect.top, nullptr);
+    LineTo(hdc, localRect.left + px, localRect.top + h);
+    SelectObject(hdc, oldPen);
+    DeleteObject(dotPen);
+
+    double displayX = state.probeMathX;
+    double displayY = state.probeMathY;
+    int targetPx = px;
+    int targetPy = py;
+
+    bool snapped = false;
+    double bestDist = 24.0 * 24.0; // 24px max snapping radius
+
+    auto trySnap = [&](double x, double y) {
+        if (!std::isfinite(x) || !std::isfinite(y)) return;
+        POINT cpt = state.mathToPixel(x, y, localRect);
+        double dx = cpt.x - px;
+        double dy = cpt.y - py;
+        double dist = dx * dx + dy * dy;
+        if (dist < bestDist) {
+            bestDist = dist;
+            displayX = x;
+            displayY = y;
+            targetPx = cpt.x;
+            targetPy = cpt.y;
+            snapped = true;
+        }
+    };
+
+    if (GetAsyncKeyState(VK_SHIFT) & 0x8000) {
+        // Integer grid snapping
+        trySnap(std::round(state.probeMathX), std::round(state.probeMathY));
+    } else if (analysis.isValid) {
+        if (analysis.kind == GraphEquationKind::ExplicitY) {
+            // Base curve snapping
+            double curveY = analysis.evalExplicit(state.probeMathX);
+            trySnap(state.probeMathX, curveY);
+            
+            // Advanced POIs (Roots, Y-Intercept, Extrema)
+            double sr = 30.0 * (state.maxX - state.minX) / w;
+            int steps = 40;
+            double dx = (sr * 2.0) / steps;
+            double startX = state.probeMathX - sr;
+            
+            double prevY = analysis.evalExplicit(startX);
+            double prevDy = 0.0;
+            for (int i = 1; i <= steps; i++) {
+                double currX = startX + i * dx;
+                double currY = analysis.evalExplicit(currX);
+                
+                // Root (X-Intercept)
+                if (prevY * currY <= 0.0 && prevY != currY) {
+                    double rootX = startX + (i - 1) * dx - prevY * dx / (currY - prevY);
+                    trySnap(rootX, 0.0);
+                }
+                
+                // Y-Intercept
+                if ((startX + (i - 1) * dx) <= 0.0 && currX >= 0.0) {
+                    trySnap(0.0, analysis.evalExplicit(0.0));
+                }
+                
+                // Extremum (Minima/Maxima)
+                if (i > 1) {
+                    double currDy = currY - prevY;
+                    if (prevDy * currDy <= 0.0) {
+                        double extX = currX - dx;
+                        trySnap(extX, analysis.evalExplicit(extX));
+                    }
+                    prevDy = currDy;
+                }
+                prevY = currY;
+            }
+        } else if (analysis.kind == GraphEquationKind::ExplicitX) {
+            // Base curve snapping
+            double curveX = analysis.evalExplicitX(state.probeMathY);
+            trySnap(curveX, state.probeMathY);
+            
+            // Advanced POIs
+            double sr = 30.0 * (state.maxY - state.minY) / h;
+            int steps = 40;
+            double dy_step = (sr * 2.0) / steps;
+            double startY = state.probeMathY - sr;
+            
+            double prevX = analysis.evalExplicitX(startY);
+            double prevDx = 0.0;
+            for (int i = 1; i <= steps; i++) {
+                double currY = startY + i * dy_step;
+                double currX = analysis.evalExplicitX(currY);
+                if (prevX * currX <= 0.0 && prevX != currX) {
+                    double rootY = startY + (i - 1) * dy_step - prevX * dy_step / (currX - prevX);
+                    trySnap(0.0, rootY);
+                }
+                if ((startY + (i - 1) * dy_step) <= 0.0 && currY >= 0.0) {
+                    trySnap(analysis.evalExplicitX(0.0), 0.0);
+                }
+                if (i > 1) {
+                    double currDx = currX - prevX;
+                    if (prevDx * currDx <= 0.0) {
+                        double extY = currY - dy_step;
+                        trySnap(analysis.evalExplicitX(extY), extY);
+                    }
+                    prevDx = currDx;
+                }
+                prevX = currX;
+            }
+        } else if (analysis.kind == GraphEquationKind::ImplicitXY) {
+            // Newton-Raphson closest point
+            double cx = state.probeMathX, cy = state.probeMathY;
+            for (int iter = 0; iter < 8; ++iter) {
+                double f = analysis.evalImplicit(cx, cy);
+                double dfdx = (analysis.evalImplicit(cx + 1e-5, cy) - f) / 1e-5;
+                double dfdy = (analysis.evalImplicit(cx, cy + 1e-5) - f) / 1e-5;
+                double gSq = dfdx*dfdx + dfdy*dfdy;
+                if (gSq < 1e-12) break;
+                cx -= (f * dfdx) / gSq;
+                cy -= (f * dfdy) / gSq;
+            }
+            if (std::abs(analysis.evalImplicit(cx, cy)) < 1e-2) trySnap(cx, cy);
+            
+            // Y-Intercept
+            double yint = state.probeMathY;
+            for (int iter = 0; iter < 8; ++iter) {
+                double f = analysis.evalImplicit(0.0, yint);
+                double dfdy = (analysis.evalImplicit(0.0, yint + 1e-5) - f) / 1e-5;
+                if (std::abs(dfdy) < 1e-12) break;
+                yint -= f / dfdy;
+            }
+            if (std::abs(analysis.evalImplicit(0.0, yint)) < 1e-2) trySnap(0.0, yint);
+            
+            // X-Intercept
+            double xint = state.probeMathX;
+            for (int iter = 0; iter < 8; ++iter) {
+                double f = analysis.evalImplicit(xint, 0.0);
+                double dfdx = (analysis.evalImplicit(xint + 1e-5, 0.0) - f) / 1e-5;
+                if (std::abs(dfdx) < 1e-12) break;
+                xint -= f / dfdx;
+            }
+            if (std::abs(analysis.evalImplicit(xint, 0.0)) < 1e-2) trySnap(xint, 0.0);
+        }
+    }
+
+    // Glowing target marker
+    int markerX = localRect.left + targetPx;
+    int markerY = localRect.top + targetPy;
+    COLORREF markerCol = theme.accent;
+    HBRUSH glowB = CreateSolidBrush(markerCol);
+    HBRUSH oldB = (HBRUSH)SelectObject(hdc, glowB);
+    HPEN ringP = CreatePen(PS_SOLID, 2, RGB(0xFF, 0xFF, 0xFF));
+    HPEN oldP = (HPEN)SelectObject(hdc, ringP);
+    Ellipse(hdc, markerX - 5, markerY - 5, markerX + 6, markerY + 6);
+    SelectObject(hdc, oldP);
+    SelectObject(hdc, oldB);
+    DeleteObject(glowB);
+    DeleteObject(ringP);
+
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "(%s, %s)",
+                  formatNumberShort(displayX).c_str(),
+                  formatNumberShort(displayY).c_str());
+
+    SIZE ts{};
+    HFONT oldFont = (HFONT)SelectObject(hdc, font);
+    GetTextExtentPoint32A(hdc, buf, (int)std::strlen(buf), &ts);
+
+    int padX = 10;
+    int padY = 5;
+    int tipW = ts.cx + padX * 2;
+    int tipH = ts.cy + padY * 2;
+
+    int tipX = markerX + 14;
+    int tipY = markerY - tipH - 8;
+    if (tipX + tipW > localRect.left + w - 10) tipX = markerX - tipW - 14;
+    if (tipY < localRect.top + 40) tipY = markerY + 14;
+    tipX = std::clamp(tipX, (int)localRect.left + 8, std::max((int)localRect.left + 8, (int)localRect.left + w - tipW - 8));
+    tipY = std::clamp(tipY, (int)localRect.top + 40, std::max((int)localRect.top + 40, (int)localRect.top + h - tipH - 8));
+
+    RECT tipRect = { tipX, tipY, tipX + tipW, tipY + tipH };
+
+    HBRUSH tipBg = CreateSolidBrush(theme.isDark ? RGB(0x15, 0x18, 0x22) : RGB(0xFA, 0xFA, 0xFD));
+    HPEN tipBorder = CreatePen(PS_SOLID, 1, theme.accent);
+    HBRUSH otb = (HBRUSH)SelectObject(hdc, tipBg);
+    HPEN otp = (HPEN)SelectObject(hdc, tipBorder);
+    RoundRect(hdc, tipRect.left, tipRect.top, tipRect.right, tipRect.bottom, 6, 6);
+    SelectObject(hdc, otb);
+    SelectObject(hdc, otp);
+    DeleteObject(tipBg);
+    DeleteObject(tipBorder);
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, theme.isDark ? RGB(0xFF, 0xF4, 0xEA) : RGB(0x18, 0x1A, 0x20));
+    DrawTextA(hdc, buf, -1, &tipRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(hdc, oldFont);
+}
+
 void renderGraph(HDC hdc, const RECT& graphRect, const GraphAnalysis& analysis,
                  GraphState& state, const Theme& theme, HFONT font, HFONT smallFont) {
     int w = graphRect.right - graphRect.left;
@@ -311,7 +628,14 @@ void renderGraph(HDC hdc, const RECT& graphRect, const GraphAnalysis& analysis,
 
     if (!state.initialized) state.resetView(10.0);
 
-    // 1. Double buffer memory DC
+    // 0. Primary GPU Rendering Path (Direct3D 11 Hardware Acceleration)
+    if (isGpuGraphAvailable()) {
+        if (renderGraphGpu(hdc, graphRect, analysis, state, theme, font, smallFont, false)) {
+            return;
+        }
+    }
+
+    // 1. Transparent CPU fallback
     HDC mem = CreateCompatibleDC(hdc);
     HBITMAP bmp = CreateCompatibleBitmap(hdc, w, h);
     HBITMAP oldBmp = (HBITMAP)SelectObject(mem, bmp);
@@ -418,7 +742,7 @@ void renderGraph(HDC hdc, const RECT& graphRect, const GraphAnalysis& analysis,
                 }
 
                 POINT pt = state.mathToPixel(mx, my, localRect);
-                int py = pt.y;
+                int py = std::clamp((int)pt.y, -h, 2 * h);
 
                 if (!inSegment) {
                     MoveToEx(mem, px, py, nullptr);
@@ -435,6 +759,39 @@ void renderGraph(HDC hdc, const RECT& graphRect, const GraphAnalysis& analysis,
                 }
                 lastPy = py;
                 lastMathY = my;
+            }
+        } else if (analysis.kind == GraphEquationKind::ExplicitX) {
+            bool inSegment = false;
+            int lastPx = 0;
+            double lastMathX = 0.0;
+
+            for (int py = 0; py < h; ++py) {
+                double dummyMx, my;
+                state.pixelToMath(0, py, localRect, dummyMx, my);
+                double mx = analysis.evalExplicitX(my);
+
+                if (!std::isfinite(mx) || std::isnan(mx)) {
+                    inSegment = false;
+                    continue;
+                }
+
+                POINT pt = state.mathToPixel(mx, my, localRect);
+                int px = std::clamp((int)pt.x, -w, 2 * w);
+
+                if (!inSegment) {
+                    MoveToEx(mem, px, py, nullptr);
+                    inSegment = true;
+                } else {
+                    double mathDiff = std::fabs(mx - lastMathX);
+                    int pixelDiff = std::abs(px - lastPx);
+                    if (pixelDiff > w * 0.75 && mathDiff > (state.maxX - state.minX) * 0.5) {
+                        MoveToEx(mem, px, py, nullptr);
+                    } else {
+                        LineTo(mem, px, py);
+                    }
+                }
+                lastPx = px;
+                lastMathX = mx;
             }
         } else if (analysis.kind == GraphEquationKind::ImplicitXY) {
             // Marching squares 2D contouring with dynamic resolution
@@ -466,6 +823,11 @@ void renderGraph(HDC hdc, const RECT& graphRect, const GraphAnalysis& analysis,
 
                     if (!std::isfinite(tl) || !std::isfinite(tr) ||
                         !std::isfinite(bl) || !std::isfinite(br)) continue;
+
+                    // Reject cells where values jump violently across asymptotes/singularities (e.g. tan(x), 1/x)
+                    double maxV = std::max({std::fabs(tl), std::fabs(tr), std::fabs(bl), std::fabs(br)});
+                    double minV = std::min({std::fabs(tl), std::fabs(tr), std::fabs(bl), std::fabs(br)});
+                    if (maxV > 25.0 && (maxV - minV) > 15.0) continue;
 
                     int mask = 0;
                     if (tl > 0) mask |= 1;
@@ -558,45 +920,10 @@ void renderGraph(HDC hdc, const RECT& graphRect, const GraphAnalysis& analysis,
         drawBtn(bx - 2 * btnW - 48, 44, L"RESET");
     }
 
-    // 7. Hover Tooltip Coordinates
-    if (state.isHovering && analysis.isValid) {
-        int hx = state.hoverPos.x - graphRect.left;
-        int hy = state.hoverPos.y - graphRect.top;
-        if (hx >= 0 && hx < w && hy >= 35 && hy < h) {
-            double curY = analysis.kind == GraphEquationKind::ExplicitY ?
-                          analysis.evalExplicit(state.hoverMathX) : state.hoverMathY;
 
-            POINT trackPt = analysis.kind == GraphEquationKind::ExplicitY && std::isfinite(curY) ?
-                            state.mathToPixel(state.hoverMathX, curY, localRect) : POINT{ hx, hy };
-
-            // Indicator dot
-            HBRUSH dotBrush = CreateSolidBrush(curveColor);
-            HPEN dotPen = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
-            SelectObject(mem, dotBrush);
-            SelectObject(mem, dotPen);
-            Ellipse(mem, trackPt.x - 4, trackPt.y - 4, trackPt.x + 5, trackPt.y + 5);
-            DeleteObject(dotPen);
-            DeleteObject(dotBrush);
-
-            // Coordinate label badge
-            std::string coordStr = "(" + formatNumberShort(state.hoverMathX) + ", " +
-                                   formatNumberShort(std::isfinite(curY) ? curY : state.hoverMathY) + ")";
-            SelectObject(mem, smallFont);
-            SIZE textSize{};
-            GetTextExtentPoint32A(mem, coordStr.c_str(), (int)coordStr.size(), &textSize);
-
-            int badgeX = std::clamp((int)trackPt.x + 8, 4, (int)(w - textSize.cx - 12));
-            int badgeY = std::clamp((int)trackPt.y - 20, 38, (int)(h - textSize.cy - 6));
-            RECT badgeRect = { badgeX, badgeY, badgeX + textSize.cx + 8, badgeY + textSize.cy + 4 };
-
-            HBRUSH badgeBrush = CreateSolidBrush(theme.isDark ? RGB(0x10, 0x12, 0x16) : RGB(0x20, 0x24, 0x2A));
-            FillRect(mem, &badgeRect, badgeBrush);
-            DeleteObject(badgeBrush);
-
-            SetTextColor(mem, RGB(255, 255, 255));
-            RECT textR = { badgeX + 4, badgeY + 2, badgeX + textSize.cx + 4, badgeY + textSize.cy + 2 };
-            DrawTextA(mem, coordStr.c_str(), -1, &textR, DT_LEFT | DT_SINGLELINE);
-        }
+    // 7b. Right-click probe tooltip HUD
+    if (state.isRightProbing) {
+        drawProbeTooltip(mem, localRect, state, analysis, theme, font ? font : smallFont);
     }
 
     // 8. Blit to target DC

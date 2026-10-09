@@ -73,7 +73,7 @@ struct VS_OUTPUT {
 
 VS_OUTPUT VSMain(uint id : SV_VertexID) {
     VS_OUTPUT output;
-    output.uv = float2((id == 1 || id == 2) ? 1.0 : 0.0, (id >= 2) ? 1.0 : 0.0);
+    output.uv = float2((id % 2 == 1) ? 1.0 : 0.0, (id >= 2) ? 1.0 : 0.0);
     output.pos = float4(output.uv.x * 2.0 - 1.0, 1.0 - output.uv.y * 2.0, 0.0, 1.0);
     return output;
 }
@@ -141,15 +141,27 @@ float4 PSMain(VS_OUTPUT input) : SV_Target {
     float axisAlpha = saturate(1.2 - axisLine * 0.7) * uAxisCol.a;
     color = lerp(color, float4(uAxisCol.rgb, 1.0), axisAlpha);
 
-    // Math Curve / Implicit Contour
+    // Math Curve / Implicit Contour with Pole & Asymptote Rejection
     float f = evalF(mathX, mathY);
-    float grad = length(float2(ddx(f), ddy(f)));
-    if (grad > 1e-7 && isfinite(f)) {
+    float df_dx = ddx(f);
+    float df_dy = ddy(f);
+    float grad = length(float2(df_dx, df_dy));
+
+    if (isfinite(f) && grad > 1e-7) {
         float distPix = abs(f) / grad;
-        float core = saturate(1.6 - distPix);
-        float glow = saturate(1.0 - distPix * 0.28) * 0.38;
-        float alpha = saturate(core + glow) * uCurveCol.a;
-        color = lerp(color, float4(uCurveCol.rgb, 1.0), alpha);
+        float f_right = f + df_dx;
+        float f_down  = f + df_dy;
+        float minF = min(f, min(f_right, f_down));
+        float maxF = max(f, max(f_right, f_down));
+        bool signChange = (minF <= 0.0 && maxF >= 0.0);
+        bool isPole = (abs(f) > 25.0 && (abs(df_dx) > 80.0 || abs(df_dy) > 80.0));
+
+        if (distPix <= 2.2 && !isPole && (signChange || abs(f) < 2.0)) {
+            float core = saturate(1.7 - distPix);
+            float glow = saturate(1.0 - distPix * 0.32) * 0.4;
+            float alpha = saturate(core + glow) * uCurveCol.a;
+            color = lerp(color, float4(uCurveCol.rgb, 1.0), alpha);
+        }
     }
 
     return color;
@@ -288,6 +300,12 @@ bool analysisToHLSL(const GraphAnalysis& analysis, std::string& outExpr) {
         const Row* right = analysis.rightRow ? analysis.rightRow.get() : analysis.leftRow.get();
         if (!rowToHLSL(right, rightStr)) return false;
         outExpr = "y - (" + rightStr + ")";
+        return true;
+    } else if (analysis.kind == GraphEquationKind::ExplicitX) {
+        std::string rightStr;
+        const Row* right = analysis.rightRow ? analysis.rightRow.get() : analysis.leftRow.get();
+        if (!rowToHLSL(right, rightStr)) return false;
+        outExpr = "x - (" + rightStr + ")";
         return true;
     } else if (analysis.kind == GraphEquationKind::ImplicitXY) {
         std::string leftStr, rightStr;
@@ -625,16 +643,38 @@ bool renderGraphGpu(HDC hdc, const RECT& graphRect, const GraphAnalysis& analysi
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
 
-    SetDIBitsToDevice(
-        hdc,
-        graphRect.left, graphRect.top,
-        w, h,
-        0, 0,
-        0, h,
-        mapped.pData,
-        &bmi,
-        DIB_RGB_COLORS
-    );
+    if (mapped.RowPitch == w * 4) {
+        SetDIBitsToDevice(
+            hdc,
+            graphRect.left, graphRect.top,
+            w, h,
+            0, 0,
+            0, h,
+            mapped.pData,
+            &bmi,
+            DIB_RGB_COLORS
+        );
+    } else {
+        static std::vector<uint32_t> s_pixelBuffer;
+        if (s_pixelBuffer.size() < (size_t)(w * h)) {
+            s_pixelBuffer.resize(w * h);
+        }
+        const uint8_t* src = (const uint8_t*)mapped.pData;
+        uint8_t* dst = (uint8_t*)s_pixelBuffer.data();
+        for (int y = 0; y < h; ++y) {
+            memcpy(dst + y * w * 4, src + y * mapped.RowPitch, w * 4);
+        }
+        SetDIBitsToDevice(
+            hdc,
+            graphRect.left, graphRect.top,
+            w, h,
+            0, 0,
+            0, h,
+            dst,
+            &bmi,
+            DIB_RGB_COLORS
+        );
+    }
 
     s_gpu.context->Unmap(s_gpu.stagingTexture, 0);
 
@@ -743,49 +783,11 @@ bool renderGraphGpu(HDC hdc, const RECT& graphRect, const GraphAnalysis& analysi
     drawGraphButton(zoomOutBtn, "-");
     drawGraphButton(zoomInBtn, "+");
 
-    // Crosshair and Hover Coordinate Badge
-    if (state.isHovering && !state.isDragging) {
-        int hx = graphRect.left + state.hoverPos.x;
-        int hy = graphRect.top + state.hoverPos.y;
-
-        HPEN chPen = CreatePen(PS_DOT, 1, theme.isDark ? RGB(0x55, 0x5E, 0x70) : RGB(0xAD, 0xB5, 0xBD));
-        HPEN oldCh = (HPEN)SelectObject(hdc, chPen);
-        MoveToEx(hdc, graphRect.left, hy, nullptr);
-        LineTo(hdc, graphRect.right, hy);
-        MoveToEx(hdc, hx, graphRect.top, nullptr);
-        LineTo(hdc, hx, graphRect.bottom);
-        SelectObject(hdc, oldCh);
-        DeleteObject(chPen);
-
-        // Hover coordinate tooltip
-        char coordBuf[64];
-        std::snprintf(coordBuf, sizeof(coordBuf), "(%s, %s)",
-                      formatNumberShort(state.hoverMathX).c_str(),
-                      formatNumberShort(state.hoverMathY).c_str());
-
-        RECT tipRect = { hx + 12, hy - 22, hx + 110, hy - 2 };
-        if (tipRect.right > graphRect.right - 8) {
-            tipRect.left = hx - 110;
-            tipRect.right = hx - 12;
-        }
-        if (tipRect.top < graphRect.top + 8) {
-            tipRect.top = hy + 8;
-            tipRect.bottom = hy + 28;
-        }
-
-        HBRUSH tipBrush = CreateSolidBrush(theme.isDark ? RGB(0x21, 0x25, 0x2B) : RGB(0xFF, 0xFF, 0xFF));
-        HPEN tipPen = CreatePen(PS_SOLID, 1, theme.accent);
-        HBRUSH ob2 = (HBRUSH)SelectObject(hdc, tipBrush);
-        HPEN op2 = (HPEN)SelectObject(hdc, tipPen);
-        RoundRect(hdc, tipRect.left, tipRect.top, tipRect.right, tipRect.bottom, 6, 6);
-        SelectObject(hdc, ob2);
-        SelectObject(hdc, op2);
-        DeleteObject(tipBrush);
-        DeleteObject(tipPen);
-
-        SetTextColor(hdc, theme.isDark ? RGB(0xF0, 0xF2, 0xF5) : RGB(0x21, 0x25, 0x29));
-        DrawTextA(hdc, coordBuf, -1, &tipRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    // Right-Click Probe Tooltip
+    if (state.isRightProbing) {
+        drawProbeTooltip(hdc, localRect, state, analysis, theme, font ? font : smallFont);
     }
+
 
     SelectObject(hdc, oldFont);
     return true;
