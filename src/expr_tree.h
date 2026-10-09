@@ -127,6 +127,13 @@ struct Item {
     std::unique_ptr<Row> d;
 
     explicit Item(ItemType t) : type(t) {}
+
+    // High-performance arena/pool allocator overrides
+    static void* operator new(size_t size);
+    static void operator delete(void* p) noexcept;
+    static void operator delete(void* p, size_t size) noexcept;
+    static void* operator new[](size_t size) = delete;
+    static void operator delete[](void* p) noexcept = delete;
 };
 
 struct Row {
@@ -149,6 +156,13 @@ struct Row {
         layoutDirty = true;
         if (ownerParentRow) ownerParentRow->invalidateLayout();
     }
+
+    // High-performance arena/pool allocator overrides
+    static void* operator new(size_t size);
+    static void operator delete(void* p) noexcept;
+    static void operator delete(void* p, size_t size) noexcept;
+    static void* operator new[](size_t size) = delete;
+    static void operator delete[](void* p) noexcept = delete;
 };
 
 // A cursor is a (row, index) gap position: it sits *before* items[index]

@@ -44,7 +44,9 @@ struct GpuContext {
 
     ID3D11Texture2D* rtTexture = nullptr;
     ID3D11RenderTargetView* rtView = nullptr;
-    ID3D11Texture2D* stagingTexture = nullptr;
+    ID3D11Texture2D* stagingTextures[2] = { nullptr, nullptr };
+    int stagingIndex = 0;
+    bool stagingValid[2] = { false, false };
 
     int currentWidth = 0;
     int currentHeight = 0;
@@ -355,7 +357,11 @@ bool resizeTargets(int width, int height) {
 
     if (s_gpu.rtView) { s_gpu.rtView->Release(); s_gpu.rtView = nullptr; }
     if (s_gpu.rtTexture) { s_gpu.rtTexture->Release(); s_gpu.rtTexture = nullptr; }
-    if (s_gpu.stagingTexture) { s_gpu.stagingTexture->Release(); s_gpu.stagingTexture = nullptr; }
+    if (s_gpu.stagingTextures[0]) { s_gpu.stagingTextures[0]->Release(); s_gpu.stagingTextures[0] = nullptr; }
+    if (s_gpu.stagingTextures[1]) { s_gpu.stagingTextures[1]->Release(); s_gpu.stagingTextures[1] = nullptr; }
+    s_gpu.stagingIndex = 0;
+    s_gpu.stagingValid[0] = false;
+    s_gpu.stagingValid[1] = false;
 
     D3D11_TEXTURE2D_DESC td = {};
     td.Width = width;
@@ -376,7 +382,9 @@ bool resizeTargets(int width, int height) {
     td.BindFlags = 0;
     td.Usage = D3D11_USAGE_STAGING;
     td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    hr = s_gpu.device->CreateTexture2D(&td, nullptr, &s_gpu.stagingTexture);
+    hr = s_gpu.device->CreateTexture2D(&td, nullptr, &s_gpu.stagingTextures[0]);
+    if (FAILED(hr)) return false;
+    hr = s_gpu.device->CreateTexture2D(&td, nullptr, &s_gpu.stagingTextures[1]);
     if (FAILED(hr)) return false;
 
     s_gpu.currentWidth = width;
@@ -575,8 +583,11 @@ void shutdownGpuGraph() {
     if (s_gpu.psDefault) { s_gpu.psDefault->Release(); s_gpu.psDefault = nullptr; }
     if (s_gpu.vsQuad) { s_gpu.vsQuad->Release(); s_gpu.vsQuad = nullptr; }
     if (s_gpu.rtView) { s_gpu.rtView->Release(); s_gpu.rtView = nullptr; }
-    if (s_gpu.rtTexture) { s_gpu.rtTexture->Release(); s_gpu.rtTexture = nullptr; }
-    if (s_gpu.stagingTexture) { s_gpu.stagingTexture->Release(); s_gpu.stagingTexture = nullptr; }
+    if (s_gpu.stagingTextures[0]) { s_gpu.stagingTextures[0]->Release(); s_gpu.stagingTextures[0] = nullptr; }
+    if (s_gpu.stagingTextures[1]) { s_gpu.stagingTextures[1]->Release(); s_gpu.stagingTextures[1] = nullptr; }
+    s_gpu.stagingIndex = 0;
+    s_gpu.stagingValid[0] = false;
+    s_gpu.stagingValid[1] = false;
     if (s_gpu.context) { s_gpu.context->Release(); s_gpu.context = nullptr; }
     if (s_gpu.device) { s_gpu.device->Release(); s_gpu.device = nullptr; }
     if (s_gpu.compilerDll) { FreeLibrary(s_gpu.compilerDll); s_gpu.compilerDll = nullptr; }
@@ -703,11 +714,32 @@ bool renderGraphGpu(HDC hdc, const RECT& graphRect, const GraphAnalysis& analysi
         // Draw fullscreen GPU quad
         s_gpu.context->Draw(4, 0);
 
-        // Copy to staging texture and read back into GDI DC
-        s_gpu.context->CopyResource(s_gpu.stagingTexture, s_gpu.rtTexture);
+        int writeIdx = s_gpu.stagingIndex;
+        int readIdx = 1 - s_gpu.stagingIndex;
 
-        hr = s_gpu.context->Map(s_gpu.stagingTexture, 0, D3D11_MAP_READ, 0, &mapped);
-        if (FAILED(hr)) return false;
+        // Dispatch asynchronous copy to the current staging buffer
+        s_gpu.context->CopyResource(s_gpu.stagingTextures[writeIdx], s_gpu.rtTexture);
+        s_gpu.stagingValid[writeIdx] = true;
+
+        // Double-buffered asynchronous readback:
+        // When interactively dragging/panning and the previous staging texture has valid data,
+        // attempt a non-blocking map (DO_NOT_WAIT) on the already-completed buffer to eliminate CPU stalls.
+        int targetIdx = writeIdx;
+        bool mappedSuccess = false;
+        if (state.isDragging && s_gpu.stagingValid[readIdx]) {
+            HRESULT hrTry = s_gpu.context->Map(s_gpu.stagingTextures[readIdx], 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+            if (SUCCEEDED(hrTry)) {
+                targetIdx = readIdx;
+                mappedSuccess = true;
+            }
+        }
+
+        if (!mappedSuccess) {
+            // Immediate synchronous map for static/first-time frames
+            hr = s_gpu.context->Map(s_gpu.stagingTextures[writeIdx], 0, D3D11_MAP_READ, 0, &mapped);
+            if (FAILED(hr)) return false;
+            targetIdx = writeIdx;
+        }
 
         if (s_cachedPixels.size() < (size_t)(w * h)) {
             s_cachedPixels.resize(w * h);
@@ -721,7 +753,10 @@ bool renderGraphGpu(HDC hdc, const RECT& graphRect, const GraphAnalysis& analysi
                 memcpy(dst + y * w * 4, src + y * mapped.RowPitch, w * 4);
             }
         }
-        s_gpu.context->Unmap(s_gpu.stagingTexture, 0);
+        s_gpu.context->Unmap(s_gpu.stagingTextures[targetIdx], 0);
+
+        // Advance double-buffer index
+        s_gpu.stagingIndex = 1 - s_gpu.stagingIndex;
 
         SetDIBitsToDevice(
             hdc,

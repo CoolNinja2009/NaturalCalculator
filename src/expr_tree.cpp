@@ -4,6 +4,105 @@
 #include <algorithm>
 #include <cstring>
 #include <functional>
+#include <mutex>
+#include <cstdlib>
+
+namespace {
+
+template <typename T, size_t BlockCount = 512>
+class NodePool {
+    struct FreeNode {
+        FreeNode* next;
+    };
+    struct Chunk {
+        Chunk* next = nullptr;
+        alignas(alignof(T)) char data[sizeof(T) * BlockCount];
+    };
+
+    Chunk* chunks_ = nullptr;
+    FreeNode* freeList_ = nullptr;
+    size_t chunkIndex_ = BlockCount;
+    std::mutex mutex_;
+
+public:
+    NodePool() = default;
+    ~NodePool() {
+        Chunk* c = chunks_;
+        while (c) {
+            Chunk* n = c->next;
+            std::free(c);
+            c = n;
+        }
+    }
+
+    void* allocate(size_t size) {
+        if (size != sizeof(T)) return std::malloc(size);
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (freeList_) {
+            FreeNode* node = freeList_;
+            freeList_ = freeList_->next;
+            return node;
+        }
+        if (chunkIndex_ >= BlockCount) {
+            Chunk* newChunk = static_cast<Chunk*>(std::malloc(sizeof(Chunk)));
+            if (!newChunk) return std::malloc(size);
+            newChunk->next = chunks_;
+            chunks_ = newChunk;
+            chunkIndex_ = 0;
+        }
+        void* ptr = &chunks_->data[chunkIndex_ * sizeof(T)];
+        chunkIndex_++;
+        return ptr;
+    }
+
+    void deallocate(void* ptr, size_t size) noexcept {
+        if (!ptr) return;
+        if (size != sizeof(T)) {
+            std::free(ptr);
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        FreeNode* node = static_cast<FreeNode*>(ptr);
+        node->next = freeList_;
+        freeList_ = node;
+    }
+};
+
+static NodePool<Item, 1024>& getItemPool() {
+    static NodePool<Item, 1024> pool;
+    return pool;
+}
+
+static NodePool<Row, 1024>& getRowPool() {
+    static NodePool<Row, 1024> pool;
+    return pool;
+}
+
+} // namespace
+
+void* Item::operator new(size_t size) {
+    return getItemPool().allocate(size);
+}
+
+void Item::operator delete(void* p) noexcept {
+    getItemPool().deallocate(p, sizeof(Item));
+}
+
+void Item::operator delete(void* p, size_t size) noexcept {
+    getItemPool().deallocate(p, size);
+}
+
+void* Row::operator new(size_t size) {
+    return getRowPool().allocate(size);
+}
+
+void Row::operator delete(void* p) noexcept {
+    getRowPool().deallocate(p, sizeof(Row));
+}
+
+void Row::operator delete(void* p, size_t size) noexcept {
+    getRowPool().deallocate(p, size);
+}
 
 // ---------------------------------------------------------------- helpers
 
