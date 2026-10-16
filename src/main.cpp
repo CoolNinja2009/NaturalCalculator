@@ -69,6 +69,31 @@ enum Action {
 // Header buttons, laid out right to left by layoutTopBar().
 enum TopAction { TopVarX, TopVarY, TopQuadratic, TopAngle, TopSci, TopTheme, TopCount };
 
+constexpr int kScreenPad = 16;            // inner margin of the history and editor
+
+// The editor line and the history column scroll sideways when an expression
+// is wider than the screen. While a strip overflows it shows a thin bar along
+// its bottom edge: drag the thumb, click the track to jump, or use the wheel
+// (over the editor; Shift+wheel or a tilt wheel over the history).
+constexpr int kScrollBarThickness = 6;
+constexpr int kScrollBarInset = 4;        // gap below the bar
+constexpr int kScrollBarSlop = 4;         // pixels above and below the bar that still grab it
+constexpr int kWheelScrollPx = 56;        // per wheel notch
+constexpr int kCaretRoom = 4;             // space for the caret after the last item
+
+struct HScroll {
+    int offset = 0;       // pixels scrolled from the start
+    int content = 0;      // content width, as of the last paint
+    int view = 0;         // visible width
+    RECT track{};         // the bar, as of the last paint
+    bool hover = false;
+    bool dragging = false;
+    int grab = 0;         // pointer x within the thumb while dragging
+
+    int maxOffset() const { return std::max(0, content - view); }
+    bool active() const { return maxOffset() > 0 && track.right > track.left; }
+};
+
 struct App {
     HWND hwnd = nullptr;
     Workspace workspace;
@@ -88,6 +113,9 @@ struct App {
     int editorAnchor = 0;
     int editorCaret = 0;
     int editorTextCursor = -1;
+    HScroll editorScroll;
+    HScroll historyScroll;
+    bool revealCaret = true;     // scroll the editor to the caret on the next paint
     EvaluationContext values;
     bool proMode = false;
     bool degrees = true;   // Pro Max angle unit: true = DEG, false = RAD
@@ -174,6 +202,76 @@ void invalidateButtonCache() {
 void invalidateGraphCache() {
     g.graphCacheValid = false;
 }
+
+// ------------------------------------------------------------- sideways scrolling
+
+// Puts the strip's bar along its bottom edge and clamps the offset to the
+// content as it is now.
+void layoutHScroll(HScroll& s, const RECT& strip, int content) {
+    s.view = std::max(0, (int)(strip.right - strip.left) - 2 * kScreenPad);
+    s.content = content;
+    s.track = { strip.left + kScreenPad, strip.bottom - kScrollBarInset - kScrollBarThickness,
+                strip.right - kScreenPad, strip.bottom - kScrollBarInset };
+    s.offset = std::clamp(s.offset, 0, s.maxOffset());
+}
+
+RECT hscrollThumb(const HScroll& s) {
+    const int trackW = s.track.right - s.track.left;
+    const int thumbW = std::clamp((int)((long long)trackW * s.view / std::max(1, s.content)),
+                                  std::min(trackW, 28), trackW);
+    const int travel = trackW - thumbW;
+    const int x = s.track.left + (s.maxOffset() > 0 ? (int)((long long)travel * s.offset / s.maxOffset()) : 0);
+    return { x, s.track.top, x + thumbW, s.track.bottom };
+}
+
+bool hscrollHit(const HScroll& s, POINT p) {
+    if (!s.active()) return false;
+    RECT zone = s.track;
+    InflateRect(&zone, 0, kScrollBarSlop);
+    return PtInRect(&zone, p) != FALSE;
+}
+
+// True if the view moved.
+bool hscrollBy(HScroll& s, int pixels) {
+    const int before = s.offset;
+    s.offset = std::clamp(s.offset + pixels, 0, s.maxOffset());
+    return s.offset != before;
+}
+
+// Keeps the grabbed point of the thumb under the pointer.
+bool hscrollDrag(HScroll& s, int x) {
+    const RECT thumb = hscrollThumb(s);
+    const int travel = (s.track.right - s.track.left) - (thumb.right - thumb.left);
+    if (travel <= 0) return false;
+    const int target = (int)std::lround((double)(x - s.grab - s.track.left) * s.maxOffset() / travel);
+    return hscrollBy(s, target - s.offset);
+}
+
+// A press grabs the thumb where it was hit; on the track it brings the
+// thumb's middle under the pointer first, so a click jumps and a drag follows.
+void hscrollPress(HScroll& s, POINT p) {
+    const RECT thumb = hscrollThumb(s);
+    const bool onThumb = p.x >= thumb.left && p.x < thumb.right;
+    s.grab = onThumb ? p.x - thumb.left : (thumb.right - thumb.left) / 2;
+    s.dragging = true;
+    hscrollDrag(s, p.x);
+}
+
+void invalidateHScroll(const HScroll& s) {
+    InvalidateRect(g.hwnd, &s == &g.editorScroll ? &g.editorRect : &g.historyRect, FALSE);
+}
+
+void paintHScroll(HDC hdc, const HScroll& s, const UiPalette& pal, COLORREF ink) {
+    if (!s.active()) return;
+    const float radius = kScrollBarThickness / 2.0f;
+    if (s.hover || s.dragging)
+        fillRoundRect(hdc, s.track, radius, mixColor(pal.screen, ink, 0.10), CLR_INVALID);
+    const double weight = s.dragging ? 0.62 : (s.hover ? 0.48 : 0.30);
+    fillRoundRect(hdc, hscrollThumb(s), radius, mixColor(pal.screen, ink, weight), CLR_INVALID);
+}
+
+// Where the editor's expression starts, scrolled.
+int editorOriginX() { return g.editorRect.left + kScreenPad - g.editorScroll.offset; }
 
 constexpr UINT_PTR kGraphRefreshTimerId = 4;
 constexpr UINT kGraphRefreshMs = 12;
@@ -638,8 +736,9 @@ void activateProMode() {
 
 void ensureCaretVisible() {
     // Simple heuristic: keep caret blinking "on" right after any edit so
-    // the change is immediately visible.
+    // the change is immediately visible, and scrolled into view.
     g.caretVisible = true;
+    g.revealCaret = true;
     KillTimer(g.hwnd, kCaretTimerId);
     SetTimer(g.hwnd, kCaretTimerId, 530, nullptr);
 }
@@ -771,6 +870,7 @@ void undoLastEdit() {
     g.editorTextCursor = -1;
     g.editorAnchor = g.editorCaret = 0;
     g.editorTextCursor = -1;
+    g.revealCaret = true;
     InvalidateRect(g.hwnd, &g.editorRect, FALSE);
 }
 
@@ -814,7 +914,7 @@ int editorCharacterAtPoint(POINT point) {
         std::wstring prefix(plain.begin(), plain.begin() + index);
         SIZE size{};
         GetTextExtentPoint32W(hdc, prefix.c_str(), (int)prefix.size(), &size);
-        int distance = std::abs(point.x - (g.editorRect.left + 16 + size.cx));
+        int distance = std::abs(point.x - (editorOriginX() + size.cx));
         if (distance < bestDistance) { bestDistance = distance; result = index; }
     }
     SelectObject(hdc, old);
@@ -830,7 +930,7 @@ void editorCursorAtPoint(POINT point) {
     Size size = measureExpression(hdc, expression.root.get());
     int midY = (g.editorRect.top + g.editorRect.bottom) / 2;
     int baseline = midY + (size.ascent - size.descent) / 2;
-    placeCursorAtPoint(expression, hdc, g.editorRect.left + 16, baseline,
+    placeCursorAtPoint(expression, hdc, editorOriginX(), baseline,
                        point.x, point.y);
     ReleaseDC(g.hwnd, hdc);
 }
@@ -883,7 +983,8 @@ int currentEditorTextCursor() {
     return (int)g.workspace.current().toPlainString().size();
 }
 
-int editorTextX(HDC hdc, const std::string& text, int index) {
+// Width of the first `index` characters of the flat text in the editor font.
+int editorTextWidth(HDC hdc, const std::string& text, int index) {
     HFONT font = CreateFontW(-fontHeightForDepth(0), 0, 0, 0, FW_NORMAL,
                              FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS,
                              CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
@@ -894,7 +995,11 @@ int editorTextX(HDC hdc, const std::string& text, int index) {
     GetTextExtentPoint32W(hdc, prefix.c_str(), (int)prefix.size(), &size);
     SelectObject(hdc, old);
     DeleteObject(font);
-    return g.editorRect.left + 16 + size.cx;
+    return size.cx;
+}
+
+int editorTextX(HDC hdc, const std::string& text, int index) {
+    return editorOriginX() + editorTextWidth(hdc, text, index);
 }
 
 std::wstring wideResult(const std::string& result) {
@@ -1664,8 +1769,6 @@ void paintButton(HDC hdc, const ButtonDef& b, const Theme& theme, const UiPalett
 
 // ------------------------------------------------------------- chrome painting
 
-constexpr int kScreenPad = 16;
-
 uint64_t hashMix(uint64_t hash, uint64_t value) {
     return (hash ^ value) * 0x100000001B3ull + 0x9E3779B97F4A7C15ull;
 }
@@ -1893,6 +1996,12 @@ void paintHistory(HDC mem, const Theme& theme, const Theme& screenTheme, const U
     if (g.scrollToBottomPending) { g.scrollY = maxScroll; g.scrollToBottomPending = false; }
     g.scrollY = std::clamp(g.scrollY, 0, maxScroll);
     int origin = g.historyRect.top - g.scrollY;
+    // Expressions wider than the column scroll sideways together; results
+    // stay right-aligned under them.
+    int widest = 0;
+    for (const HistoryRow& row : rows) widest = std::max(widest, row.size.width);
+    layoutHScroll(g.historyScroll, g.historyRect, widest);
+    const int expressionX = g.historyRect.left + kScreenPad - g.historyScroll.offset;
     SetBkMode(mem, TRANSPARENT);
 
     if (rows.empty()) {
@@ -1916,7 +2025,7 @@ void paintHistory(HDC mem, const Theme& theme, const Theme& screenTheme, const U
     for (size_t i = 0; i < rows.size(); ++i) {
         const HistoryRow& row = rows[i];
         if (origin + row.bottom < g.historyRect.top || origin + row.top > g.historyRect.bottom) continue;
-        drawExpression(mem, hist[i]->expr->root.get(), g.historyRect.left + kScreenPad,
+        drawExpression(mem, hist[i]->expr->root.get(), expressionX,
                        origin + row.baseline, screenTheme, nullptr, nullptr);
 
         RECT rr = row.result;
@@ -1964,9 +2073,38 @@ void paintHistory(HDC mem, const Theme& theme, const Theme& screenTheme, const U
     if (g.scrollY < maxScroll)
         fadeEdge(mem, { g.historyRect.left, g.historyRect.bottom - fadeH, g.historyRect.right, g.historyRect.bottom },
                  pal.screen, false);
-    (void)theme;
+    const RECT& h = g.historyRect;
+    if (g.historyScroll.offset > 0)
+        fadeEdgeH(mem, { h.left, h.top, h.left + kScreenPad, h.bottom }, pal.screen, true);
+    if (g.historyScroll.offset < g.historyScroll.maxOffset())
+        fadeEdgeH(mem, { h.right - kScreenPad, h.top, h.right, h.bottom }, pal.screen, false);
+    paintHScroll(mem, g.historyScroll, pal, theme.screenText);
     SelectClipRgn(mem, nullptr);
     DeleteObject(clip);
+}
+
+// Scrolls the editor so the caret stands inside its view with some context
+// around it. The structural caret's place comes from a layout pass that is
+// clipped away entirely, so nothing is drawn.
+void revealEditorCaret(HDC mem, const Expression& cur, int baseline, const Theme& screenTheme) {
+    HScroll& scroll = g.editorScroll;
+    if (scroll.maxOffset() == 0) return;
+    int caretX = 0;  // from the start of the line
+    if (g.editorTextCursor >= 0) {
+        caretX = editorTextWidth(mem, cur.toPlainString(), g.editorTextCursor);
+    } else {
+        CaretInfo caret;
+        int saved = SaveDC(mem);
+        IntersectClipRect(mem, 0, 0, 0, 0);
+        drawExpression(mem, cur.root.get(), 0, baseline, screenTheme, &cur.cursor, &caret);
+        RestoreDC(mem, saved);
+        if (!caret.valid) return;
+        caretX = caret.x;
+    }
+    const int context = std::min(40, scroll.view / 4);
+    if (caretX - scroll.offset < context) scroll.offset = caretX - context;
+    else if (caretX - scroll.offset > scroll.view - context) scroll.offset = caretX - scroll.view + context;
+    scroll.offset = std::clamp(scroll.offset, 0, scroll.maxOffset());
 }
 
 void paintEditor(HDC mem, const Theme& theme, const Theme& screenTheme, const UiPalette& pal) {
@@ -1984,9 +2122,22 @@ void paintEditor(HDC mem, const Theme& theme, const Theme& screenTheme, const Ui
     Size s = measureExpression(mem, cur.root.get());
     int midY = (g.editorRect.top + g.editorRect.bottom) / 2;
     int baseline = midY + (s.ascent - s.descent) / 2;
+
+    // A line wider than the editor scrolls sideways; edits and caret moves
+    // bring the caret back into view.
+    layoutHScroll(g.editorScroll, g.editorRect, s.width + kCaretRoom);
+    if (g.revealCaret) {
+        revealEditorCaret(mem, cur, baseline, screenTheme);
+        g.revealCaret = false;
+    }
+    const int origin = editorOriginX();
+    const RECT& e = g.editorRect;
+    HRGN clip = CreateRectRgn(e.left, e.top + 1, e.right, e.bottom);
+    SelectClipRgn(mem, clip);
+
     if ((g.allSelected || g.rangeSelected || g.editorCaret != g.editorAnchor) && !rowIsEmpty(cur.root.get())) {
-        int selectionLeft = g.editorRect.left + 12;
-        int selectionRight = g.editorRect.left + 20 + s.width;
+        int selectionLeft = origin - 4;
+        int selectionRight = origin + 4 + s.width;
         if (g.editorCaret != g.editorAnchor && !g.allSelected && !g.rangeSelected) {
             std::string plain = cur.toPlainString();
             HDC measure = mem;
@@ -2005,7 +2156,6 @@ void paintEditor(HDC mem, const Theme& theme, const Theme& screenTheme, const Ui
             GetTextExtentPoint32W(measure, selected.c_str(), (int)selected.size(), &selectedSize);
             SelectObject(measure, previousFont);
             DeleteObject(expressionFont);
-            int origin = g.editorRect.left + kScreenPad;
             selectionLeft = origin + beforeSize.cx;
             selectionRight = selectionLeft + selectedSize.cx;
             SelectObject(measure, oldFont);
@@ -2017,11 +2167,11 @@ void paintEditor(HDC mem, const Theme& theme, const Theme& screenTheme, const Ui
         DeleteObject(selectionBrush);
     }
     CaretInfo caret;
-    drawExpression(mem, cur.root.get(), g.editorRect.left + kScreenPad, baseline, screenTheme, &cur.cursor, &caret);
+    drawExpression(mem, cur.root.get(), origin, baseline, screenTheme, &cur.cursor, &caret);
 
     if (rowIsEmpty(cur.root.get())) {
         // First-run hint beside the empty slot; it disappears on the first key.
-        RECT hint = { g.editorRect.left + kScreenPad + s.width + 12, baseline - s.ascent,
+        RECT hint = { origin + s.width + 12, baseline - s.ascent,
                       g.editorRect.right - kScreenPad, baseline + s.descent };
         SetBkMode(mem, TRANSPARENT);
         SetTextColor(mem, pal.screenMuted);
@@ -2045,6 +2195,15 @@ void paintEditor(HDC mem, const Theme& theme, const Theme& screenTheme, const Ui
         SelectObject(mem, ocp);
         DeleteObject(cp);
     }
+
+    // Soft edges where the line continues out of view, the bar on top.
+    if (g.editorScroll.offset > 0)
+        fadeEdgeH(mem, { e.left, e.top + 1, e.left + kScreenPad, e.bottom }, pal.screen, true);
+    if (g.editorScroll.offset < g.editorScroll.maxOffset())
+        fadeEdgeH(mem, { e.right - kScreenPad, e.top + 1, e.right, e.bottom }, pal.screen, false);
+    paintHScroll(mem, g.editorScroll, pal, theme.screenText);
+    SelectClipRgn(mem, nullptr);
+    DeleteObject(clip);
 }
 
 // The keypad drawn in `state` over the button area, reused frame after frame
@@ -2210,6 +2369,8 @@ void paint(HDC hdc, RECT client, const RECT& dirty) {
                                      ((uint64_t)(uint32_t)g.outputAnchor << 20) ^ (uint32_t)g.outputCaret);
     historyKey = hashMix(historyKey, ((uint64_t)g.historyRect.right << 32) ^ ((uint64_t)g.historyRect.top << 16) ^
                                      (uint64_t)g.historyRect.bottom);
+    historyKey = hashMix(historyKey, (uint64_t)(uint32_t)g.historyScroll.offset |
+                                     ((uint64_t)g.historyScroll.hover << 32) | ((uint64_t)g.historyScroll.dragging << 33));
     if (exposed(g.historyRect) && (full || petOverHistory || historyKey != g.historyKey)) {
         paintHistory(mem, theme, screenTheme, pal);
         g.historyKey = historyKey;
@@ -2350,7 +2511,8 @@ void invalidateTopAction(int index) {
 // are repainted, so moving the pointer costs a BitBlt or two.
 void updateHover(POINT point) {
     bool busy = g.editorSelecting || g.outputSelecting || g.petDragging ||
-                g.graphState.isDragging || g.graphState.isRightProbing;
+                g.graphState.isDragging || g.graphState.isRightProbing ||
+                g.editorScroll.dragging || g.historyScroll.dragging;
     int key = busy ? -1 : keyAt(point);
     int top = busy ? -1 : topActionAt(point);
     if (key != g.hoverKey) {
@@ -2362,6 +2524,12 @@ void updateHover(POINT point) {
         invalidateTopAction(g.hoverTop);
         invalidateTopAction(top);
         g.hoverTop = top;
+    }
+    for (HScroll* bar : { &g.editorScroll, &g.historyScroll }) {
+        const bool hover = !busy && hscrollHit(*bar, point);
+        if (hover == bar->hover) continue;
+        bar->hover = hover;
+        invalidateHScroll(*bar);
     }
 }
 
@@ -2505,6 +2673,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 SetCursor(LoadCursorW(nullptr, IDC_HAND));
                 return TRUE;
             }
+            if (hscrollHit(g.editorScroll, point) || hscrollHit(g.historyScroll, point)) {
+                SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+                return TRUE;
+            }
             int outputEntry = -1;
             int outputCharacter = 0;
             if (findOutputAtPoint(point, outputEntry, outputCharacter) ||
@@ -2551,6 +2723,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     case TopSci: doAction(ActToggleScientific); break;
                     case TopAngle: doAction(ActToggleAngle); break;
                 }
+                return 0;
+            }
+            for (HScroll* bar : { &g.editorScroll, &g.historyScroll }) {
+                if (!hscrollHit(*bar, pt)) continue;
+                hscrollPress(*bar, pt);
+                SetCapture(hwnd);
+                invalidateHScroll(*bar);
                 return 0;
             }
             if (PtInRect(&g.editorRect, pt)) {
@@ -2611,6 +2790,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
             }
+            for (HScroll* bar : { &g.editorScroll, &g.historyScroll }) {
+                if (!bar->dragging) continue;
+                if (hscrollDrag(*bar, GET_X_LPARAM(lParam))) invalidateHScroll(*bar);
+                return 0;
+            }
             {
                 POINT point = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
                 if (!g.trackingMouse) {
@@ -2662,6 +2846,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (g.pressedKey >= 0 || g.pressedTop >= 0) {
                 releasePressed();
                 ReleaseCapture();
+                return 0;
+            }
+            if (g.editorScroll.dragging || g.historyScroll.dragging) {
+                for (HScroll* bar : { &g.editorScroll, &g.historyScroll }) {
+                    if (!bar->dragging) continue;
+                    bar->dragging = false;
+                    invalidateHScroll(*bar);
+                }
+                ReleaseCapture();
+                updateHover({ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) });
                 return 0;
             }
             if (g.proMode && g.graphState.isDragging) {
@@ -2722,6 +2916,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (g.petDragging) g.petDragging = false;
             if (g.editorSelecting) g.editorSelecting = false;
             if (g.outputSelecting) g.outputSelecting = false;
+            g.editorScroll.dragging = g.historyScroll.dragging = false;
             if (g.proMode) {
                 if (g.graphState.isDragging) handleGraphMouseUp(g.graphState);
                 if (g.graphState.isRightProbing) handleGraphRightUp(g.graphState);
@@ -2734,20 +2929,39 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_MOUSEWHEEL: {
             stampInput();
             int delta = GET_WHEEL_DELTA_WPARAM(wParam);
-            if (g.proMode) {
-                POINT point = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-                ScreenToClient(hwnd, &point);
-                if (PtInRect(&g.graphRect, point)) {
-                    handleGraphMouseWheel(g.graphState, g.graphRect, (int)point.x, (int)point.y, (short)delta);
-                    invalidateGraphCache();
-                    InvalidateRect(hwnd, &g.graphRect, FALSE);
-                    return 0;
-                }
+            POINT point = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            ScreenToClient(hwnd, &point);
+            if (g.proMode && PtInRect(&g.graphRect, point)) {
+                handleGraphMouseWheel(g.graphState, g.graphRect, (int)point.x, (int)point.y, (short)delta);
+                invalidateGraphCache();
+                InvalidateRect(hwnd, &g.graphRect, FALSE);
+                return 0;
+            }
+            // The editor is a single line, so over it the wheel scrolls
+            // sideways while the line overflows; Shift does it anywhere.
+            const bool shift = (GET_KEYSTATE_WPARAM(wParam) & MK_SHIFT) != 0;
+            HScroll* sideways = PtInRect(&g.editorRect, point) && (shift || g.editorScroll.maxOffset() > 0)
+                                ? &g.editorScroll
+                                : (shift && PtInRect(&g.historyRect, point) ? &g.historyScroll : nullptr);
+            if (sideways) {
+                if (hscrollBy(*sideways, -delta * kWheelScrollPx / WHEEL_DELTA)) invalidateHScroll(*sideways);
+                return 0;
             }
             g.scrollY -= delta / 2;
             if (g.scrollY < 0) g.scrollY = 0;
             InvalidateRect(hwnd, &g.historyRect, FALSE);
             return 0;
+        }
+
+        case WM_MOUSEHWHEEL: {
+            stampInput();
+            POINT point = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            ScreenToClient(hwnd, &point);
+            HScroll* sideways = PtInRect(&g.editorRect, point) ? &g.editorScroll
+                              : (PtInRect(&g.historyRect, point) ? &g.historyScroll : nullptr);
+            if (sideways && hscrollBy(*sideways, GET_WHEEL_DELTA_WPARAM(wParam) * kWheelScrollPx / WHEEL_DELTA))
+                invalidateHScroll(*sideways);
+            return TRUE;  // tilt-wheel drivers keep repeating only when told it was handled
         }
 
         case WM_CHAR: {

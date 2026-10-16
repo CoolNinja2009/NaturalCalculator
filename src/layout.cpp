@@ -134,13 +134,37 @@ HFONT fontForDepth(int depth) {
     return f;
 }
 
+// Ink box of one glyph in the selected font, relative to its origin on the
+// baseline: [left, left + width) x [top, top + height), top negative.
+struct GlyphInk {
+    int left = 0, top = 0, width = 0, height = 0;
+    bool valid = false;
+};
+
+GlyphInk glyphInk(HDC hdc, HFONT font, wchar_t ch) {
+    HFONT old = (HFONT)SelectObject(hdc, font);
+    GLYPHMETRICS gm{};
+    const MAT2 identity = { { 0, 1 }, { 0, 0 }, { 0, 0 }, { 0, 1 } };
+    DWORD r = GetGlyphOutlineW(hdc, ch, GGO_METRICS, &gm, 0, nullptr, &identity);
+    SelectObject(hdc, old);
+    GlyphInk ink;
+    if (r == GDI_ERROR) return ink;
+    ink.left = gm.gmptGlyphOrigin.x;
+    ink.top = -gm.gmptGlyphOrigin.y;
+    ink.width = (int)gm.gmBlackBoxX;
+    ink.height = (int)gm.gmBlackBoxY;
+    ink.valid = ink.height > 0;
+    return ink;
+}
+
 struct FontMetricsCache {
     TEXTMETRICW tm;
+    int inkAscent = 0, inkDescent = 0;  // reach of the font's '(' glyph
     bool have = false;
 };
 std::unordered_map<int, FontMetricsCache> g_tmCache;
 
-TEXTMETRICW textMetricsForDepth(HDC hdc, int depth) {
+const FontMetricsCache& metricsForDepth(HDC hdc, int depth) {
     int px = fontPxForDepth(depth);
     auto& c = g_tmCache[px];
     if (!c.have) {
@@ -148,9 +172,27 @@ TEXTMETRICW textMetricsForDepth(HDC hdc, int depth) {
         HFONT old = (HFONT)SelectObject(hdc, f);
         GetTextMetricsW(hdc, &c.tm);
         SelectObject(hdc, old);
+        const GlyphInk paren = glyphInk(hdc, f, L'(');
+        c.inkAscent = paren.valid ? -paren.top : (int)c.tm.tmAscent;
+        c.inkDescent = paren.valid ? paren.top + paren.height : (int)c.tm.tmDescent;
         c.have = true;
     }
-    return c.tm;
+    return c;
+}
+
+TEXTMETRICW textMetricsForDepth(HDC hdc, int depth) { return metricsForDepth(hdc, depth).tm; }
+
+// A run of text at this depth. Its ink reach counts as tall as a plain
+// parenthesis beside it, so brackets around plain text are the font's own.
+Size textSize(HDC hdc, int depth, int width) {
+    const FontMetricsCache& m = metricsForDepth(hdc, depth);
+    Size s;
+    s.width = width;
+    s.ascent = m.tm.tmAscent;
+    s.descent = m.tm.tmDescent;
+    s.inkAscent = m.inkAscent;
+    s.inkDescent = m.inkDescent;
+    return s;
 }
 
 int scaledPx(int basePx, int depth) {
@@ -177,6 +219,8 @@ Size placeholderSize(int depth) {
     s.width = std::max(px / 2, 10);
     s.ascent = (int)(px * 0.72);
     s.descent = (int)(px * 0.22);
+    s.inkAscent = s.ascent;
+    s.inkDescent = s.descent;
     return s;
 }
 
@@ -188,12 +232,7 @@ Size measureNumber(HDC hdc, const Item* it, int depth) {
     if (w.empty()) w = L" ";
     GetTextExtentPoint32W(hdc, w.c_str(), (int)w.size(), &sz);
     SelectObject(hdc, old);
-    TEXTMETRICW tm = textMetricsForDepth(hdc, depth);
-    Size s;
-    s.width = sz.cx;
-    s.ascent = tm.tmAscent;
-    s.descent = tm.tmDescent;
-    return s;
+    return textSize(hdc, depth, sz.cx);
 }
 
 Size measureVariable(HDC hdc, const Item* it, int depth) {
@@ -210,8 +249,7 @@ Size measureNameText(HDC hdc, const std::string& text, int depth) {
     if (w.empty()) w = L"?";
     GetTextExtentPoint32W(hdc, w.c_str(), (int)w.size(), &sz);
     SelectObject(hdc, old);
-    TEXTMETRICW tm = textMetricsForDepth(hdc, depth);
-    return { sz.cx, tm.tmAscent, tm.tmDescent };
+    return textSize(hdc, depth, sz.cx);
 }
 
 const wchar_t* opGlyph(char c) {
@@ -237,41 +275,21 @@ Size measureOperator(HDC hdc, const Item* it, int depth) {
     const wchar_t* g = opGlyph(it->opChar);
     GetTextExtentPoint32W(hdc, g, (int)wcslen(g), &sz);
     SelectObject(hdc, old);
-    TEXTMETRICW tm = textMetricsForDepth(hdc, depth);
-    Size s;
-    s.width = sz.cx;
-    s.ascent = tm.tmAscent;
-    s.descent = tm.tmDescent;
-    return s;
+    return textSize(hdc, depth, sz.cx);
 }
 
-static std::unordered_map<int, HFONT> g_parenFontCache;
-static std::unordered_map<uint32_t, int> g_parenWidthCache;
+// Segoe UI scaled up uniformly to span content this tall (big operators).
+static std::unordered_map<int, HFONT> g_bigGlyphFontCache;
 
-HFONT createParenFont(int depth, int innerHeight) {
-    int height = std::max(fontPxForDepth(depth), innerHeight + scaledPx(6, depth));
-    auto it = g_parenFontCache.find(height);
-    if (it != g_parenFontCache.end()) return it->second;
+HFONT bigGlyphFont(int depth, int contentHeight) {
+    int height = std::max(fontPxForDepth(depth), contentHeight + scaledPx(6, depth));
+    auto it = g_bigGlyphFontCache.find(height);
+    if (it != g_bigGlyphFontCache.end()) return it->second;
     HFONT f = CreateFontW(-height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                           DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
                           CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-    g_parenFontCache[height] = f;
+    g_bigGlyphFontCache[height] = f;
     return f;
-}
-
-int measureParenWidth(HDC hdc, int depth, int innerHeight) {
-    int height = std::max(fontPxForDepth(depth), innerHeight + scaledPx(6, depth));
-    uint32_t key = ((uint32_t)depth << 20) ^ (uint32_t)height;
-    auto it = g_parenWidthCache.find(key);
-    if (it != g_parenWidthCache.end()) return it->second;
-
-    HFONT font = createParenFont(depth, innerHeight);
-    HFONT old = (HFONT)SelectObject(hdc, font);
-    SIZE size{};
-    GetTextExtentPoint32W(hdc, L"(", 1, &size);
-    SelectObject(hdc, old);
-    g_parenWidthCache[key] = size.cx;
-    return size.cx;
 }
 
 Size measureEquals(HDC hdc, int depth) {
@@ -281,8 +299,7 @@ Size measureEquals(HDC hdc, int depth) {
     const wchar_t* glyph = L" = ";
     GetTextExtentPoint32W(hdc, glyph, 3, &sz);
     SelectObject(hdc, old);
-    TEXTMETRICW tm = textMetricsForDepth(hdc, depth);
-    return { sz.cx, tm.tmAscent, tm.tmDescent };
+    return textSize(hdc, depth, sz.cx);
 }
 
 // ---------------------------------------------------------------- natural function notation
@@ -438,6 +455,8 @@ Size measureSliceImpl(HDC hdc, const RowRef& r, int depth) {
         total.width += s.width;
         total.ascent = std::max(total.ascent, s.ascent);
         total.descent = std::max(total.descent, s.descent);
+        total.inkAscent = std::max(total.inkAscent, s.inkAscent);
+        total.inkDescent = std::max(total.inkDescent, s.inkDescent);
     }
     return total;
 }
@@ -504,7 +523,7 @@ struct FnText {
     int x = 0;
     int baseline = 0;     // offset from the item baseline (negative raises)
     int depth = 0;
-    int parenHeight = 0;  // > 0: stretchy delimiter font for content this tall
+    int glyphHeight = 0;  // > 0: font scaled to span content this tall (big operators)
     bool isOperator = true;
     int mathPx = 0;       // > 0: Cambria Math at this pixel size (big operators)
 };
@@ -522,27 +541,141 @@ HFONT mathFontPx(int px) {
     return f;
 }
 
-// Ink box of one glyph in the selected font, relative to its origin on the
-// baseline: [left, left + width) x [top, top + height), top negative.
-struct GlyphInk {
-    int left = 0, top = 0, width = 0, height = 0;
-    bool valid = false;
+int glyphAdvance(HDC hdc, HFONT font, wchar_t ch) {
+    HFONT old = (HFONT)SelectObject(hdc, font);
+    SIZE size{};
+    GetTextExtentPoint32W(hdc, &ch, 1, &size);
+    SelectObject(hdc, old);
+    return size.cx;
+}
+
+// ---------------------------------------------------------------- stretchy delimiters
+//
+// Brackets around a plain line of text are the font's own glyphs. Taller
+// content gets the glyph stretched vertically, with its width capped near the
+// text's (as MathQuill does), so a tall paren keeps the stroke weight of the
+// digits beside it instead of scaling up into a heavy blob. Square brackets
+// are drawn as rules: stretching would thicken their serifs.
+
+struct Delimiter {
+    wchar_t glyph = L'(';
+    int depth = 0;
+    int top = 0, bottom = 0;        // ink span, offsets from the item baseline
+    int advance = 0;                // horizontal cell
+    int inkLeft = 0, inkWidth = 0;  // ink columns within the cell
+    int fontPx = 0, fontWidth = 0;  // stretched glyph font; fontPx == 0: the text font
+    int textTop = 0;                // TextOut y offset that puts the glyph's ink on the span
+    int stem = 0;                   // > 0: square bracket drawn as rules this thick
 };
 
-GlyphInk glyphInk(HDC hdc, HFONT font, wchar_t ch) {
+std::unordered_map<uint32_t, HFONT> g_delimiterFontCache;
+std::unordered_map<uint64_t, Delimiter> g_delimiterCache;
+std::unordered_map<int, int> g_stemCache;
+
+// Thickness of the text's vertical strokes at this depth (its '|' glyph):
+// brackets drawn as rules use it so they weigh the same as the digits.
+int stemWidth(HDC hdc, int depth) {
+    const int px = fontPxForDepth(depth);
+    auto it = g_stemCache.find(px);
+    if (it != g_stemCache.end()) return it->second;
+    const int stem = std::max(1, glyphInk(hdc, fontForDepth(depth), L'|').width);
+    g_stemCache[px] = stem;
+    return stem;
+}
+
+// Segoe UI at `px` with its average character width forced to `width`
+// (0 = natural), i.e. squeezed horizontally.
+HFONT delimiterFont(int px, int width) {
+    const uint32_t key = ((uint32_t)px << 12) ^ (uint32_t)width;
+    auto it = g_delimiterFontCache.find(key);
+    if (it != g_delimiterFontCache.end()) return it->second;
+    HFONT f = CreateFontW(-px, width, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                          DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                          CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    g_delimiterFontCache[key] = f;
+    return f;
+}
+
+// Delimiter glyph at this depth reaching as far as the content's ink.
+Delimiter delimiterFor(HDC hdc, int depth, const Size& content, wchar_t glyph) {
+    const int reachUp = std::clamp(content.inkAscent, 0, 0xFFFFF);
+    const int reachDown = std::clamp(content.inkDescent, 0, 0xFFFFF);
+    const uint64_t key = ((uint64_t)glyph << 48) | ((uint64_t)(depth & 0xFF) << 40) |
+                         ((uint64_t)reachUp << 20) | (uint64_t)reachDown;
+    auto cached = g_delimiterCache.find(key);
+    if (cached != g_delimiterCache.end()) return cached->second;
+
+    HFONT text = fontForDepth(depth);
+    const TEXTMETRICW tm = textMetricsForDepth(hdc, depth);
+    const GlyphInk plain = glyphInk(hdc, text, glyph);
+    Delimiter d;
+    d.glyph = glyph;
+    d.depth = depth;
+    d.advance = glyphAdvance(hdc, text, glyph);
+    d.textTop = -(int)tm.tmAscent;
+    d.top = plain.top;
+    d.bottom = plain.top + plain.height;
+    d.inkLeft = plain.left;
+    d.inkWidth = plain.width;
+
+    // Plain text reaches exactly as far as the plain glyph; a pixel of slack
+    // keeps placeholder boxes and rounding from stretching it.
+    const bool tallAbove = reachUp > -d.top + 1, tallBelow = reachDown > d.bottom + 1;
+    const GlyphInk probe = (tallAbove || tallBelow) ? glyphInk(hdc, delimiterFont(100, 0), glyph) : GlyphInk{};
+    if (plain.valid && probe.valid) {
+        if (tallAbove) d.top = -reachUp;
+        if (tallBelow) d.bottom = reachDown;
+        const int height = d.bottom - d.top;
+        const double widen = std::min(1.0 + 0.2 * ((double)height / plain.height - 1.0), 1.2);
+        if (glyph == L'[' || glyph == L']') {
+            d.stem = stemWidth(hdc, depth);
+            d.inkLeft = (int)std::lround(plain.left * widen);
+            d.inkWidth = std::max(d.stem + 1, (int)std::lround(plain.width * widen));
+            d.advance = (int)std::lround(d.advance * widen);
+        } else {
+            // Font sized so the glyph's ink spans the height, squeezed back
+            // to about the text's width.
+            d.fontPx = std::max(1, (int)std::lround(100.0 * height / probe.height));
+            d.fontWidth = std::max(1, (int)std::lround(tm.tmAveCharWidth * widen));
+            HFONT font = delimiterFont(d.fontPx, d.fontWidth);
+            const GlyphInk ink = glyphInk(hdc, font, glyph);
+            HFONT old = (HFONT)SelectObject(hdc, font);
+            TEXTMETRICW ftm{};
+            GetTextMetricsW(hdc, &ftm);
+            SelectObject(hdc, old);
+            d.advance = glyphAdvance(hdc, font, glyph);
+            d.inkLeft = ink.left;
+            d.inkWidth = ink.width;
+            // Center the rendered ink on the span (hinting rounds its height).
+            const int glyphBaseline = d.top + (height - ink.height) / 2 - ink.top;
+            d.textTop = glyphBaseline - (int)ftm.tmAscent;
+            d.top = glyphBaseline + ink.top;
+            d.bottom = d.top + ink.height;
+        }
+    }
+    g_delimiterCache[key] = d;
+    return d;
+}
+
+void drawDelimiter(HDC hdc, const Delimiter& d, int x, int baselineY, COLORREF color) {
+    if (d.stem > 0) {
+        const int left = x + d.inkLeft, right = left + d.inkWidth;
+        const int top = baselineY + d.top, bottom = baselineY + d.bottom;
+        const int stemX = d.glyph == L'[' ? left : right - d.stem;
+        const RECT rules[3] = { { stemX, top, stemX + d.stem, bottom },
+                                { left, top, right, top + d.stem },
+                                { left, bottom - d.stem, right, bottom } };
+        HBRUSH brush = CreateSolidBrush(color);
+        for (const RECT& r : rules) FillRect(hdc, &r, brush);
+        DeleteObject(brush);
+        return;
+    }
+    HFONT font = d.fontPx > 0 ? delimiterFont(d.fontPx, d.fontWidth) : fontForDepth(d.depth);
     HFONT old = (HFONT)SelectObject(hdc, font);
-    GLYPHMETRICS gm{};
-    const MAT2 identity = { { 0, 1 }, { 0, 0 }, { 0, 0 }, { 0, 1 } };
-    DWORD r = GetGlyphOutlineW(hdc, ch, GGO_METRICS, &gm, 0, nullptr, &identity);
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, color);
+    TextOutW(hdc, x, baselineY + d.textTop, &d.glyph, 1);
     SelectObject(hdc, old);
-    GlyphInk ink;
-    if (r == GDI_ERROR) return ink;
-    ink.left = gm.gmptGlyphOrigin.x;
-    ink.top = -gm.gmptGlyphOrigin.y;
-    ink.width = (int)gm.gmBlackBoxX;
-    ink.height = (int)gm.gmBlackBoxY;
-    ink.valid = ink.height > 0;
-    return ink;
 }
 
 enum class FnShapeKind { Bar, DoubleBar, FloorLeft, FloorRight, CeilLeft, CeilRight, Radical, Rule, IntegralSign };
@@ -564,11 +697,18 @@ struct FnRowPart {
     int depth = 0;
 };
 
+struct FnDelimiter {
+    Delimiter shape;
+    int x = 0;
+    int baseline = 0;
+};
+
 struct FnLayout {
     Size size;
     std::vector<FnText> texts;
     std::vector<FnShape> shapes;
     std::vector<FnRowPart> rows;
+    std::vector<FnDelimiter> delimiters;
 };
 
 // Lays parts out left to right around one baseline. Groups built in a
@@ -603,9 +743,10 @@ public:
     // Text at the pen, `shift` pixels below the baseline (negative raises).
     void text(const std::wstring& s, bool isOperator = true, int depth = -1, int shift = 0) {
         if (depth < 0) depth = depth_;
-        TEXTMETRICW tm = textMetricsForDepth(hdc_, depth);
+        const FontMetricsCache& m = metricsForDepth(hdc_, depth);
         out_.texts.push_back({ s, pen_, shift, depth, 0, isOperator });
-        cover(tm.tmAscent - shift, tm.tmDescent + shift);
+        cover(m.tm.tmAscent - shift, m.tm.tmDescent + shift);
+        reach(m.inkAscent - shift, m.inkDescent + shift);
         pen_ += extent(s, depth).cx;
     }
     void superscript(const std::wstring& s) { text(s, true, depth_ + 1, -raiseFor(depth_)); }
@@ -616,6 +757,7 @@ public:
         Size s = measureSliceImpl(hdc_, r, depth);
         out_.rows.push_back({ r, pen_, shift, depth });
         cover(s.ascent - shift, s.descent + shift);
+        reach(s.inkAscent - shift, s.inkDescent + shift);
         pen_ += s.width;
     }
 
@@ -636,34 +778,40 @@ public:
             r.baseline += shift;
             out_.rows.push_back(r);
         }
+        for (FnDelimiter d : g.delimiters) {
+            d.x += pen_;
+            d.baseline += shift;
+            out_.delimiters.push_back(d);
+        }
         cover(g.size.ascent - shift, g.size.descent + shift);
+        reach(g.size.inkAscent - shift, g.size.inkDescent + shift);
         pen_ += g.size.width;
     }
 
     // Stretchy parentheses, exactly like the Paren item draws them.
     void parens(const FnLayout& inner) {
-        const int h = inner.size.height();
-        const int glyphW = measureParenWidth(hdc_, depth_, h);
-        out_.texts.push_back({ L"(", pen_, 0, depth_, h, false });
-        pen_ += glyphW;
+        const Delimiter open = delimiterFor(hdc_, depth_, inner.size, L'(');
+        const Delimiter close = delimiterFor(hdc_, depth_, inner.size, L')');
+        out_.delimiters.push_back({ open, pen_, 0 });
+        pen_ += open.advance;
         group(inner);
-        out_.texts.push_back({ L")", pen_, 0, depth_, h, false });
-        pen_ += glyphW;
-        const int pad = scaledPx(2, depth_);
-        cover(inner.size.ascent + pad, inner.size.descent + pad);
+        out_.delimiters.push_back({ close, pen_, 0 });
+        pen_ += close.advance;
+        coverInk(-open.top, open.bottom);
     }
 
-    // Vector delimiters (|x|, ⌊x⌋, ‖v‖) that stretch with their contents.
+    // Vector delimiters (|x|, ⌊x⌋, ‖v‖) that stretch with their contents,
+    // as tall as parentheses around the same content.
     void delimited(FnShapeKind left, FnShapeKind right, const FnLayout& inner) {
-        const int pad = scaledPx(2, depth_);
-        const int top = -(inner.size.ascent + pad), bottom = inner.size.descent + pad;
+        const Delimiter span = delimiterFor(hdc_, depth_, inner.size, L'(');
+        const int top = span.top, bottom = span.bottom;
         const int w = scaledPx(left == FnShapeKind::DoubleBar ? 10 : 8, depth_);
         out_.shapes.push_back({ left, pen_, top, bottom, w, 0, depth_ });
         pen_ += w;
         group(inner);
         out_.shapes.push_back({ right, pen_, top, bottom, w, 0, depth_ });
         pen_ += w;
-        cover(-top, bottom);
+        coverInk(-top, bottom);
     }
 
     // Radical sign over a group, with an optional root index in its crook.
@@ -677,7 +825,9 @@ public:
             const int indexBaseline = top + (bottom - top) * 45 / 100;
             const int lead = std::max(0, indexW - signW / 2);
             out_.texts.push_back({ index, pen_ + std::max(0, signW / 2 - indexW) / 2, indexBaseline, d, 0, false });
-            cover(-(indexBaseline - (int)textMetricsForDepth(hdc_, d).tmAscent), 0);
+            const FontMetricsCache& m = metricsForDepth(hdc_, d);
+            cover(-(indexBaseline - (int)m.tm.tmAscent), 0);
+            reach(-(indexBaseline - m.inkAscent), 0);
             pen_ += lead;
         }
         out_.shapes.push_back({ FnShapeKind::Radical, pen_, top, bottom, signW,
@@ -685,7 +835,7 @@ public:
         pen_ += signW;
         group(inner);
         pen_ += scaledPx(4, depth_);
-        cover(-top, bottom);
+        coverInk(-top, bottom);
     }
 
     // Stacked fraction with its bar on the baseline, like the Fraction item.
@@ -709,7 +859,7 @@ public:
     // the glyph's ink box rather than its padded font cell.
     void bigOperator(const std::wstring& glyph, int contentHeight, const FnLayout& lower, const FnLayout& upper) {
         const int fontHeight = std::max(scaledPx(40, depth_), contentHeight + scaledPx(10, depth_));
-        HFONT font = createParenFont(depth_, fontHeight);
+        HFONT font = bigGlyphFont(depth_, fontHeight);
         GlyphInk ink = glyphInk(hdc_, font, glyph[0]);
         if (!ink.valid) {
             HFONT old = (HFONT)SelectObject(hdc_, font);
@@ -726,7 +876,7 @@ public:
         const int centerW = std::max(ink.width, std::max(lower.size.width, upper.size.width));
         const int x0 = pen_;
         out_.texts.push_back({ glyph, x0 + (centerW - ink.width) / 2 - ink.left, shift, depth_, fontHeight, true });
-        cover(-inkTop, inkBottom);
+        coverInk(-inkTop, inkBottom);
         pen_ = x0 + (centerW - upper.size.width) / 2;
         group(upper, inkTop - gap - upper.size.descent);
         pen_ = x0 + (centerW - lower.size.width) / 2;
@@ -763,6 +913,7 @@ public:
             out_.shapes.push_back({ FnShapeKind::IntegralSign, x0, -asc, desc, signW, 0, depth_ });
         }
         cover(asc + scaledPx(2, depth_), desc + scaledPx(2, depth_));
+        reach(asc, desc);
         int limitsW = 0;
         if (limits) {
             pen_ = x0 + signW + scaledPx(1, depth_);
@@ -776,13 +927,22 @@ public:
 
     void shape(const FnShape& s) {
         out_.shapes.push_back(s);
-        cover(-s.top, s.bottom);
+        coverInk(-s.top, s.bottom);
     }
 
 private:
     void cover(int asc, int desc) {
         out_.size.ascent = std::max(out_.size.ascent, asc);
         out_.size.descent = std::max(out_.size.descent, desc);
+    }
+    void reach(int asc, int desc) {
+        out_.size.inkAscent = std::max(out_.size.inkAscent, asc);
+        out_.size.inkDescent = std::max(out_.size.inkDescent, desc);
+    }
+    // Graphics: their box is their ink.
+    void coverInk(int asc, int desc) {
+        cover(asc, desc);
+        reach(asc, desc);
     }
 
     HDC hdc_;
@@ -1140,7 +1300,8 @@ FnLayout layoutStructure(HDC hdc, const Item* it, int depth) {
 Size measureRowImpl(HDC hdc, const Row* row, int depth) {
     if (rowIsEmpty(row)) return placeholderSize(depth);
     if (!row->layoutDirty && row->cachedDepth == depth) {
-        return { row->cachedWidth, row->cachedAscent, row->cachedDescent };
+        return { row->cachedWidth, row->cachedAscent, row->cachedDescent,
+                 row->cachedInkAscent, row->cachedInkDescent };
     }
     Size total;
     for (auto& it : row->items) {
@@ -1148,10 +1309,14 @@ Size measureRowImpl(HDC hdc, const Row* row, int depth) {
         total.width += s.width;
         total.ascent = std::max(total.ascent, s.ascent);
         total.descent = std::max(total.descent, s.descent);
+        total.inkAscent = std::max(total.inkAscent, s.inkAscent);
+        total.inkDescent = std::max(total.inkDescent, s.inkDescent);
     }
     row->cachedWidth = total.width;
     row->cachedAscent = total.ascent;
     row->cachedDescent = total.descent;
+    row->cachedInkAscent = total.inkAscent;
+    row->cachedInkDescent = total.inkDescent;
     row->cachedDepth = depth;
     row->layoutDirty = false;
     return total;
@@ -1177,7 +1342,9 @@ Size measureItemImpl(HDC hdc, const Item* it, int depth) {
             Size s;
             s.width = std::max(num.width, den.width) + 2 * hpad;
             s.ascent = num.height() + gap + bar;
-            s.descent = den.height() + gap;
+            s.descent = den.height() + gap + bar;  // the denominator sits gap + bar below
+            s.inkAscent = gap + bar + num.descent + num.inkAscent;
+            s.inkDescent = gap + bar + den.ascent + den.inkDescent;
             return s;
         }
         case ItemType::Power: {
@@ -1190,15 +1357,20 @@ Size measureItemImpl(HDC hdc, const Item* it, int depth) {
             s.width = baseRow.width + exp.width + scaledPx(2, depth);
             s.ascent = std::max(baseRow.ascent, raise + exp.height());
             s.descent = baseRow.descent;
+            s.inkAscent = std::max(baseRow.inkAscent, raise + exp.inkAscent);
+            s.inkDescent = std::max(baseRow.inkDescent, exp.inkDescent - raise);
             return s;
         }
         case ItemType::Paren: {
             Size inner = measureRowImpl(hdc, it->a.get(), depth);
-            int glyphW = measureParenWidth(hdc, depth, inner.height());
+            const Delimiter open = delimiterFor(hdc, depth, inner, openingDelimiter(it));
             Size s;
-            s.width = inner.width + (it->isClosed ? 2 : 1) * glyphW;
-            s.ascent = inner.ascent + scaledPx(2, depth);
-            s.descent = inner.descent + scaledPx(2, depth);
+            s.width = inner.width + open.advance;
+            if (it->isClosed) s.width += delimiterFor(hdc, depth, inner, closingDelimiter(it)).advance;
+            s.ascent = std::max(inner.ascent, -open.top);
+            s.descent = std::max(inner.descent, open.bottom);
+            s.inkAscent = std::max(inner.inkAscent, -open.top);
+            s.inkDescent = std::max(inner.inkDescent, open.bottom);
             return s;
         }
         case ItemType::Sqrt: {
@@ -1209,6 +1381,9 @@ Size measureItemImpl(HDC hdc, const Item* it, int depth) {
             s.width = inner.width + radicalW + scaledPx(4, depth);
             s.ascent = inner.ascent + roofPad;
             s.descent = inner.descent;
+            // The vinculum tops the box and the sign's foot reaches its bottom.
+            s.inkAscent = s.ascent;
+            s.inkDescent = s.descent;
             return s;
         }
         case ItemType::Name:
@@ -1243,7 +1418,8 @@ Size measureItemImpl(HDC hdc, const Item* it, int depth) {
             SIZE opSz{};
             GetTextExtentPoint32W(hdc, glyph, 1, &opSz);
             SelectObject(hdc, old);
-            TEXTMETRICW tm = textMetricsForDepth(hdc, depth);
+            const FontMetricsCache& m = metricsForDepth(hdc, depth);
+            const TEXTMETRICW& tm = m.tm;
             int raise = (int)(tm.tmAscent * 0.45);
             int drop = (int)(tm.tmDescent * 0.5) + scaledPx(3, depth);
             int pad = scaledPx(1, depth);
@@ -1251,6 +1427,8 @@ Size measureItemImpl(HDC hdc, const Item* it, int depth) {
             s.width = nSize.width + pad + opSz.cx + pad + rSize.width;
             s.ascent = std::max((int)tm.tmAscent, raise + nSize.ascent);
             s.descent = std::max((int)tm.tmDescent, drop + rSize.descent);
+            s.inkAscent = std::max(m.inkAscent, raise + nSize.inkAscent);
+            s.inkDescent = std::max(m.inkDescent, drop + rSize.inkDescent);
             return s;
         }
         case ItemType::Function:
@@ -1310,42 +1488,57 @@ void drawSliceImpl(HDC hdc, const RowRef& r, int depth, int x, int baselineY,
 }
 
 void drawFnShape(HDC hdc, const FnShape& s, int x, int baselineY, const Theme& theme) {
+    const int left = x + s.x, w = s.width;
+    const int top = baselineY + s.top, bottom = baselineY + s.bottom;
+
+    // Delimiters are ruled like the square brackets, at the text's stem weight.
+    RECT rules[3];
+    int ruleCount = 0;
+    const int t = stemWidth(hdc, s.depth), inset = w * 3 / 10;
+    auto stem = [&](int center) { rules[ruleCount++] = { center - t / 2, top, center - t / 2 + t, bottom }; };
+    auto serif = [&](int x0, int x1, bool atBottom) {
+        const int y = atBottom ? bottom - t : top;
+        rules[ruleCount++] = { x0, y, x1, y + t };
+    };
+    switch (s.kind) {
+        case FnShapeKind::Bar:
+            stem(left + w / 2);
+            break;
+        case FnShapeKind::DoubleBar:
+            stem(left + inset);
+            stem(left + w - inset);
+            break;
+        case FnShapeKind::FloorLeft:
+        case FnShapeKind::CeilLeft:
+            stem(left + inset);
+            serif(rules[0].left, left + w, s.kind == FnShapeKind::FloorLeft);
+            break;
+        case FnShapeKind::FloorRight:
+        case FnShapeKind::CeilRight:
+            stem(left + w - inset);
+            serif(left, rules[0].right, s.kind == FnShapeKind::FloorRight);
+            break;
+        default:
+            break;
+    }
+    if (ruleCount > 0) {
+        HBRUSH brush = CreateSolidBrush(theme.text);
+        for (int i = 0; i < ruleCount; ++i) FillRect(hdc, &rules[i], brush);
+        DeleteObject(brush);
+        return;
+    }
+
     const bool integral = s.kind == FnShapeKind::IntegralSign;
     int penW = std::max(1, scaledPx(2, s.depth) / 2);  // same weight as the sqrt radical
     if (integral) penW = std::max(2, scaledPx(2, s.depth));
     if (s.kind == FnShapeKind::Rule) penW = std::max(1, s.extra);
     HPEN pen = CreatePen(PS_SOLID, penW, integral ? theme.operatorColor : theme.text);
     HPEN oldPen = (HPEN)SelectObject(hdc, pen);
-    const int left = x + s.x, w = s.width;
-    const int top = baselineY + s.top, bottom = baselineY + s.bottom;
     auto line = [&](int x0, int y0, int x1, int y1) {
         MoveToEx(hdc, x0, y0, nullptr);
         LineTo(hdc, x1, y1);
     };
     switch (s.kind) {
-        case FnShapeKind::Bar:
-            line(left + w / 2, top, left + w / 2, bottom);
-            break;
-        case FnShapeKind::DoubleBar:
-            line(left + w * 3 / 10, top, left + w * 3 / 10, bottom);
-            line(left + w * 7 / 10, top, left + w * 7 / 10, bottom);
-            break;
-        case FnShapeKind::FloorLeft:
-        case FnShapeKind::CeilLeft: {
-            const int stem = left + w * 3 / 10;
-            const int serifY = s.kind == FnShapeKind::FloorLeft ? bottom : top;
-            line(stem, top, stem, bottom);
-            line(stem, serifY, left + w, serifY);
-            break;
-        }
-        case FnShapeKind::FloorRight:
-        case FnShapeKind::CeilRight: {
-            const int stem = left + w * 7 / 10;
-            const int serifY = s.kind == FnShapeKind::FloorRight ? bottom : top;
-            line(stem, top, stem, bottom);
-            line(stem, serifY, left, serifY);
-            break;
-        }
         case FnShapeKind::Radical: {
             POINT pts[4] = {
                 { left, top + (bottom - top) * 2 / 3 },
@@ -1376,6 +1569,8 @@ void drawFnShape(HDC hdc, const FnShape& s, int x, int baselineY, const Theme& t
             PolyBezier(hdc, pts, 7);
             break;
         }
+        default:
+            break;
     }
     SelectObject(hdc, oldPen);
     DeleteObject(pen);
@@ -1386,7 +1581,7 @@ void drawFnLayout(HDC hdc, const FnLayout& layout, int x, int baselineY, const T
     SetBkMode(hdc, TRANSPARENT);
     for (const FnText& t : layout.texts) {
         HFONT font = t.mathPx > 0 ? mathFontPx(t.mathPx)
-                   : t.parenHeight > 0 ? createParenFont(t.depth, t.parenHeight)
+                   : t.glyphHeight > 0 ? bigGlyphFont(t.depth, t.glyphHeight)
                    : fontForDepth(t.depth);
         HFONT old = (HFONT)SelectObject(hdc, font);
         TEXTMETRICW tm{};
@@ -1396,6 +1591,8 @@ void drawFnLayout(HDC hdc, const FnLayout& layout, int x, int baselineY, const T
         SelectObject(hdc, old);
     }
     for (const FnShape& s : layout.shapes) drawFnShape(hdc, s, x, baselineY, theme);
+    for (const FnDelimiter& d : layout.delimiters)
+        drawDelimiter(hdc, d.shape, x + d.x, baselineY + d.baseline, theme.text);
     for (const FnRowPart& r : layout.rows)
         drawSliceImpl(hdc, r.ref, r.depth, x + r.x, baselineY + r.baseline, theme, cursor, outCaret);
 }
@@ -1532,25 +1729,15 @@ void drawItemImpl(HDC hdc, const Item* it, int depth, int x, int baselineY,
         }
         case ItemType::Paren: {
             Size inner = measureRowImpl(hdc, it->a.get(), depth);
-            int glyphW = measureParenWidth(hdc, depth, inner.height());
-            HFONT parenFont = createParenFont(depth, inner.height());
-            HFONT oldFont = (HFONT)SelectObject(hdc, parenFont);
-            SetBkMode(hdc, TRANSPARENT);
-            const bool unmatchedOpen = g_unmatchedOpenDelimiters.count(it) != 0;
-            const bool unmatchedClose = g_unmatchedCloseDelimiters.count(it) != 0;
-            SetTextColor(hdc, unmatchedOpen || unmatchedClose ? theme.accent : theme.text);
-            TEXTMETRICW metrics{};
-            GetTextMetricsW(hdc, &metrics);
-            const wchar_t* openG = it->isBrace ? L"{" : (it->isBracket ? L"[" : L"(");
-            const wchar_t* closeG = it->isBrace ? L"}" : (it->isBracket ? L"]" : L")");
-            SetTextColor(hdc, unmatchedOpen ? theme.accent : theme.text);
-            TextOutW(hdc, x, baselineY - metrics.tmAscent, openG, 1);
-            drawRowImpl(hdc, it->a.get(), depth, x + glyphW, baselineY, theme, cursor, outCaret);
+            const Delimiter open = delimiterFor(hdc, depth, inner, openingDelimiter(it));
+            drawDelimiter(hdc, open, x, baselineY,
+                          g_unmatchedOpenDelimiters.count(it) ? theme.accent : theme.text);
+            drawRowImpl(hdc, it->a.get(), depth, x + open.advance, baselineY, theme, cursor, outCaret);
             if (it->isClosed) {
-                SetTextColor(hdc, unmatchedClose ? theme.accent : theme.text);
-                TextOutW(hdc, x + glyphW + inner.width, baselineY - metrics.tmAscent, closeG, 1);
+                drawDelimiter(hdc, delimiterFor(hdc, depth, inner, closingDelimiter(it)),
+                              x + open.advance + inner.width, baselineY,
+                              g_unmatchedCloseDelimiters.count(it) ? theme.accent : theme.text);
             }
-            SelectObject(hdc, oldFont);
             return;
         }
         case ItemType::Summation:
@@ -1660,8 +1847,8 @@ void findItemHit(HDC hdc, Row* parent, int index, Item* item, int depth,
             return;
         case ItemType::Paren: {
             Size inner = measureRowImpl(hdc, item->a.get(), depth);
-            int glyphW = measureParenWidth(hdc, depth, inner.height());
-            findRowHit(hdc, item->a.get(), depth, x + glyphW, baselineY,
+            const int openW = delimiterFor(hdc, depth, inner, openingDelimiter(item)).advance;
+            findRowHit(hdc, item->a.get(), depth, x + openW, baselineY,
                        pointX, pointY, best);
             return;
         }
@@ -1810,11 +1997,14 @@ int fontHeightForDepth(int depth) { return fontPxForDepth(depth); }
 void shutdownFonts() {
     for (auto& kv : g_fontCache) DeleteObject(kv.second);
     g_fontCache.clear();
-    for (auto& kv : g_parenFontCache) DeleteObject(kv.second);
-    g_parenFontCache.clear();
+    for (auto& kv : g_bigGlyphFontCache) DeleteObject(kv.second);
+    g_bigGlyphFontCache.clear();
+    for (auto& kv : g_delimiterFontCache) DeleteObject(kv.second);
+    g_delimiterFontCache.clear();
+    g_delimiterCache.clear();
+    g_stemCache.clear();
     for (auto& kv : g_mathFontCache) DeleteObject(kv.second);
     g_mathFontCache.clear();
-    g_parenWidthCache.clear();
     g_tmCache.clear();
 }
 

@@ -21,6 +21,11 @@ struct Size {
     int width = 0;
     int ascent = 0;
     int descent = 0;
+    // How far above/below the baseline a bracket around this content has to
+    // reach: text counts as tall as a plain parenthesis beside it, graphics
+    // (radicals, bars, brackets) as drawn. Within ascent/descent.
+    int inkAscent = 0;
+    int inkDescent = 0;
     int height() const { return ascent + descent; }
 };
 

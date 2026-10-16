@@ -79,6 +79,8 @@ void fillRoundRect(HDC hdc, const RECT& r, float radius, COLORREF fill, COLORREF
 // Gradient from opaque `color` to transparent across `band`, marking content
 // that continues past a scroll edge. `opaqueAtTop` picks the solid side.
 void fadeEdge(HDC hdc, const RECT& band, COLORREF color, bool opaqueAtTop);
+// The same for a side edge of horizontally scrolled content.
+void fadeEdgeH(HDC hdc, const RECT& band, COLORREF color, bool opaqueAtLeft);
 
 void drawKeyCap(HDC hdc, const RECT& r, KeyRole role, KeyState state, const std::wstring& label,
                 const UiPalette& palette, const UiFonts& fonts);

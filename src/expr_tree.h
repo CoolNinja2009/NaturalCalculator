@@ -151,6 +151,8 @@ struct Row {
     mutable int cachedWidth = 0;
     mutable int cachedAscent = 0;
     mutable int cachedDescent = 0;
+    mutable int cachedInkAscent = 0;
+    mutable int cachedInkDescent = 0;
     mutable int cachedDepth = -1;
     mutable bool layoutDirty = true;
 

@@ -3,8 +3,10 @@
 #include "layout.h"
 #include "workspace.h"
 #include "graph.h"
+#include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <iostream>
 
@@ -408,6 +410,73 @@ static void testClickPlacesStructuralCursor() {
     insertDigit(power, '4');
     assert(power.toPlainString() == "x^(42) + 3");
     assertNear(evaluate(power.root.get(), { 2.0, 0.0 }), std::pow(2.0, 42.0) + 3.0);
+    DeleteDC(hdc);
+}
+
+// Topmost and bottommost rows with ink in columns [x0, x1) of a white-on-black
+// render; top > bottom when there is none.
+static void inkRows(const uint32_t* pixels, int width, int height, int x0, int x1,
+                    int& top, int& bottom) {
+    top = height;
+    bottom = -1;
+    for (int y = 0; y < height; ++y)
+        for (int x = x0; x < x1; ++x)
+            if (pixels[y * width + x] & 0xFFFFFF) {
+                top = std::min(top, y);
+                bottom = std::max(bottom, y);
+            }
+}
+
+static void testBracketsFitTheirContent() {
+    HDC hdc = CreateCompatibleDC(nullptr);
+    assert(hdc);
+    auto measure = [&](const char* text) {
+        Expression e;
+        insertFromText(e, text);
+        return measureExpression(hdc, e.root.get());
+    };
+
+    // Around plain text a paren is the font's own glyph: no extra height.
+    const Size digits = measure("12"), plain = measure("(12)");
+    assert(plain.ascent == digits.ascent && plain.descent == digits.descent);
+    const int plainParens = plain.width - digits.width;
+    assert(plainParens > 0);
+
+    // Around tall content it stretches to cover the content but stays about
+    // as wide (and as light) as the plain glyph instead of scaling up.
+    const Size stack = measure("1/2/3"), tall = measure("(1/2/3)");
+    assert(tall.inkAscent >= stack.inkAscent && tall.inkDescent >= stack.inkDescent);
+    assert(tall.width - stack.width <= plainParens * 3 / 2);
+
+    // A radical's vinculum is ink at the very top of its box; the paren
+    // has to reach it even though no text sits that high.
+    Expression root;
+    insertFromText(root, "(sqrt(2))");
+    const Size rootSize = measureExpression(hdc, root.root.get());
+    const int width = rootSize.width + 8, height = rootSize.height() + 8;
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = width;
+    bi.bmiHeader.biHeight = -height;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    void* bits = nullptr;
+    HBITMAP bitmap = CreateDIBSection(hdc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    assert(bitmap && bits);
+    HGDIOBJ oldBitmap = SelectObject(hdc, bitmap);
+    RECT all{ 0, 0, width, height };
+    FillRect(hdc, &all, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    Theme theme = darkTheme();
+    theme.text = theme.operatorColor = theme.accent = RGB(255, 255, 255);
+    drawExpression(hdc, root.root.get(), 4, 4 + rootSize.ascent, theme, nullptr, nullptr);
+    GdiFlush();
+    const int parenW = (rootSize.width - measure("sqrt(2)").width) / 2;
+    int parenTop, parenBottom, allTop, allBottom;
+    inkRows((const uint32_t*)bits, width, height, 4, 4 + parenW, parenTop, parenBottom);
+    inkRows((const uint32_t*)bits, width, height, 0, width, allTop, allBottom);
+    assert(parenTop <= allTop + 1 && parenBottom >= allBottom - 1);
+    SelectObject(hdc, oldBitmap);
+    DeleteObject(bitmap);
     DeleteDC(hdc);
 }
 
@@ -921,6 +990,7 @@ int main() {
     testStandaloneClosingParen();
     testCloseParenExitsNestedStructure();
     testClickPlacesStructuralCursor();
+    testBracketsFitTheirContent();
     testPowerEditing();
     testCombinatoricsTypingAndEvaluation();
     testAllScientificFunctions();

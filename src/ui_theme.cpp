@@ -175,6 +175,17 @@ void fadeEdge(HDC hdc, const RECT& band, COLORREF color, bool opaqueAtTop) {
     graphics.FillRectangle(&brush, (INT)band.left, (INT)band.top, (INT)(band.right - band.left), (INT)h);
 }
 
+void fadeEdgeH(HDC hdc, const RECT& band, COLORREF color, bool opaqueAtLeft) {
+    int w = band.right - band.left;
+    if (w <= 0 || band.bottom <= band.top) return;
+    Gdiplus::Graphics graphics(hdc);
+    Gdiplus::Color solid = gp(color, 255), clear = gp(color, 0);
+    // Start one pixel outside so the opaque end fully covers the edge column.
+    Gdiplus::LinearGradientBrush brush(Gdiplus::Point(band.left - 1, 0), Gdiplus::Point(band.right, 0),
+                                       opaqueAtLeft ? solid : clear, opaqueAtLeft ? clear : solid);
+    graphics.FillRectangle(&brush, (INT)band.left, (INT)band.top, (INT)w, (INT)(band.bottom - band.top));
+}
+
 void drawKeyCap(HDC hdc, const RECT& r, KeyRole role, KeyState state, const std::wstring& label,
                 const UiPalette& palette, const UiFonts& fonts) {
     KeyColors colors = keyColorsForState(palette.keys[(int)role], role, state, palette.dark);
