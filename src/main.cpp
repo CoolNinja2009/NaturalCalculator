@@ -845,8 +845,8 @@ void insertPlainText(Expression& expression, const std::string& text) {
 void replaceEditorSelection(const std::string& replacement) {
     Expression& expression = g.workspace.current();
     std::string plain = expression.toPlainString();
-    int begin = std::min(g.editorAnchor, g.editorCaret);
-    int end = std::max(g.editorAnchor, g.editorCaret);
+    int begin = g.allSelected ? 0 : std::min(g.editorAnchor, g.editorCaret);
+    int end = g.allSelected ? (int)plain.size() : std::max(g.editorAnchor, g.editorCaret);
     if (begin < 0 || end > (int)plain.size() || begin >= end) return;
     plain.replace(begin, end - begin, replacement);
     expression = Expression();
@@ -856,6 +856,15 @@ void replaceEditorSelection(const std::string& replacement) {
     g.editorCaret = 0;
     g.allSelected = false;
     g.rangeSelected = false;
+}
+
+void clearAllSelectedExpression() {
+    g.workspace.current() = Expression();
+    g.allSelected = false;
+    g.rangeSelected = false;
+    g.editorTextCursor = -1;
+    g.editorAnchor = 0;
+    g.editorCaret = 0;
 }
 
 void rebuildEditorText(const std::string& text, int cursorPosition) {
@@ -2745,6 +2754,57 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             wchar_t c = (wchar_t)wParam;
             stampInput();
             flashKeyForAction(actionForChar(c));
+            if (g.allSelected) {
+                if (c == 8) {
+                    g.undo.push_back(cloneExpression(g.workspace.current()));
+                    clearAllSelectedExpression();
+                    ensureCaretVisible();
+                    invalidateEdit();
+                    return 0;
+                }
+                if ((c >= L'0' && c <= L'9') || c == L'.' || c == L'+' || c == L'-' ||
+                    c == L'*' || c == L'/' || c == L'(' || c == L')' || c == L'^' ||
+                    c == L'[' || c == L']' || c == L',' || c == L';') {
+                    int action = -1;
+                    if (c >= L'0' && c <= L'9') action = ActDigit0 + (c - L'0');
+                    else if (c == L'.') action = ActDot;
+                    else if (c == L'+') action = ActPlus;
+                    else if (c == L'-') action = ActMinus;
+                    else if (c == L'*') action = ActMul;
+                    else if (c == L'/') action = ActFrac;
+                    else if (c == L'(') action = ActOpenParen;
+                    else if (c == L')') action = ActCloseParen;
+                    else if (c == L'[') action = ActOpenBracket;
+                    else if (c == L']') action = ActCloseParen;
+                    else if (c == L'^') action = ActPower;
+                    else if (c == L',') action = ActComma;
+                    else if (c == L';') action = ActSemicolon;
+                    doAction(action);
+                    return 0;
+                }
+                if ((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z')) {
+                    g.undo.push_back(cloneExpression(g.workspace.current()));
+                    clearAllSelectedExpression();
+                    insertNameLetter(g.workspace.current(), (char)tolower((char)c));
+                    normalizeNames(g.workspace.current());
+                    ensureCaretVisible();
+                    invalidateEdit();
+                    return 0;
+                }
+                if (c == L'!' || c == L'%' || c == L'=' || c == L'{' || c == L'}') {
+                    g.undo.push_back(cloneExpression(g.workspace.current()));
+                    clearAllSelectedExpression();
+                    Expression& current = g.workspace.current();
+                    if (c == L'!') insertOperator(current, '!');
+                    else if (c == L'%') insertOperator(current, '%');
+                    else if (c == L'=') insertEquals(current);
+                    else if (c == L'{') insertOpenBrace(current);
+                    else insertCloseParen(current);
+                    ensureCaretVisible();
+                    invalidateEdit();
+                    return 0;
+                }
+            }
             if (g.editorTextCursor >= 0 && !g.allSelected && !g.rangeSelected) {
                 std::string text = g.workspace.current().toPlainString();
                 int position = currentEditorTextCursor();
@@ -2769,7 +2829,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 invalidateEdit();
                 return 0;
             }
-            if (c == L'!' || c == L'=' || c == L'%' || c == L',' || c == L';')
+            if (!g.allSelected && (c == L'!' || c == L'=' || c == L'%' || c == L',' || c == L';'))
                 g.undo.push_back(cloneExpression(g.workspace.current()));
             if (g.editorCaret != g.editorAnchor) {
                 if (c == 8) replaceEditorSelection("");
@@ -2780,6 +2840,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                          ((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z'))) {
                     char replacement = (char)c;
                     if (replacement == '/') replacement = '/';
+                    if (c != L'!' && c != L'=' && c != L'%' && c != L',' && c != L';')
+                        g.undo.push_back(cloneExpression(g.workspace.current()));
                     replaceEditorSelection(std::string(1, replacement));
                 } else return 0;
                 ensureCaretVisible();

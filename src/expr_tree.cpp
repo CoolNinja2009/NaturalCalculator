@@ -429,7 +429,8 @@ static void serializeItem(const Item* it, std::string& out) {
         case ItemType::Paren:
             out += it->isBrace ? '{' : (it->isBracket ? '[' : '(');
             serializeRow(it->a.get(), out);
-            out += it->isBrace ? '}' : (it->isBracket ? ']' : ')');
+            if (it->isClosed)
+                out += it->isBrace ? '}' : (it->isBracket ? ']' : ')');
             break;
         case ItemType::Power: {
             bool needsParensBase = !(it->a && (it->a->items.size() == 1 &&
@@ -593,6 +594,7 @@ std::unique_ptr<Row> cloneRow(const Row* source, Item* owner, Row* parent) {
         item->functionId = sourceItem->functionId;
         item->isBracket = sourceItem->isBracket;
         item->isBrace = sourceItem->isBrace;
+        item->isClosed = sourceItem->isClosed;
         Item* itemPtr = item.get();
         if (sourceItem->a) item->a = cloneRow(sourceItem->a.get(), itemPtr, copy.get());
         if (sourceItem->b) item->b = cloneRow(sourceItem->b.get(), itemPtr, copy.get());
@@ -980,6 +982,10 @@ void insertCloseParen(Expression& expr) {
             row->owner->type == ItemType::Summation ||
             row->owner->type == ItemType::Product ||
             row->owner->type == ItemType::Derivative) {
+            if (row->owner->type == ItemType::Paren) {
+                row->owner->isClosed = true;
+                row->ownerParentRow->invalidateLayout();
+            }
             expr.cursor.row = row->ownerParentRow;
             expr.cursor.index = k + 1;
             return;
@@ -1517,7 +1523,7 @@ static bool normalizeRowNames(Expression& expr, Row* row) {
         // "sin(" (Name followed directly by a Paren) becomes a real call:
         // the paren's inner row is adopted as the argument.
         Item* next = (i + 1 < row->items.size()) ? row->items[i + 1].get() : nullptr;
-        if (next && next->type == ItemType::Paren) {
+        if (next && next->type == ItemType::Paren && next->isClosed) {
             int functionId = -1;
             bool isSqrt = (lower == "sqrt");
             if (isSqrt || findSciFunction(lower, functionId)) {

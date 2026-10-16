@@ -45,6 +45,25 @@ static std::string evalTextString(const char* text, const EvaluationContext& con
     return evaluateToString(expression.root.get(), context);
 }
 
+static void testParenthesesRequireExplicitClose() {
+    Expression expression;
+    insertOpenParen(expression);
+    assert(expression.toPlainString() == "(");
+    insertDigit(expression, '2');
+    assert(expression.toPlainString() == "(2");
+    insertCloseParen(expression);
+    assert(expression.toPlainString() == "(2)");
+    assert(expression.root->items[0]->isClosed);
+
+    Expression unfinished;
+    insertFromText(unfinished, "(2");
+    assert(unfinished.toPlainString() == "(2");
+
+    Expression functionCall;
+    insertFromText(functionCall, "sin(30)");
+    assert(functionCall.toPlainString() == "sin(30)");
+}
+
 static void testVariableEvaluation() {
     Expression expression = expressionFrom("x+2*y");
     assertNear(evaluate(expression.root.get(), { 3.0, 4.0 }), 11.0);
@@ -534,15 +553,19 @@ static void testSciFunctions() {
 static void testSciTypingAndText() {
     EvaluationContext deg;
 
-    // Letter-by-letter typing resolves on the next non-letter edit.
+    // Typed function calls stay open until an explicit closing delimiter.
     Expression typed;
     insertNameLetter(typed, 's');
     insertNameLetter(typed, 'i');
     insertNameLetter(typed, 'n');
     insertOpenParen(typed);
-    normalizeNames(typed);   // doAction() performs this after button edits
+    normalizeNames(typed);
+    assert(typed.toPlainString() == "sin(");
     insertDigit(typed, '3');
     insertDigit(typed, '0');
+    assert(typed.toPlainString() == "sin(30");
+    insertCloseParen(typed);
+    normalizeNames(typed);
     assert(typed.root->items[0]->type == ItemType::Function);
     assert(typed.root->items[0]->functionId == SciSin);
     assertNear(evaluate(typed.root.get(), deg), 0.5);
@@ -555,6 +578,8 @@ static void testSciTypingAndText() {
     insertOpenParen(expTyped);
     normalizeNames(expTyped);
     insertDigit(expTyped, '1');
+    insertCloseParen(expTyped);
+    normalizeNames(expTyped);
     assert(expTyped.root->items[0]->type == ItemType::Function);
     assertNear(evaluate(expTyped.root.get(), deg), 2.718281828459045);
 
@@ -878,6 +903,7 @@ void testCalculusAndMatrices();
 void testNaturalCalculusAndSetOperations();
 
 int main() {
+    testParenthesesRequireExplicitClose();
     testVariableEvaluation();
     testSingleVariableEquation();
     testSystems();

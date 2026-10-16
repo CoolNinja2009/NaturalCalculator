@@ -916,6 +916,7 @@ static std::unique_ptr<Item> copyItem(const Item* source) {
     it->functionId = source->functionId;
     it->isBracket = source->isBracket;
     it->isBrace = source->isBrace;
+    it->isClosed = source->isClosed;
     if (source->a) it->a = cloneRow(source->a.get());
     if (source->b) it->b = cloneRow(source->b.get());
     if (source->c) it->c = cloneRow(source->c.get());

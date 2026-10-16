@@ -185,6 +185,7 @@ std::unique_ptr<Item> copyItem(const Item* it, Bound bound, const EvaluationCont
     copy->functionId = it->functionId;
     copy->isBracket = it->isBracket;
     copy->isBrace = it->isBrace;
+    copy->isClosed = it->isClosed;
 
     // The body of an integral/derivative/sum binds its variable; limits and
     // evaluation points see the outer bindings. Calculus function forms keep

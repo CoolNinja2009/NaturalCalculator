@@ -6,6 +6,7 @@
 #include <limits>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 Theme lightTheme() {
@@ -64,6 +65,54 @@ constexpr int kMinFontPx = 10;
 constexpr int kMaxDepth = 6;
 
 std::unordered_map<int, HFONT> g_fontCache;
+thread_local std::unordered_set<const Item*> g_unmatchedOpenDelimiters;
+thread_local std::unordered_set<const Item*> g_unmatchedCloseDelimiters;
+
+struct OpenDelimiter {
+    const Item* item;
+    wchar_t kind;
+};
+
+wchar_t openingDelimiter(const Item* item) {
+    return item->isBrace ? L'{' : (item->isBracket ? L'[' : L'(');
+}
+
+wchar_t closingDelimiter(const Item* item) {
+    return item->isBrace ? L'}' : (item->isBracket ? L']' : L')');
+}
+
+void matchClosingDelimiter(const Item* item, wchar_t kind,
+                           std::vector<OpenDelimiter>& openDelimiters) {
+    wchar_t expectedOpen = kind == L')' ? L'(' : (kind == L']' ? L'[' : L'{');
+    if (!openDelimiters.empty() && openDelimiters.back().kind == expectedOpen) {
+        openDelimiters.pop_back();
+    } else {
+        g_unmatchedCloseDelimiters.insert(item);
+    }
+}
+
+void findUnmatchedDelimiters(const Row* row, std::vector<OpenDelimiter>& openDelimiters) {
+    if (!row) return;
+    for (const auto& item : row->items) {
+        switch (item->type) {
+            case ItemType::Paren:
+                openDelimiters.push_back({ item.get(), openingDelimiter(item.get()) });
+                findUnmatchedDelimiters(item->a.get(), openDelimiters);
+                if (item->isClosed)
+                    matchClosingDelimiter(item.get(), closingDelimiter(item.get()), openDelimiters);
+                break;
+            case ItemType::CloseParen:
+                matchClosingDelimiter(item.get(), closingDelimiter(item.get()), openDelimiters);
+                break;
+            default:
+                findUnmatchedDelimiters(item->a.get(), openDelimiters);
+                findUnmatchedDelimiters(item->b.get(), openDelimiters);
+                findUnmatchedDelimiters(item->c.get(), openDelimiters);
+                findUnmatchedDelimiters(item->d.get(), openDelimiters);
+                break;
+        }
+    }
+}
 
 int fontPxForDepth(int depth) {
     if (depth > kMaxDepth) depth = kMaxDepth;
@@ -1147,7 +1196,7 @@ Size measureItemImpl(HDC hdc, const Item* it, int depth) {
             Size inner = measureRowImpl(hdc, it->a.get(), depth);
             int glyphW = measureParenWidth(hdc, depth, inner.height());
             Size s;
-            s.width = inner.width + 2 * glyphW;
+            s.width = inner.width + (it->isClosed ? 2 : 1) * glyphW;
             s.ascent = inner.ascent + scaledPx(2, depth);
             s.descent = inner.descent + scaledPx(2, depth);
             return s;
@@ -1405,7 +1454,8 @@ void drawItemImpl(HDC hdc, const Item* it, int depth, int x, int baselineY,
             drawText(hdc, depth, x, baselineY, L" = ", theme.operatorColor);
             return;
         case ItemType::CloseParen:
-            drawText(hdc, depth, x, baselineY, L")", theme.text);
+            drawText(hdc, depth, x, baselineY, L")",
+                     g_unmatchedCloseDelimiters.count(it) ? theme.accent : theme.text);
             return;
         case ItemType::Operator: {
             drawText(hdc, depth, x, baselineY, opGlyph(it->opChar), theme.operatorColor);
@@ -1486,14 +1536,20 @@ void drawItemImpl(HDC hdc, const Item* it, int depth, int x, int baselineY,
             HFONT parenFont = createParenFont(depth, inner.height());
             HFONT oldFont = (HFONT)SelectObject(hdc, parenFont);
             SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, theme.text);
+            const bool unmatchedOpen = g_unmatchedOpenDelimiters.count(it) != 0;
+            const bool unmatchedClose = g_unmatchedCloseDelimiters.count(it) != 0;
+            SetTextColor(hdc, unmatchedOpen || unmatchedClose ? theme.accent : theme.text);
             TEXTMETRICW metrics{};
             GetTextMetricsW(hdc, &metrics);
             const wchar_t* openG = it->isBrace ? L"{" : (it->isBracket ? L"[" : L"(");
             const wchar_t* closeG = it->isBrace ? L"}" : (it->isBracket ? L"]" : L")");
+            SetTextColor(hdc, unmatchedOpen ? theme.accent : theme.text);
             TextOutW(hdc, x, baselineY - metrics.tmAscent, openG, 1);
             drawRowImpl(hdc, it->a.get(), depth, x + glyphW, baselineY, theme, cursor, outCaret);
-            TextOutW(hdc, x + glyphW + inner.width, baselineY - metrics.tmAscent, closeG, 1);
+            if (it->isClosed) {
+                SetTextColor(hdc, unmatchedClose ? theme.accent : theme.text);
+                TextOutW(hdc, x + glyphW + inner.width, baselineY - metrics.tmAscent, closeG, 1);
+            }
             SelectObject(hdc, oldFont);
             return;
         }
@@ -1713,6 +1769,12 @@ Size measureExpression(HDC hdc, const Row* root) { return measureExpressionImpl(
 void drawExpression(HDC hdc, const Row* root, int originX, int baselineY,
                      const Theme& theme, const Cursor* cursor, CaretInfo* outCaret) {
     if (outCaret) *outCaret = CaretInfo{};
+    g_unmatchedOpenDelimiters.clear();
+    g_unmatchedCloseDelimiters.clear();
+    std::vector<OpenDelimiter> openDelimiters;
+    findUnmatchedDelimiters(root, openDelimiters);
+    for (const OpenDelimiter& delimiter : openDelimiters)
+        g_unmatchedOpenDelimiters.insert(delimiter.item);
     drawRowImpl(hdc, root, 0, originX, baselineY, theme, cursor, outCaret);
 }
 
@@ -1917,7 +1979,8 @@ void appendItemText(const Item* it, bool unary, std::wstring& out) {
         case ItemType::Paren:
             out += it->isBrace ? L'{' : (it->isBracket ? L'[' : L'(');
             out += refText(wholeRow(it->a.get()));
-            out += it->isBrace ? L'}' : (it->isBracket ? L']' : L')');
+            if (it->isClosed)
+                out += it->isBrace ? L'}' : (it->isBracket ? L']' : L')');
             break;
         case ItemType::Function: out += functionText(it); break;
         case ItemType::Permutation:

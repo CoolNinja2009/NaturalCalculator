@@ -113,6 +113,8 @@ struct Item {
     bool isBracket = false;
     // Set / brace styling: true if curly brace { ... }
     bool isBrace = false;
+    // Parentheses are closed only after an explicit closing delimiter.
+    bool isClosed = false;
 
     // Structural children. Meaning depends on `type`:
     //   Fraction:   a = numerator,   b = denominator
