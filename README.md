@@ -97,6 +97,10 @@ g++ src\*.cpp build\app_res.o -o build\NaturalCalculator.exe `
 
 The resulting standalone executable will be generated at `build/NaturalCalculator.exe`.
 
+### GitHub Releases
+
+Each successful push to `main` or `master` publishes a new, separately dated release with the portable executable. The newest release is marked **Latest**; earlier releases remain available in the [release history](https://github.com/CoolNinja2009/TheRealCalculator/releases).
+
 ---
 
 ## Usage & Controls

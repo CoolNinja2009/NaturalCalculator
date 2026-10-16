@@ -49,10 +49,11 @@ jobs:
       uses: softprops/action-gh-release@v2
       if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
       with:
-        tag_name: latest
-        name: Natural Calculator (Latest)
+        tag_name: build-${{ github.run_number }}
+        name: Natural Calculator (${{ github.run_number }})
         make_latest: true
         body: |
           ### Portable Executable (Windows)
           Download the standalone `NaturalCalculator.exe` below. No installation required.
+          This release was built from commit `${{ github.sha }}`.
         files: build/NaturalCalculator.exe
