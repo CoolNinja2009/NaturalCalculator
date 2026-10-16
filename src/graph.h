@@ -76,14 +76,29 @@ enum class ByteOp : uint8_t {
     Round,
     Trunc,
     Sgn,
-    Fact
+    Fact,
+    SciCall,    // any other one-argument scientific function; id taken from fnIds
+    Zeta,
+    Atan2,
+    Hypot,
+    Beta,
+    Gcd,
+    Lcm,
+    Min,
+    Max,
+    Clamp,
+    Lerp,
+    Ncr,
+    Npr
 };
 
 struct BytecodeProgram {
     std::vector<ByteOp> ops;
     std::vector<double> consts;
+    std::vector<int> fnIds;     // operands of SciCall, consumed in order
     bool isValid = false;
 
+    // Never throws: domain errors and undefined points evaluate to NaN.
     double execute(double x, double y) const;
 };
 
@@ -94,6 +109,7 @@ struct GraphAnalysis {
     GraphEquationKind kind = GraphEquationKind::None;
     bool isValid = false;
     std::string title;
+    std::wstring displayTitle;  // natural-notation title shown in the graph header
     std::string description;
     // Cloned AST rows isolated from active editor state for reentrant evaluation
     std::unique_ptr<Row> leftRow;
@@ -107,6 +123,10 @@ struct GraphAnalysis {
     double evalExplicit(double x) const;
     double evalExplicitX(double y) const;
     double evalImplicit(double x, double y) const;
+
+    // True when bytecode covers the whole equation, so evaluation is cheap,
+    // thread-safe and exception-free (the renderer samples more densely then).
+    bool hasFastEval() const;
 };
 
 struct GraphPalette {
@@ -129,12 +149,31 @@ std::string formatAxisNumber(double v, double step);
 // if it is a graph-valid equation or expression.
 GraphAnalysis analyzeGraphExpression(const Row* root, const EvaluationContext& context);
 
+// Double-precision mapping between math coordinates and a w x h pixel panel.
+// Pixel (i, j) covers [i, i+1) x [j, j+1) with its center at (i + 0.5, j + 0.5);
+// pixel y grows downward. All curve geometry is computed through this in
+// double so lines stay crisp far beyond float32's zoom limits.
+struct GraphView {
+    double minX = -10.0, maxX = 10.0, minY = -10.0, maxY = 10.0;
+    int w = 0, h = 0;
+
+    double pxPerUnitX() const { return w / (maxX - minX); }
+    double pxPerUnitY() const { return h / (maxY - minY); }
+    double toPx(double x) const { return (x - minX) * pxPerUnitX(); }
+    double toPy(double y) const { return (maxY - y) * pxPerUnitY(); }
+    double fromPx(double px) const { return minX + px * ((maxX - minX) / w); }
+    double fromPy(double py) const { return maxY - py * ((maxY - minY) / h); }
+};
+
 struct GraphState {
     double minX = -10.0;
     double maxX = 10.0;
     double minY = -10.0;
     double maxY = 10.0;
     bool initialized = false;
+    // Panel size the bounds were last fitted to (0 until the first render).
+    int pixelW = 0;
+    int pixelH = 0;
 
     // Interaction state
     bool isDragging = false;
@@ -150,17 +189,28 @@ struct GraphState {
     double probeMathX = 0.0;
     double probeMathY = 0.0;
 
-    void resetView(double range = 10.0);
+    // Shows [-range, range] along the panel's shorter side. With a panel size
+    // the view gets square pixels immediately; otherwise on the next render.
+    void resetView(double range = 10.0, int pxW = 0, int pxH = 0);
+    // Keeps pixels square for a pxW x pxH panel: the first fit widens the
+    // longer axis around the center; later resizes keep center and scale.
+    void fitAspect(int pxW, int pxH);
     void zoom(double factor, double centerMathX, double centerMathY);
     void pan(double dxPixels, double dyPixels, int pixelWidth, int pixelHeight);
+    GraphView view(int pxW, int pxH) const;
 
     POINT mathToPixel(double mx, double my, const RECT& rect) const;
     void pixelToMath(int px, int py, const RECT& rect, double& mx, double& my) const;
 };
 
-// Render graph onto hdc within graphRect.
+// Render graph onto hdc within graphRect: curves are drawn by the FP64
+// software rasterizer, or by the D3D11 engine for implicit curves when
+// float32 can resolve the current view.
 void renderGraph(HDC hdc, const RECT& graphRect, const GraphAnalysis& analysis,
                  GraphState& state, const Theme& theme, HFONT font, HFONT smallFont);
+
+// Header button hit boxes (Reset, zoom out, zoom in) for a graph panel rect.
+void graphButtonRects(const RECT& graphRect, RECT& resetBtn, RECT& zoomOutBtn, RECT& zoomInBtn);
 
 // Draw floating tooltip beside probed coordinate
 void drawProbeTooltip(HDC hdc, const RECT& localRect, const GraphState& state,

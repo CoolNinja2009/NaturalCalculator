@@ -36,6 +36,11 @@ struct EvaluationContext {
 	// default, matching the Casio/Windows-calculator convention this app
 	// follows; the Pro Max UI chip toggles it.
 	bool degrees = true;
+	// x and y are unknowns until the user assigns them ("x = 5"). The
+	// workspace keeps undeclared ones symbolic; evaluate() itself still
+	// substitutes x/y, which the grapher and the numeric solvers rely on.
+	bool xDefined = false;
+	bool yDefined = false;
 };
 
 struct Matrix {
@@ -116,6 +121,8 @@ double evaluate(const Row* root, const EvaluationContext& context);
 // On error, returns the exception's message prefixed with an error glyph.
 std::string evaluateToString(const Row* root);
 std::string evaluateToString(const Row* root, const EvaluationContext& context);
+// Same text; `failed` tells an error message apart from a value.
+std::string evaluateToString(const Row* root, const EvaluationContext& context, bool& failed);
 
 // Pro Mode variant of evaluateToString: identical output while the result
 // fits a double, but falls back to log10-domain arithmetic whenever normal
@@ -158,3 +165,8 @@ bool solveGeneralEquation(const Row* equation, const EvaluationContext& context,
 						  std::string& message);
 
 bool isProModeTrigger(const Row* expression);
+
+// Plain double value of a one-argument scientific function (SciFunction id),
+// the same code the calculator uses. Throws std::runtime_error on domain
+// errors; the grapher pre-checks domains and treats a throw as undefined.
+double sciFunctionValue(int id, double x, bool degrees);

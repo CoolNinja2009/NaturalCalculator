@@ -110,8 +110,13 @@ The resulting standalone executable will be generated at `build/NaturalCalculato
 - **Ctrl + V**: Paste plain text or LaTeX-like equations (auto-parsed into 2D structures).
 - **Ctrl + Z**: Undo the last structural or text edit.
 - **Delete / Backspace**: Structure-aware deletion (empties nested structures before collapsing them).
+- **Ctrl + Shift + P**: Toggle the latency overlay (input-to-pixels and paint time of the last frame).
 
 ### Equation Solving Syntax
+- **Variables**:
+  - `x` and `y` stay symbolic until you assign them (`x = 5`); they are never silently treated as 0.
+  - `2x + 3` answers `2x + 3`, and one equation in both variables is solved for one of them: `2x + y = 9` gives `y = 9 − 2x`, `x^2 + y^2 = 25` gives `y = ±√(25 − x²)`.
+  - Solving an equation reports the value without assigning it. Press `Delete` twice quickly to clear assignments.
 - **Linear Systems**:
   - Enter equation 1: `x + y = 10`
   - Press `Enter`, then enter equation 2: `2x - y = 5`

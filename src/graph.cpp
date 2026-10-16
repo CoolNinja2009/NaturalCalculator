@@ -7,10 +7,13 @@
 
 #include "graph.h"
 #include "gpu_graph.h"
+#include "graph_raster.h"
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <numeric>
 #include <sstream>
 #include <iomanip>
 
@@ -64,31 +67,58 @@ void collectVars(const Row* row, bool& hasX, bool& hasY) {
 
 } // namespace
 
+namespace {
+
+// UTF-8 superscript digits for an exponent, e.g. -12 -> "⁻¹²".
+std::string superscriptInt(int e) {
+    static const char* const kDigits[10] = {
+        "\xE2\x81\xB0", "\xC2\xB9", "\xC2\xB2", "\xC2\xB3", "\xE2\x81\xB4",
+        "\xE2\x81\xB5", "\xE2\x81\xB6", "\xE2\x81\xB7", "\xE2\x81\xB8", "\xE2\x81\xB9" };
+    std::string out;
+    if (e < 0) {
+        out += "\xE2\x81\xBB";
+        e = -e;
+    }
+    for (char c : std::to_string(e)) out += kDigits[c - '0'];
+    return out;
+}
+
+// "2.500" -> "2.5", "3.000" -> "3".
+void trimFraction(std::string& s) {
+    if (s.find('.') == std::string::npos) return;
+    while (!s.empty() && s.back() == '0') s.pop_back();
+    if (!s.empty() && s.back() == '.') s.pop_back();
+}
+
+} // namespace
+
+// Formats v so neighbouring multiples of `step` stay distinct at any zoom:
+// fixed notation while it stays short, otherwise "m×10ⁿ" with just enough
+// mantissa digits. Output is UTF-8 and negatives use a true minus sign.
 std::string formatAxisNumber(double v, double step) {
-    if (std::fabs(v) < 1e-12 || (step > 0.0 && std::fabs(v) < step * 1e-4)) return "0";
-
-    // Dynamic decimal precision matching step resolution
-    int decimals = 0;
-    if (step < 1.0 && step > 0.0) {
-        decimals = (int)std::ceil(-std::log10(step) + 1e-6);
-        if (decimals < 0) decimals = 0;
-        if (decimals > 7) decimals = 7;
-    }
-
+    if (!std::isfinite(v)) return "?";
+    const double av = std::fabs(v);
+    if (!(step > 0.0) || !std::isfinite(step)) step = av > 0.0 ? av * 1e-6 : 1e-6;
+    if (av < step * 1e-3 || av < 1e-300) return "0";
+    const std::string sign = v < 0.0 ? "\xE2\x88\x92" : "";
+    const int decimals = std::max(0, (int)std::ceil(-std::log10(step) - 1e-9));
+    const int intDigits = av >= 1.0 ? (int)std::floor(std::log10(av)) + 1 : 1;
     char buf[64];
-    double av = std::fabs(v);
-    if (av >= 1e7 || (av <= 1e-4 && av > 0.0)) {
-        std::snprintf(buf, sizeof(buf), "%.2e", v);
-    } else {
-        std::snprintf(buf, sizeof(buf), "%.*f", decimals, v);
+    if (av < 1e7 && av >= 1e-4 && intDigits + decimals <= 12) {
+        std::snprintf(buf, sizeof(buf), "%.*f", decimals, av);
+        std::string s(buf);
+        trimFraction(s);
+        return s == "0" ? s : sign + s;
     }
-
+    int sig = (int)std::floor(std::log10(av)) - (int)std::floor(std::log10(step)) + 1;
+    sig = std::clamp(sig, 1, 15);
+    std::snprintf(buf, sizeof(buf), "%.*e", sig - 1, av);
     std::string s(buf);
-    if (s.find('.') != std::string::npos && s.find('e') == std::string::npos) {
-        while (!s.empty() && s.back() == '0') s.pop_back();
-        if (!s.empty() && s.back() == '.') s.pop_back();
-    }
-    return s.empty() ? "0" : s;
+    size_t ePos = s.find('e');
+    std::string mantissa = s.substr(0, ePos);
+    int exponent = ePos == std::string::npos ? 0 : std::atoi(s.c_str() + ePos + 1);
+    trimFraction(mantissa);
+    return sign + mantissa + "\xC3\x97" "10" + superscriptInt(exponent);
 }
 
 std::string formatNumberShort(double v) {
@@ -165,11 +195,125 @@ static bool mapSciFunctionToByteOp(int fnId, ByteOp& outOp) {
     }
 }
 
+// One-argument functions the VM evaluates through the calculator's own
+// sciFunctionValue, after domain checks that keep its throwing path cold.
+static bool isSciCallFunction(int fnId) {
+    switch (fnId) {
+        case SciGamma: case SciLgamma: case SciErf: case SciErfc:
+        case SciBesselJ0: case SciBesselJ1: case SciBesselY0: case SciBesselY1:
+        case SciSinc: case SciLambertW: case SciDeg: case SciRad: case SciIsPrime:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static double sciCall(int fnId, double x) {
+    if (std::isnan(x)) return NAN;
+    switch (fnId) {
+        case SciGamma:
+        case SciLgamma:
+            if (x <= 0.0 && std::floor(x) == x) return NAN;
+            break;
+        case SciBesselY0:
+        case SciBesselY1:
+            if (!(x > 0.0)) return NAN;
+            break;
+        case SciLambertW:
+            if (x < -0.36787944117144233) return NAN;
+            break;
+        default:
+            break;
+    }
+    try {
+        return sciFunctionValue(fnId, x, false);
+    } catch (...) {
+        return NAN;
+    }
+}
+
+// Riemann zeta for real s != 1: Borwein's acceleration of the alternating
+// Dirichlet eta series for s >= 1/2, the functional equation below that.
+static double zetaReal(double s) {
+    constexpr double kPi = 3.14159265358979323846;
+    constexpr int kTerms = 30;
+    if (std::isnan(s) || s == 1.0) return NAN;
+    if (std::fabs(s) < 1e-12) return -0.5 - 0.91893853320467274 * s;  // zeta(0) + zeta'(0) s
+    if (s < 0.5) {
+        return std::pow(2.0, s) * std::pow(kPi, s - 1.0) * std::sin(kPi * s * 0.5) *
+               std::tgamma(1.0 - s) * zetaReal(1.0 - s);
+    }
+    if (s > 60.0) return 1.0 + std::pow(2.0, -s);
+    static const std::vector<double> d = [] {
+        std::vector<double> v(kTerms + 1);
+        double term = 1.0 / kTerms, acc = term;
+        v[0] = kTerms * acc;
+        for (int i = 1; i <= kTerms; ++i) {
+            term *= 4.0 * (kTerms + i - 1) * (kTerms - i + 1) / ((2.0 * i) * (2.0 * i - 1.0));
+            acc += term;
+            v[i] = kTerms * acc;
+        }
+        return v;
+    }();
+    double sum = 0.0;
+    for (int k = 0; k < kTerms; ++k) {
+        double term = (d[k] - d[kTerms]) / std::pow(k + 1.0, s);
+        sum += (k & 1) ? -term : term;
+    }
+    return (-sum / d[kTerms]) / (1.0 - std::pow(2.0, 1.0 - s));
+}
+
+// nCr / nPr: exact for small non-negative integers, the Gamma-function
+// extension otherwise so x! style curves stay continuous on the graph.
+static double gammaRatio(double n, double r, bool binomial) {
+    if (std::isnan(n) || std::isnan(r)) return NAN;
+    if (n >= 0.0 && r >= 0.0 && std::floor(n) == n && std::floor(r) == r && n <= 1000.0) {
+        if (r > n) return 0.0;
+        double k = binomial ? std::min(r, n - r) : r;
+        double result = 1.0;
+        for (double i = 0.0; i < k; ++i) {
+            result *= (n - i);
+            if (binomial) result /= (i + 1.0);
+        }
+        return binomial ? std::round(result) : result;
+    }
+    double num = std::tgamma(n + 1.0);
+    double den = std::tgamma(n - r + 1.0) * (binomial ? std::tgamma(r + 1.0) : 1.0);
+    if (std::isinf(den) && std::isfinite(num)) return 0.0;
+    return num / den;
+}
+
+static double gcdOrLcm(double a, double b, bool lcm) {
+    if (!(std::fabs(a) < 9e15 && std::fabs(b) < 9e15)) return NAN;
+    long long ia = std::llround(std::fabs(a));
+    long long ib = std::llround(std::fabs(b));
+    if (!lcm) return (double)std::gcd(ia, ib);
+    if (ia == 0 || ib == 0) return 0.0;
+    return (double)(ia / std::gcd(ia, ib)) * (double)ib;
+}
+
+static double binaryOp(ByteOp op, double a, double b) {
+    switch (op) {
+        case ByteOp::Atan2: return std::atan2(a, b);
+        case ByteOp::Hypot: return std::hypot(a, b);
+        case ByteOp::Beta:
+            return (a > 0.0 && b > 0.0) ? std::exp(std::lgamma(a) + std::lgamma(b) - std::lgamma(a + b)) : NAN;
+        case ByteOp::Gcd: return gcdOrLcm(a, b, false);
+        case ByteOp::Lcm: return gcdOrLcm(a, b, true);
+        case ByteOp::Min: return (std::isnan(a) || std::isnan(b)) ? NAN : std::min(a, b);
+        case ByteOp::Max: return (std::isnan(a) || std::isnan(b)) ? NAN : std::max(a, b);
+        case ByteOp::Ncr: return gammaRatio(a, b, true);
+        case ByteOp::Npr: return gammaRatio(a, b, false);
+        default: return NAN;
+    }
+}
+
 double BytecodeProgram::execute(double x, double y) const {
     if (!isValid || ops.empty()) return NAN;
     double stack[64];
     int sp = 0;
     size_t constIdx = 0;
+    size_t fnIdx = 0;
     for (ByteOp op : ops) {
         switch (op) {
             case ByteOp::PushConst:
@@ -423,7 +567,39 @@ double BytecodeProgram::execute(double x, double y) const {
             case ByteOp::Fact:
                 if (sp >= 1) {
                     double a = stack[sp - 1];
-                    stack[sp - 1] = (a < 0.0) ? NAN : std::tgamma(a + 1.0);
+                    stack[sp - 1] = (a < 0.0 && std::floor(a) == a) ? NAN : std::tgamma(a + 1.0);
+                } else return NAN;
+                break;
+            case ByteOp::SciCall:
+                if (sp >= 1 && fnIdx < fnIds.size()) stack[sp - 1] = sciCall(fnIds[fnIdx++], stack[sp - 1]);
+                else return NAN;
+                break;
+            case ByteOp::Zeta:
+                if (sp >= 1) stack[sp - 1] = zetaReal(stack[sp - 1]);
+                else return NAN;
+                break;
+            case ByteOp::Atan2:
+            case ByteOp::Hypot:
+            case ByteOp::Beta:
+            case ByteOp::Gcd:
+            case ByteOp::Lcm:
+            case ByteOp::Min:
+            case ByteOp::Max:
+            case ByteOp::Ncr:
+            case ByteOp::Npr:
+                if (sp >= 2) {
+                    double b = stack[--sp];
+                    stack[sp - 1] = binaryOp(op, stack[sp - 1], b);
+                } else return NAN;
+                break;
+            case ByteOp::Clamp:
+            case ByteOp::Lerp:
+                if (sp >= 3) {
+                    double c = stack[--sp];
+                    double b = stack[--sp];
+                    double a = stack[sp - 1];
+                    if (op == ByteOp::Clamp) stack[sp - 1] = a < b ? b : (a > c ? c : a);
+                    else stack[sp - 1] = a + c * (b - a);
                 } else return NAN;
                 break;
         }
@@ -441,7 +617,10 @@ public:
     BytecodeProgram prog;
 
     explicit BytecodeCompiler(const Row* row)
-        : items(row->items), pos(0), end(row ? row->items.size() : 0) {}
+        : items(row->items), pos(0), end(row->items.size()) {}
+    // Compiles only items [begin, finish) of row, e.g. one function argument.
+    BytecodeCompiler(const Row* row, size_t begin, size_t finish)
+        : items(row->items), pos(begin), end(finish) {}
 
     bool compile() {
         if (!compileRow()) return false;
@@ -461,6 +640,79 @@ private:
     void appendProg(const BytecodeProgram& other) {
         for (ByteOp op : other.ops) prog.ops.push_back(op);
         for (double c : other.consts) prog.consts.push_back(c);
+        for (int id : other.fnIds) prog.fnIds.push_back(id);
+    }
+
+    // Arguments are split at the row's top-level commas, mirroring the
+    // evaluator; each compiles onto the stack in order, then the function op.
+    bool compileFunction(const Item* it) {
+        const Row* arg = it->a.get();
+        if (!arg || arg->items.empty()) return false;
+        std::vector<std::pair<size_t, size_t>> slices;
+        size_t start = 0;
+        for (size_t i = 0; i < arg->items.size(); ++i) {
+            const Item* a = arg->items[i].get();
+            if (a->type == ItemType::Operator && a->opChar == ',') {
+                slices.emplace_back(start, i);
+                start = i + 1;
+            }
+        }
+        slices.emplace_back(start, arg->items.size());
+        for (const auto& slice : slices) {
+            if (slice.first >= slice.second) return false;
+            BytecodeCompiler sub(arg, slice.first, slice.second);
+            if (!sub.compile()) return false;
+            appendProg(sub.prog);
+        }
+
+        const size_t count = slices.size();
+        const int id = it->functionId;
+        ByteOp op;
+        if (count == 1) {
+            if (mapSciFunctionToByteOp(id, op)) {
+                prog.ops.push_back(op);
+                return true;
+            }
+            if (id == SciZeta) {
+                prog.ops.push_back(ByteOp::Zeta);
+                return true;
+            }
+            if (isSciCallFunction(id)) {
+                prog.ops.push_back(ByteOp::SciCall);
+                prog.fnIds.push_back(id);
+                return true;
+            }
+            return id == SciMin || id == SciMax || id == SciMean;  // a lone value is its own min/max/mean
+        }
+        switch (id) {
+            case SciAtan2: op = ByteOp::Atan2; break;
+            case SciHypot: op = ByteOp::Hypot; break;
+            case SciBeta: op = ByteOp::Beta; break;
+            case SciGcd: op = ByteOp::Gcd; break;
+            case SciLcm: op = ByteOp::Lcm; break;
+            case SciNcrFn: op = ByteOp::Ncr; break;
+            case SciNprFn: op = ByteOp::Npr; break;
+            case SciClamp:
+            case SciLerp:
+                if (count != 3) return false;
+                prog.ops.push_back(id == SciClamp ? ByteOp::Clamp : ByteOp::Lerp);
+                return true;
+            case SciMin:
+            case SciMax:
+                for (size_t k = 1; k < count; ++k) prog.ops.push_back(id == SciMin ? ByteOp::Min : ByteOp::Max);
+                return true;
+            case SciMean:
+                for (size_t k = 1; k < count; ++k) prog.ops.push_back(ByteOp::Add);
+                prog.ops.push_back(ByteOp::PushConst);
+                prog.consts.push_back((double)count);
+                prog.ops.push_back(ByteOp::Div);
+                return true;
+            default:
+                return false;
+        }
+        if (count != 2) return false;
+        prog.ops.push_back(op);
+        return true;
     }
 
     bool compileRow() {
@@ -534,8 +786,11 @@ private:
         pos++;
         switch (it->type) {
             case ItemType::Number: {
+                // Adjacent digit runs form one number, as in the evaluator.
+                std::string text = it->numText;
+                while (!atEnd() && items[pos]->type == ItemType::Number) text += items[pos++]->numText;
                 try {
-                    double val = std::stod(it->numText);
+                    double val = std::stod(text);
                     prog.ops.push_back(ByteOp::PushConst);
                     prog.consts.push_back(val);
                     return true;
@@ -587,13 +842,17 @@ private:
                 appendProg(innerCompiler.prog);
                 return true;
             }
-            case ItemType::Function: {
-                ByteOp fnOp;
-                if (!mapSciFunctionToByteOp(it->functionId, fnOp)) return false;
-                BytecodeCompiler argCompiler(it->a.get());
-                if (!argCompiler.compile()) return false;
-                appendProg(argCompiler.prog);
-                prog.ops.push_back(fnOp);
+            case ItemType::Function:
+                return compileFunction(it);
+            case ItemType::Permutation:
+            case ItemType::Combination: {
+                if (rowIsEmpty(it->a.get()) || rowIsEmpty(it->b.get())) return false;
+                BytecodeCompiler nCompiler(it->a.get());
+                BytecodeCompiler rCompiler(it->b.get());
+                if (!nCompiler.compile() || !rCompiler.compile()) return false;
+                appendProg(nCompiler.prog);
+                appendProg(rCompiler.prog);
+                prog.ops.push_back(it->type == ItemType::Permutation ? ByteOp::Npr : ByteOp::Ncr);
                 return true;
             }
             default:
@@ -614,15 +873,12 @@ bool compileRowToBytecode(const Row* row, BytecodeProgram& outProg) {
     return false;
 }
 
+// Bytecode results are final, NaN included: re-running an undefined point
+// through the throwing evaluator cost an exception per sample.
 double GraphAnalysis::evalExplicit(double x) const {
     if (!isValid) return NAN;
-    if (rightProgram.isValid) {
-        double v = rightProgram.execute(x, 0.0);
-        if (std::isfinite(v)) return v;
-    } else if (leftProgram.isValid && !rightRow) {
-        double v = leftProgram.execute(x, 0.0);
-        if (std::isfinite(v)) return v;
-    }
+    const BytecodeProgram& program = rightRow ? rightProgram : leftProgram;
+    if (program.isValid) return program.execute(x, 0.0);
     EvaluationContext ctx = baseContext;
     ctx.degrees = false; // Cartesian mathematical graphing always operates in radians
     ctx.x = x;
@@ -635,13 +891,8 @@ double GraphAnalysis::evalExplicit(double x) const {
 
 double GraphAnalysis::evalExplicitX(double y) const {
     if (!isValid) return NAN;
-    if (rightProgram.isValid) {
-        double v = rightProgram.execute(0.0, y);
-        if (std::isfinite(v)) return v;
-    } else if (leftProgram.isValid && !rightRow) {
-        double v = leftProgram.execute(0.0, y);
-        if (std::isfinite(v)) return v;
-    }
+    const BytecodeProgram& program = rightRow ? rightProgram : leftProgram;
+    if (program.isValid) return program.execute(0.0, y);
     EvaluationContext ctx = baseContext;
     ctx.degrees = false; // Cartesian mathematical graphing always operates in radians
     ctx.y = y;
@@ -652,15 +903,18 @@ double GraphAnalysis::evalExplicitX(double y) const {
     return NAN;
 }
 
+bool GraphAnalysis::hasFastEval() const {
+    if (!isValid) return false;
+    if (kind == GraphEquationKind::ImplicitXY)
+        return leftProgram.isValid && (!rightRow || rightProgram.isValid);
+    return rightRow ? rightProgram.isValid : leftProgram.isValid;
+}
+
 double GraphAnalysis::evalImplicit(double x, double y) const {
     if (!isValid) return NAN;
-    if (leftProgram.isValid && rightProgram.isValid) {
+    if (leftProgram.isValid && (!rightRow || rightProgram.isValid)) {
         double l = leftProgram.execute(x, y);
-        double r = rightProgram.execute(x, y);
-        if (std::isfinite(l) && std::isfinite(r)) return l - r;
-    } else if (leftProgram.isValid && !rightRow) {
-        double l = leftProgram.execute(x, y);
-        if (std::isfinite(l)) return l;
+        return rightRow ? l - rightProgram.execute(x, y) : l;
     }
     EvaluationContext ctx = baseContext;
     ctx.degrees = false; // Cartesian mathematical graphing always operates in radians
@@ -818,16 +1072,56 @@ GraphAnalysis analyzeGraphExpression(const Row* root, const EvaluationContext& c
     if (result.isValid) {
         if (result.leftRow) compileRowToBytecode(result.leftRow.get(), result.leftProgram);
         if (result.rightRow) compileRowToBytecode(result.rightRow.get(), result.rightProgram);
+        // Header text in natural notation (sin⁻¹(x), x², 1/x ...).
+        if (hasEquals(root)) result.displayTitle = rowToDisplayText(root);
+        else if (result.kind == GraphEquationKind::ExplicitY) result.displayTitle = L"y = " + rowToDisplayText(result.rightRow.get());
+        else if (result.kind == GraphEquationKind::ExplicitX) result.displayTitle = L"x = " + rowToDisplayText(result.rightRow.get());
+        else result.displayTitle = rowToDisplayText(result.leftRow.get()) + L" = 0";
     }
     return result;
 }
 
-void GraphState::resetView(double range) {
+void GraphState::resetView(double range, int pxW, int pxH) {
     minX = -range;
     maxX = range;
     minY = -range;
     maxY = range;
     initialized = true;
+    pixelW = 0;
+    pixelH = 0;
+    if (pxW > 0 && pxH > 0) fitAspect(pxW, pxH);
+}
+
+void GraphState::fitAspect(int pxW, int pxH) {
+    if (pxW <= 0 || pxH <= 0) return;
+    const double spanX = maxX - minX, spanY = maxY - minY;
+    if (!(spanX > 0.0) || !(spanY > 0.0)) return;
+    double unitsPerPx;
+    if (pixelW > 0 && pixelH > 0 && (pixelW != pxW || pixelH != pxH)) {
+        unitsPerPx = spanX / pixelW;  // panel resized: keep center and scale
+    } else {
+        const double ux = spanX / pxW, uy = spanY / pxH;
+        if (pixelW == pxW && pixelH == pxH && std::fabs(ux - uy) <= 1e-9 * std::max(ux, uy)) return;
+        unitsPerPx = std::max(ux, uy);  // first fit: keep both requested ranges visible
+    }
+    const double cx = 0.5 * (minX + maxX), cy = 0.5 * (minY + maxY);
+    minX = cx - 0.5 * unitsPerPx * pxW;
+    maxX = cx + 0.5 * unitsPerPx * pxW;
+    minY = cy - 0.5 * unitsPerPx * pxH;
+    maxY = cy + 0.5 * unitsPerPx * pxH;
+    pixelW = pxW;
+    pixelH = pxH;
+}
+
+GraphView GraphState::view(int pxW, int pxH) const {
+    GraphView v;
+    v.minX = minX;
+    v.maxX = maxX;
+    v.minY = minY;
+    v.maxY = maxY;
+    v.w = pxW;
+    v.h = pxH;
+    return v;
 }
 
 void GraphState::zoom(double factor, double centerMathX, double centerMathY) {
@@ -836,19 +1130,15 @@ void GraphState::zoom(double factor, double centerMathX, double centerMathY) {
     double curH = maxY - minY;
     if (curW <= 0.0 || curH <= 0.0) return;
 
+    // FP64 limits: the view never shrinks below 1e-10 of its coordinates'
+    // magnitude (a pixel then still spans hundreds of double ulps), and never
+    // grows beyond 1e12 units.
+    const double magnitude = std::max({ 1.0, std::fabs(minX), std::fabs(maxX), std::fabs(minY), std::fabs(maxY) });
+    factor = std::max(factor, 1e-10 * magnitude / std::min(curW, curH));
+    factor = std::min(factor, 1e12 / std::max(curW, curH));
+    if (!(factor > 0.0)) return;
     double newW = curW * factor;
     double newH = curH * factor;
-
-    // Desmos-grade zoom clamps:
-    // Min viewport width 1e-5: prevents 32-bit GPU float underflow/cancellation
-    // Max viewport width 1e7: prevents float overflow and extreme frequency aliasing
-    if (newW < 1e-5) {
-        newW = 1e-5;
-        newH = 1e-5 * (curH / curW);
-    } else if (newW > 1e7) {
-        newW = 1e7;
-        newH = 1e7 * (curH / curW);
-    }
 
     double xRatio = (centerMathX - minX) / curW;
     double yRatio = (centerMathY - minY) / curH;
@@ -863,8 +1153,9 @@ void GraphState::pan(double dxPixels, double dyPixels, int pixelWidth, int pixel
     double mathDx = (dxPixels / pixelWidth) * (maxX - minX);
     double mathDy = (dyPixels / pixelHeight) * (maxY - minY);
     if (!std::isfinite(mathDx) || !std::isfinite(mathDy)) return;
-    if (std::fabs(minX - mathDx) > 1e8 || std::fabs(maxX - mathDx) > 1e8) return;
-    if (std::fabs(minY + mathDy) > 1e8 || std::fabs(maxY + mathDy) > 1e8) return;
+    constexpr double kMaxCoord = 1e13;
+    if (std::fabs(minX - mathDx) > kMaxCoord || std::fabs(maxX - mathDx) > kMaxCoord) return;
+    if (std::fabs(minY + mathDy) > kMaxCoord || std::fabs(maxY + mathDy) > kMaxCoord) return;
     minX -= mathDx;
     maxX -= mathDx;
     minY += mathDy;
@@ -886,20 +1177,21 @@ void GraphState::pixelToMath(int px, int py, const RECT& rect, double& mx, doubl
     my = minY + ((rect.bottom - py) / h) * (maxY - minY);
 }
 
+void graphButtonRects(const RECT& graphRect, RECT& resetBtn, RECT& zoomOutBtn, RECT& zoomInBtn) {
+    const int size = 24, gap = 6, resetW = 52;
+    const int top = graphRect.top + 10;
+    const int right = graphRect.right - 10;
+    zoomInBtn = { right - size, top, right, top + size };
+    zoomOutBtn = { zoomInBtn.left - gap - size, top, zoomInBtn.left - gap, top + size };
+    resetBtn = { zoomOutBtn.left - gap - resetW, top, zoomOutBtn.left - gap, top + size };
+}
+
 bool handleGraphMouseDown(GraphState& state, const RECT& graphRect, int x, int y) {
     POINT pt = { x, y };
     if (!PtInRect(&graphRect, pt)) return false;
 
-    // Check zoom buttons in top-right of graphRect
-    int btnSize = 24;
-    int gap = 6;
-    int bx = graphRect.right - btnSize - 10;
-    int by = graphRect.top + 10;
-
-    RECT resetBtn = { bx - 2 * (btnSize + gap), by, bx - 2 * (btnSize + gap) + btnSize * 2, by + btnSize };
-    RECT zoomOutBtn = { bx - (btnSize + gap), by, bx - gap, by + btnSize };
-    RECT zoomInBtn = { bx, by, bx + btnSize, by + btnSize };
-
+    RECT resetBtn, zoomOutBtn, zoomInBtn;
+    graphButtonRects(graphRect, resetBtn, zoomOutBtn, zoomInBtn);
     if (PtInRect(&zoomInBtn, pt)) {
         state.zoom(0.75, (state.minX + state.maxX) * 0.5, (state.minY + state.maxY) * 0.5);
         return true;
@@ -909,7 +1201,7 @@ bool handleGraphMouseDown(GraphState& state, const RECT& graphRect, int x, int y
         return true;
     }
     if (PtInRect(&resetBtn, pt)) {
-        state.resetView(10.0);
+        state.resetView(10.0, graphRect.right - graphRect.left, graphRect.bottom - graphRect.top);
         return true;
     }
 
@@ -934,16 +1226,14 @@ bool handleGraphMouseMove(GraphState& state, const RECT& graphRect, int x, int y
         state.lastMousePos = pt;
         return true;
     }
+    // Hover is tracked but never drawn, so it must not trigger a repaint.
     if (PtInRect(&graphRect, pt)) {
         state.isHovering = true;
         state.hoverPos = { x - graphRect.left, y - graphRect.top };
         RECT localRect = { 0, 0, graphRect.right - graphRect.left, graphRect.bottom - graphRect.top };
         state.pixelToMath(state.hoverPos.x, state.hoverPos.y, localRect, state.hoverMathX, state.hoverMathY);
-        return true;
-    }
-    if (state.isHovering) {
+    } else {
         state.isHovering = false;
-        return true;
     }
     return false;
 }
@@ -985,14 +1275,357 @@ bool handleGraphMouseWheel(GraphState& state, const RECT& graphRect, int x, int 
     return true;
 }
 
+namespace {
+
+std::wstring utf8ToWide(const std::string& s) {
+    if (s.empty()) return std::wstring();
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+    std::wstring w(n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &w[0], n);
+    return w;
+}
+
+SIZE textSize(HDC hdc, const std::wstring& s) {
+    SIZE sz{};
+    GetTextExtentPoint32W(hdc, s.c_str(), (int)s.size(), &sz);
+    return sz;
+}
+
+// Text with a 1 px halo in the background color, so labels stay legible
+// where a curve or grid line passes underneath.
+void drawHaloText(HDC hdc, int x, int y, const std::wstring& s, COLORREF text, COLORREF halo) {
+    static const int kOffsets[4][2] = { { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } };
+    SetTextColor(hdc, halo);
+    for (const auto& o : kOffsets) TextOutW(hdc, x + o[0], y + o[1], s.c_str(), (int)s.size());
+    SetTextColor(hdc, text);
+    TextOutW(hdc, x, y, s.c_str(), (int)s.size());
+}
+
+void drawRoundedBox(HDC hdc, const RECT& r, COLORREF fill, COLORREF border, int radius) {
+    HBRUSH brush = CreateSolidBrush(fill);
+    HPEN pen = CreatePen(PS_SOLID, 1, border);
+    HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, brush);
+    HPEN oldPen = (HPEN)SelectObject(hdc, pen);
+    RoundRect(hdc, r.left, r.top, r.right, r.bottom, radius, radius);
+    SelectObject(hdc, oldBrush);
+    SelectObject(hdc, oldPen);
+    DeleteObject(brush);
+    DeleteObject(pen);
+}
+
+// 1-2-5 grid steps: nearest for the first pick, next larger when widening.
+double niceStep(double raw) {
+    if (!(raw > 0.0) || !std::isfinite(raw)) return 1.0;
+    double mag = std::pow(10.0, std::floor(std::log10(raw)));
+    double n = raw / mag;
+    return (n < 1.5 ? 1.0 : n < 3.5 ? 2.0 : n < 7.5 ? 5.0 : 10.0) * mag;
+}
+
+double nextNiceStep(double step) {
+    double mag = std::pow(10.0, std::floor(std::log10(step) + 1e-9));
+    double m = step / mag;
+    return (m < 1.5 ? 2.0 : m < 3.5 ? 5.0 : 10.0) * mag;
+}
+
+// One step for both axes (pixels are square), about 80 px apart and widened
+// until the x-axis labels fit between neighbouring grid lines. Expects the
+// label font to be selected into hdc.
+double chooseGridStep(HDC hdc, const GraphView& view) {
+    const double ppu = view.pxPerUnitX();
+    double step = niceStep(80.0 / ppu);
+    for (int iter = 0; iter < 8; ++iter) {
+        const double first = std::ceil(view.minX / step), last = std::floor(view.maxX / step);
+        int widest = 0;
+        for (double k : { first, last, std::floor(0.5 * (first + last)) })
+            widest = std::max(widest, (int)textSize(hdc, utf8ToWide(formatAxisNumber(k * step, step))).cx);
+        if (widest + 18 <= step * ppu) break;
+        step = nextNiceStep(step);
+    }
+    return step;
+}
+
+constexpr int kHeaderBottom = 42;  // labels stay below the header pills
+
+void drawAxisLabels(HDC hdc, const RECT& rc, const GraphView& view, double step, const GraphPalette& pal) {
+    const int w = view.w, h = view.h;
+    TEXTMETRICW tm{};
+    GetTextMetricsW(hdc, &tm);
+    const int th = tm.tmHeight;
+    const double ox = view.toPx(0.0), oy = view.toPy(0.0);
+
+    // x labels sit under the x-axis, pinned to the panel edge when it scrolls away.
+    const int xLabelY = std::clamp((int)std::lround(std::clamp(oy, -1e6, 1e6)) + 4, kHeaderBottom, h - th - 3);
+    std::vector<RECT> placed;
+    double first = std::ceil(view.minX / step), last = std::floor(view.maxX / step);
+    for (double k = first; k <= last && last - first < 2000; k += 1.0) {
+        const double v = k * step;
+        if (std::fabs(v) < step * 1e-6) continue;  // the origin gets its own "0"
+        std::wstring s = utf8ToWide(formatAxisNumber(v, step));
+        SIZE sz = textSize(hdc, s);
+        int lx = (int)std::lround(view.toPx(v)) - sz.cx / 2;
+        if (lx < 2 || lx + sz.cx > w - 2) continue;
+        placed.push_back({ lx - 3, xLabelY, lx + sz.cx + 3, xLabelY + th });
+        drawHaloText(hdc, rc.left + lx, rc.top + xLabelY, s, pal.text, pal.bg);
+    }
+
+    // y labels to the right of the y-axis, or along the nearer edge when it
+    // scrolls out of view.
+    const int axisX = (int)std::lround(std::clamp(ox, -1e6, 1e6));
+    first = std::ceil(view.minY / step);
+    last = std::floor(view.maxY / step);
+    for (double k = first; k <= last && last - first < 2000; k += 1.0) {
+        const double v = k * step;
+        if (std::fabs(v) < step * 1e-6) continue;
+        std::wstring s = utf8ToWide(formatAxisNumber(v, step));
+        SIZE sz = textSize(hdc, s);
+        int ly = (int)std::lround(view.toPy(v)) - th / 2;
+        if (ly < kHeaderBottom || ly + th > h - 2) continue;
+        int lx;
+        if (axisX < 0) lx = 6;
+        else if (axisX > w) lx = w - 6 - sz.cx;
+        else if (axisX + 6 + sz.cx <= w - 4) lx = axisX + 6;
+        else lx = axisX - 6 - sz.cx;
+        RECT r = { lx, ly, lx + sz.cx, ly + th };
+        bool clash = false;
+        for (const RECT& p : placed) {
+            RECT overlap;
+            if (IntersectRect(&overlap, &r, &p)) {
+                clash = true;
+                break;
+            }
+        }
+        if (!clash) drawHaloText(hdc, rc.left + lx, rc.top + ly, s, pal.text, pal.bg);
+    }
+
+    if (ox >= 8.0 && ox <= w - 4.0 && oy >= kHeaderBottom && oy <= h - th - 4.0) {
+        SIZE sz = textSize(hdc, L"0");
+        drawHaloText(hdc, rc.left + axisX - 4 - sz.cx, rc.top + (int)std::lround(oy) + 4, L"0", pal.text, pal.bg);
+    }
+}
+
+void drawGraphHeader(HDC hdc, const RECT& rc, const GraphAnalysis& analysis, const Theme& theme,
+                     HFONT font, HFONT smallFont, bool gpuEngine) {
+    RECT resetBtn, zoomOutBtn, zoomInBtn;
+    graphButtonRects(rc, resetBtn, zoomOutBtn, zoomInBtn);
+    const COLORREF pillFill = theme.isDark ? RGB(0x28, 0x2C, 0x34) : RGB(0xEA, 0xEE, 0xF2);
+    const COLORREF pillBorder = theme.isDark ? RGB(0x3E, 0x44, 0x51) : RGB(0xCF, 0xD4, 0xDA);
+    HFONT small = smallFont ? smallFont : font;
+    if (small) SelectObject(hdc, small);
+
+    auto button = [&](RECT r, const wchar_t* label) {
+        drawRoundedBox(hdc, r, pillFill, pillBorder, 6);
+        SetTextColor(hdc, theme.isDark ? RGB(0xEB, 0xEB, 0xEB) : RGB(0x21, 0x25, 0x29));
+        DrawTextW(hdc, label, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    };
+    button(resetBtn, L"Reset");
+    button(zoomOutBtn, L"−");
+    button(zoomInBtn, L"+");
+
+    // Which engine drew the curve: the D3D11 shader or the FP64 rasterizer.
+    const wchar_t* badge = gpuEngine ? (isGpuGraphHardwareAdapter() ? L"GPU D3D11" : L"WARP D3D11") : L"CPU FP64";
+    const int badgeW = (int)textSize(hdc, badge).cx + 18;
+    RECT badgeRect = { resetBtn.left - 8 - badgeW, resetBtn.top, resetBtn.left - 8, resetBtn.bottom };
+    if (gpuEngine) {
+        drawRoundedBox(hdc, badgeRect, theme.isDark ? RGB(0x1B, 0x38, 0x28) : RGB(0xD4, 0xF0, 0xDF),
+                       theme.isDark ? RGB(0x2E, 0x7D, 0x48) : RGB(0x63, 0xC4, 0x86), 8);
+        SetTextColor(hdc, theme.isDark ? RGB(0x5A, 0xDE, 0x8B) : RGB(0x19, 0x87, 0x54));
+    } else {
+        drawRoundedBox(hdc, badgeRect, theme.isDark ? RGB(0x1A, 0x2B, 0x3C) : RGB(0xDB, 0xEA, 0xF7),
+                       theme.isDark ? RGB(0x2E, 0x5F, 0x8A) : RGB(0x7F, 0xB0, 0xDC), 8);
+        SetTextColor(hdc, theme.isDark ? RGB(0x6C, 0xC2, 0xFF) : RGB(0x0B, 0x5C, 0x9E));
+    }
+    DrawTextW(hdc, badge, -1, &badgeRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    const int titleLeft = rc.left + 12;
+    const int titleRight = badgeRect.left - 8;
+    if (titleRight > titleLeft + 30) {
+        std::wstring title = analysis.isValid
+            ? (analysis.displayTitle.empty() ? utf8ToWide(analysis.title) : analysis.displayTitle)
+            : std::wstring(L"Graph");
+        RECT titleRect = { titleLeft, resetBtn.top, titleRight, resetBtn.bottom };
+        drawRoundedBox(hdc, titleRect, pillFill, pillBorder, 8);
+        if (font) SelectObject(hdc, font);
+        SetTextColor(hdc, theme.isDark ? RGB(0xF0, 0xF2, 0xF5) : RGB(0x21, 0x25, 0x29));
+        RECT textRect = { titleRect.left + 8, titleRect.top, titleRect.right - 8, titleRect.bottom };
+        DrawTextW(hdc, title.c_str(), -1, &textRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+}
+
+// Everything that changes the rendered pixels (not the chrome on top).
+struct FrameKey {
+    std::string title;
+    GraphEquationKind kind = GraphEquationKind::None;
+    bool valid = false;
+    int w = 0, h = 0;
+    double minX = 0.0, maxX = 0.0, minY = 0.0, maxY = 0.0, step = 0.0;
+    COLORREF bg = 0, grid = 0, axis = 0, curve = 0;
+
+    bool operator==(const FrameKey& o) const {
+        return valid == o.valid && kind == o.kind && w == o.w && h == o.h &&
+               minX == o.minX && maxX == o.maxX && minY == o.minY && maxY == o.maxY &&
+               step == o.step && bg == o.bg && grid == o.grid && axis == o.axis &&
+               curve == o.curve && title == o.title;
+    }
+};
+
+// Last composited frame (background, grid, axes, curve), so probe and other
+// chrome-only repaints never re-render the curve.
+struct FrameCache {
+    FrameKey key;
+    bool filled = false;
+    bool gpu = false;
+    std::vector<uint32_t> pixels;
+};
+
+FrameCache s_frame;
+CoverageBuffer s_coverage;
+
+// Snapping for y = f(x) (or x = f(y) with xOfY): the curve under the
+// cursor plus roots, the axis intercept and extrema within 30 px.
+template <typename Snap>
+void snapExplicit(const GraphAnalysis& analysis, const GraphState& state, bool xOfY,
+                  double unitX, double unitY, Snap&& trySnap) {
+    auto eval = [&](double t) { return xOfY ? analysis.evalExplicitX(t) : analysis.evalExplicit(t); };
+    // Roots, intercepts and extrema are points of interest; the plain curve
+    // point under the cursor is not.
+    auto snapAt = [&](double t, double v, bool pointOfInterest = true) {
+        if (xOfY) trySnap(v, t, pointOfInterest);
+        else trySnap(t, v, pointOfInterest);
+    };
+    const double unitT = xOfY ? unitY : unitX;  // math units per pixel along t
+    const double unitV = xOfY ? unitX : unitY;  // and across, along the value axis
+    const double viewLo = xOfY ? state.minX : state.minY;
+    const double viewHi = xOfY ? state.maxX : state.maxY;
+    const double t0 = xOfY ? state.probeMathY : state.probeMathX;
+    snapAt(t0, eval(t0), false);
+
+    const int steps = 60;
+    double ts[steps + 1], vs[steps + 1];
+    for (int i = 0; i <= steps; ++i) {
+        ts[i] = t0 + (i - steps / 2) * unitT;
+        vs[i] = eval(ts[i]);
+    }
+    for (int i = 0; i < steps; ++i) {
+        const double fa = vs[i], fb = vs[i + 1];
+        if (!std::isfinite(fa) || !std::isfinite(fb)) continue;
+        // Root: bisect the sign change; a pole converges to huge |f| and is skipped.
+        if ((fa <= 0.0) != (fb <= 0.0)) {
+            double lo = ts[i], hi = ts[i + 1], flo = fa;
+            for (int k = 0; k < 64; ++k) {
+                double m = 0.5 * (lo + hi);
+                if (m == lo || m == hi) break;
+                double fm = eval(m);
+                if (!std::isfinite(fm)) break;
+                if ((fm <= 0.0) == (flo <= 0.0)) {
+                    lo = m;
+                    flo = fm;
+                } else {
+                    hi = m;
+                }
+            }
+            double root = 0.5 * (lo + hi);
+            double fr = eval(root);
+            if (std::isfinite(fr) && std::fabs(fr) <= 2.0 * unitV) snapAt(root, 0.0);
+        }
+        // Intercept with the value axis (t = 0).
+        if (ts[i] <= 0.0 && ts[i + 1] >= 0.0) snapAt(0.0, eval(0.0));
+        // Extremum: the discrete slope changes sign around sample i.
+        if (i >= 1 && std::isfinite(vs[i - 1])) {
+            const double d0 = vs[i] - vs[i - 1], d1 = fb - vs[i];
+            if (d0 * d1 < 0.0) {
+                const bool isMax = d0 > 0.0;
+                double lo = ts[i - 1], hi = ts[i + 1];
+                const double g = 0.6180339887498949;
+                double c = hi - g * (hi - lo), d = lo + g * (hi - lo);
+                double fc = eval(c), fd = eval(d);
+                for (int k = 0; k < 60 && std::isfinite(fc) && std::isfinite(fd); ++k) {
+                    if (isMax ? fc > fd : fc < fd) {
+                        hi = d; d = c; fd = fc;
+                        c = hi - g * (hi - lo); fc = eval(c);
+                    } else {
+                        lo = c; c = d; fc = fd;
+                        d = lo + g * (hi - lo); fd = eval(d);
+                    }
+                }
+                const double te = 0.5 * (lo + hi), fe = eval(te);
+                // Poles and jumps fake a slope change; a real extremum stays near the view.
+                const double span = viewHi - viewLo;
+                if (std::isfinite(fe) && fe > viewLo - span && fe < viewHi + span) snapAt(te, fe);
+            }
+        }
+    }
+}
+
+// Snapping for F(x, y) = 0: Newton projection onto the curve and the two
+// axis intercepts, all with steps and tolerances in pixels.
+template <typename Snap>
+void snapImplicit(const GraphAnalysis& analysis, const GraphState& state,
+                  double unitX, double unitY, Snap&& trySnap) {
+    auto F = [&](double x, double y) { return analysis.evalImplicit(x, y); };
+    const double hx = 0.25 * unitX, hy = 0.25 * unitY;
+    // Gradient of F per pixel; distance estimate |F| / |grad| is in pixels.
+    auto gradPx = [&](double x, double y, double& gx, double& gy) {
+        gx = (F(x + hx, y) - F(x - hx, y)) / (2.0 * hx) * unitX;
+        gy = (F(x, y + hy) - F(x, y - hy)) / (2.0 * hy) * unitY;
+    };
+    auto onCurve = [&](double x, double y) {
+        double f = F(x, y), gx, gy;
+        gradPx(x, y, gx, gy);
+        double g = std::hypot(gx, gy);
+        return std::isfinite(f) && g > 0.0 && std::fabs(f) / g < 0.5;
+    };
+
+    double cx = state.probeMathX, cy = state.probeMathY;
+    for (int iter = 0; iter < 16; ++iter) {
+        double f = F(cx, cy), gx, gy;
+        gradPx(cx, cy, gx, gy);
+        double g2 = gx * gx + gy * gy;
+        if (!std::isfinite(f) || !(g2 > 0.0) || !std::isfinite(g2)) break;
+        double sx = -f * gx / g2, sy = -f * gy / g2;  // Newton step in pixels
+        double len = std::hypot(sx, sy);
+        if (len > 8.0) {
+            sx *= 8.0 / len;
+            sy *= 8.0 / len;
+        }
+        cx += sx * unitX;
+        cy += sy * unitY;
+        if (len < 1e-3) break;
+    }
+    if (onCurve(cx, cy)) trySnap(cx, cy, false);
+
+    // Axis intercepts: 1D Newton along each axis from the probe position.
+    auto intercept = [&](bool alongX) {
+        double t = alongX ? state.probeMathX : state.probeMathY;
+        const double unit = alongX ? unitX : unitY, h = 0.25 * unit;
+        auto G = [&](double s) { return alongX ? F(s, 0.0) : F(0.0, s); };
+        for (int iter = 0; iter < 16; ++iter) {
+            double g = G(t), dg = (G(t + h) - G(t - h)) / (2.0 * h) * unit;
+            if (!std::isfinite(g) || !(std::fabs(dg) > 0.0) || !std::isfinite(dg)) return;
+            double step = std::clamp(-g / dg, -8.0, 8.0);  // pixels
+            t += step * unit;
+            if (std::fabs(step) < 1e-3) break;
+        }
+        if (alongX ? onCurve(t, 0.0) : onCurve(0.0, t)) {
+            if (alongX) trySnap(t, 0.0, true);
+            else trySnap(0.0, t, true);
+        }
+    };
+    if (std::fabs(state.probeMathY) < 30.0 * unitY) intercept(true);
+    if (std::fabs(state.probeMathX) < 30.0 * unitX) intercept(false);
+}
+
+} // namespace
+
 void drawProbeTooltip(HDC hdc, const RECT& localRect, const GraphState& state,
                       const GraphAnalysis& analysis, const Theme& theme, HFONT font) {
     if (!state.isRightProbing) return;
-
-    int w = localRect.right - localRect.left;
-    int h = localRect.bottom - localRect.top;
-    int px = std::clamp((int)state.probePos.x, 0, w);
-    int py = std::clamp((int)state.probePos.y, 0, h);
+    const int w = localRect.right - localRect.left;
+    const int h = localRect.bottom - localRect.top;
+    if (w <= 0 || h <= 0) return;
+    const double unitX = (state.maxX - state.minX) / w;  // math units per pixel
+    const double unitY = (state.maxY - state.minY) / h;
+    const int px = std::clamp((int)state.probePos.x, 0, w);
+    const int py = std::clamp((int)state.probePos.y, 0, h);
 
     // Dotted crosshairs
     HPEN dotPen = CreatePen(PS_DOT, 1, theme.isDark ? RGB(0x60, 0x68, 0x78) : RGB(0x9E, 0xA8, 0xB6));
@@ -1004,548 +1637,131 @@ void drawProbeTooltip(HDC hdc, const RECT& localRect, const GraphState& state,
     SelectObject(hdc, oldPen);
     DeleteObject(dotPen);
 
-    double displayX = state.probeMathX;
-    double displayY = state.probeMathY;
-    int targetPx = px;
-    int targetPy = py;
-
-    bool snapped = false;
-    double bestDist = 24.0 * 24.0; // 24px max snapping radius
-
-    auto trySnap = [&](double x, double y) {
+    double shownX = state.probeMathX, shownY = state.probeMathY;
+    double markerX = px, markerY = py;
+    double best = 24.0;  // snap radius in pixels
+    // Points of interest (roots, intercepts, extrema) get an 8 px head start
+    // over the nearest plain curve point, so they win when the cursor is near.
+    auto trySnap = [&](double x, double y, bool pointOfInterest) {
         if (!std::isfinite(x) || !std::isfinite(y)) return;
-        POINT cpt = state.mathToPixel(x, y, localRect);
-        double dx = cpt.x - px;
-        double dy = cpt.y - py;
-        double dist = dx * dx + dy * dy;
-        if (dist < bestDist) {
-            bestDist = dist;
-            displayX = x;
-            displayY = y;
-            targetPx = cpt.x;
-            targetPy = cpt.y;
-            snapped = true;
+        double sx = (x - state.minX) / unitX, sy = (state.maxY - y) / unitY;
+        double d = std::hypot(sx - px, sy - py);
+        double score = pointOfInterest ? std::max(0.0, d - 8.0) : d;
+        if (d < 24.0 && score < best) {
+            best = score;
+            shownX = x;
+            shownY = y;
+            markerX = sx;
+            markerY = sy;
         }
     };
 
     if (GetAsyncKeyState(VK_SHIFT) & 0x8000) {
-        // Integer grid snapping
-        trySnap(std::round(state.probeMathX), std::round(state.probeMathY));
+        trySnap(std::round(state.probeMathX), std::round(state.probeMathY), true);
     } else if (analysis.isValid) {
-        if (analysis.kind == GraphEquationKind::ExplicitY) {
-            // Base curve snapping
-            double curveY = analysis.evalExplicit(state.probeMathX);
-            trySnap(state.probeMathX, curveY);
-            
-            // Advanced POIs (Roots, Y-Intercept, Extrema)
-            double sr = 30.0 * (state.maxX - state.minX) / w;
-            int steps = 40;
-            double dx = (sr * 2.0) / steps;
-            double startX = state.probeMathX - sr;
-            
-            double prevY = analysis.evalExplicit(startX);
-            double prevDy = 0.0;
-            for (int i = 1; i <= steps; i++) {
-                double currX = startX + i * dx;
-                double currY = analysis.evalExplicit(currX);
-                
-                // Root (X-Intercept): verify genuine zero crossing, rejecting asymptote poles (e.g. 1/x, tan(x))
-                if (prevY * currY <= 0.0 && prevY != currY) {
-                    double rootX = startX + (i - 1) * dx - prevY * dx / (currY - prevY);
-                    double rootVal = analysis.evalExplicit(rootX);
-                    double mathH = state.maxY - state.minY;
-                    double jump = std::abs(currY - prevY);
-                    if (std::isfinite(rootVal) && std::abs(rootVal) < std::max(0.5, (mathH / (double)h) * 4.0) && jump < mathH * 2.0) {
-                        trySnap(rootX, 0.0);
-                    }
-                }
-                
-                // Y-Intercept
-                if ((startX + (i - 1) * dx) <= 0.0 && currX >= 0.0) {
-                    double yAtZero = analysis.evalExplicit(0.0);
-                    if (std::isfinite(yAtZero)) {
-                        trySnap(0.0, yAtZero);
-                    }
-                }
-                
-                // Extremum (Minima/Maxima)
-                if (i > 1) {
-                    double currDy = currY - prevY;
-                    if (prevDy * currDy <= 0.0) {
-                        double extX = currX - dx;
-                        double extVal = analysis.evalExplicit(extX);
-                        if (std::isfinite(extVal) && std::abs(extVal) < (state.maxY - state.minY) * 5.0) {
-                            trySnap(extX, extVal);
-                        }
-                    }
-                    prevDy = currDy;
-                }
-                prevY = currY;
-            }
-        } else if (analysis.kind == GraphEquationKind::ExplicitX) {
-            // Base curve snapping
-            double curveX = analysis.evalExplicitX(state.probeMathY);
-            trySnap(curveX, state.probeMathY);
-            
-            // Advanced POIs
-            double sr = 30.0 * (state.maxY - state.minY) / h;
-            int steps = 40;
-            double dy_step = (sr * 2.0) / steps;
-            double startY = state.probeMathY - sr;
-            
-            double prevX = analysis.evalExplicitX(startY);
-            double prevDx = 0.0;
-            for (int i = 1; i <= steps; i++) {
-                double currY = startY + i * dy_step;
-                double currX = analysis.evalExplicitX(currY);
-                if (prevX * currX <= 0.0 && prevX != currX) {
-                    double rootY = startY + (i - 1) * dy_step - prevX * dy_step / (currX - prevX);
-                    double rootVal = analysis.evalExplicitX(rootY);
-                    double mathW = state.maxX - state.minX;
-                    double jump = std::abs(currX - prevX);
-                    if (std::isfinite(rootVal) && std::abs(rootVal) < std::max(0.5, (mathW / (double)w) * 4.0) && jump < mathW * 2.0) {
-                        trySnap(0.0, rootY);
-                    }
-                }
-                if ((startY + (i - 1) * dy_step) <= 0.0 && currY >= 0.0) {
-                    double xAtZero = analysis.evalExplicitX(0.0);
-                    if (std::isfinite(xAtZero)) {
-                        trySnap(xAtZero, 0.0);
-                    }
-                }
-                if (i > 1) {
-                    double currDx = currX - prevX;
-                    if (prevDx * currDx <= 0.0) {
-                        double extY = currY - dy_step;
-                        double extVal = analysis.evalExplicitX(extY);
-                        if (std::isfinite(extVal) && std::abs(extVal) < (state.maxX - state.minX) * 5.0) {
-                            trySnap(extVal, extY);
-                        }
-                    }
-                    prevDx = currDx;
-                }
-                prevX = currX;
-            }
-        } else if (analysis.kind == GraphEquationKind::ImplicitXY) {
-            // Newton-Raphson closest point
-            double cx = state.probeMathX, cy = state.probeMathY;
-            for (int iter = 0; iter < 8; ++iter) {
-                double f = analysis.evalImplicit(cx, cy);
-                double dfdx = (analysis.evalImplicit(cx + 1e-5, cy) - f) / 1e-5;
-                double dfdy = (analysis.evalImplicit(cx, cy + 1e-5) - f) / 1e-5;
-                double gSq = dfdx*dfdx + dfdy*dfdy;
-                if (gSq < 1e-12) break;
-                cx -= (f * dfdx) / gSq;
-                cy -= (f * dfdy) / gSq;
-            }
-            if (std::abs(analysis.evalImplicit(cx, cy)) < 1e-2) trySnap(cx, cy);
-            
-            // Y-Intercept
-            double yint = state.probeMathY;
-            for (int iter = 0; iter < 8; ++iter) {
-                double f = analysis.evalImplicit(0.0, yint);
-                double dfdy = (analysis.evalImplicit(0.0, yint + 1e-5) - f) / 1e-5;
-                if (std::abs(dfdy) < 1e-12) break;
-                yint -= f / dfdy;
-            }
-            if (std::abs(analysis.evalImplicit(0.0, yint)) < 1e-2) trySnap(0.0, yint);
-            
-            // X-Intercept
-            double xint = state.probeMathX;
-            for (int iter = 0; iter < 8; ++iter) {
-                double f = analysis.evalImplicit(xint, 0.0);
-                double dfdx = (analysis.evalImplicit(xint + 1e-5, 0.0) - f) / 1e-5;
-                if (std::abs(dfdx) < 1e-12) break;
-                xint -= f / dfdx;
-            }
-            if (std::abs(analysis.evalImplicit(xint, 0.0)) < 1e-2) trySnap(xint, 0.0);
+        if (analysis.kind == GraphEquationKind::ImplicitXY) {
+            snapImplicit(analysis, state, unitX, unitY, trySnap);
+        } else {
+            snapExplicit(analysis, state, analysis.kind == GraphEquationKind::ExplicitX, unitX, unitY, trySnap);
         }
     }
 
     // Glowing target marker
-    int markerX = localRect.left + targetPx;
-    int markerY = localRect.top + targetPy;
-    COLORREF markerCol = theme.accent;
-    HBRUSH glowB = CreateSolidBrush(markerCol);
-    HBRUSH oldB = (HBRUSH)SelectObject(hdc, glowB);
-    HPEN ringP = CreatePen(PS_SOLID, 2, RGB(0xFF, 0xFF, 0xFF));
-    HPEN oldP = (HPEN)SelectObject(hdc, ringP);
-    Ellipse(hdc, markerX - 5, markerY - 5, markerX + 6, markerY + 6);
-    SelectObject(hdc, oldP);
-    SelectObject(hdc, oldB);
-    DeleteObject(glowB);
-    DeleteObject(ringP);
+    const int mx = localRect.left + (int)std::lround(markerX);
+    const int my = localRect.top + (int)std::lround(markerY);
+    HBRUSH glow = CreateSolidBrush(theme.accent);
+    HPEN ring = CreatePen(PS_SOLID, 2, RGB(0xFF, 0xFF, 0xFF));
+    HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, glow);
+    oldPen = (HPEN)SelectObject(hdc, ring);
+    Ellipse(hdc, mx - 5, my - 5, mx + 6, my + 6);
+    SelectObject(hdc, oldPen);
+    SelectObject(hdc, oldBrush);
+    DeleteObject(glow);
+    DeleteObject(ring);
 
-    char buf[64];
-    std::snprintf(buf, sizeof(buf), "(%s, %s)",
-                  formatNumberShort(displayX).c_str(),
-                  formatNumberShort(displayY).c_str());
-
-    SIZE ts{};
-    HFONT oldFont = (HFONT)SelectObject(hdc, font);
-    GetTextExtentPoint32A(hdc, buf, (int)std::strlen(buf), &ts);
-
-    int padX = 10;
-    int padY = 5;
-    int tipW = ts.cx + padX * 2;
-    int tipH = ts.cy + padY * 2;
-
-    int tipX = markerX + 14;
-    int tipY = markerY - tipH - 8;
-    if (tipX + tipW > localRect.left + w - 10) tipX = markerX - tipW - 14;
-    if (tipY < localRect.top + 40) tipY = markerY + 14;
+    // Coordinates to a tenth of a pixel, so deep zooms show the digits that matter.
+    std::wstring text = L"(" + utf8ToWide(formatAxisNumber(shownX, unitX * 0.1)) + L", " +
+                        utf8ToWide(formatAxisNumber(shownY, unitY * 0.1)) + L")";
+    HFONT oldFont = font ? (HFONT)SelectObject(hdc, font) : nullptr;
+    SIZE ts = textSize(hdc, text);
+    const int tipW = ts.cx + 20, tipH = ts.cy + 10;
+    int tipX = mx + 14, tipY = my - tipH - 8;
+    if (tipX + tipW > localRect.left + w - 10) tipX = mx - tipW - 14;
+    if (tipY < localRect.top + kHeaderBottom) tipY = my + 14;
     tipX = std::clamp(tipX, (int)localRect.left + 8, std::max((int)localRect.left + 8, (int)localRect.left + w - tipW - 8));
-    tipY = std::clamp(tipY, (int)localRect.top + 40, std::max((int)localRect.top + 40, (int)localRect.top + h - tipH - 8));
-
+    tipY = std::clamp(tipY, (int)localRect.top + kHeaderBottom, std::max((int)localRect.top + kHeaderBottom, (int)localRect.top + h - tipH - 8));
     RECT tipRect = { tipX, tipY, tipX + tipW, tipY + tipH };
-
-    HBRUSH tipBg = CreateSolidBrush(theme.isDark ? RGB(0x15, 0x18, 0x22) : RGB(0xFA, 0xFA, 0xFD));
-    HPEN tipBorder = CreatePen(PS_SOLID, 1, theme.accent);
-    HBRUSH otb = (HBRUSH)SelectObject(hdc, tipBg);
-    HPEN otp = (HPEN)SelectObject(hdc, tipBorder);
-    RoundRect(hdc, tipRect.left, tipRect.top, tipRect.right, tipRect.bottom, 6, 6);
-    SelectObject(hdc, otb);
-    SelectObject(hdc, otp);
-    DeleteObject(tipBg);
-    DeleteObject(tipBorder);
-
+    drawRoundedBox(hdc, tipRect, theme.isDark ? RGB(0x15, 0x18, 0x22) : RGB(0xFA, 0xFA, 0xFD), theme.accent, 6);
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, theme.isDark ? RGB(0xFF, 0xF4, 0xEA) : RGB(0x18, 0x1A, 0x20));
-    DrawTextA(hdc, buf, -1, &tipRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    SelectObject(hdc, oldFont);
+    DrawTextW(hdc, text.c_str(), -1, &tipRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    if (oldFont) SelectObject(hdc, oldFont);
 }
 
 void renderGraph(HDC hdc, const RECT& graphRect, const GraphAnalysis& analysis,
                  GraphState& state, const Theme& theme, HFONT font, HFONT smallFont) {
-    int w = graphRect.right - graphRect.left;
-    int h = graphRect.bottom - graphRect.top;
+    const int w = graphRect.right - graphRect.left;
+    const int h = graphRect.bottom - graphRect.top;
     if (w <= 10 || h <= 10) return;
-
     if (!state.initialized) state.resetView(10.0);
+    state.fitAspect(w, h);
+    const GraphView view = state.view(w, h);
+    const GraphPalette pal = getGraphPalette(theme);
 
-    // 0. Primary GPU Rendering Path (Direct3D 11 Hardware Acceleration)
-    if (isGpuGraphAvailable()) {
-        if (renderGraphGpu(hdc, graphRect, analysis, state, theme, font, smallFont, false)) {
-            return;
-        }
-    }
+    HFONT labelFont = smallFont ? smallFont : font;
+    HFONT oldFont = labelFont ? (HFONT)SelectObject(hdc, labelFont) : nullptr;
+    SetBkMode(hdc, TRANSPARENT);
+    const double step = chooseGridStep(hdc, view);
 
-    // 1. Transparent CPU fallback
-    HDC mem = CreateCompatibleDC(hdc);
-    HBITMAP bmp = CreateCompatibleBitmap(hdc, w, h);
-    HBITMAP oldBmp = (HBITMAP)SelectObject(mem, bmp);
-    RECT localRect = { 0, 0, w, h };
-
-    // 2. Background
-    COLORREF bg = theme.screenBackground;
-    HBRUSH bgBrush = CreateSolidBrush(bg);
-    FillRect(mem, &localRect, bgBrush);
-    DeleteObject(bgBrush);
-
-    // Unified graph colors based on theme
-    GraphPalette pal = getGraphPalette(theme);
-    COLORREF gridColor = pal.grid;
-    COLORREF axisColor = pal.axis;
-    COLORREF textColor = pal.text;
-    COLORREF curveColor = pal.curve;
-
-    // 3. Grid lines & numeric ticks
-    double xStep = chooseStep(state.maxX - state.minX, 8);
-    double yStep = chooseStep(state.maxY - state.minY, 8);
-
-    HPEN gridPen = CreatePen(PS_SOLID, 1, gridColor);
-    HPEN oldPen = (HPEN)SelectObject(mem, gridPen);
-
-    SetBkMode(mem, TRANSPARENT);
-    SetTextColor(mem, textColor);
-    HFONT oldFont = (HFONT)SelectObject(mem, smallFont);
-
-    // Vertical grid
-    double startX = std::floor(state.minX / xStep) * xStep;
-    for (double x = startX; x <= state.maxX + xStep * 0.5; x += xStep) {
-        POINT pt = state.mathToPixel(x, 0.0, localRect);
-        MoveToEx(mem, pt.x, 0, nullptr);
-        LineTo(mem, pt.x, h);
-
-        if (std::fabs(x) > 1e-9) {
-            std::string label = formatAxisNumber(x, xStep);
-            POINT axisPt = state.mathToPixel(x, 0.0, localRect);
-            int labelY = std::clamp((int)axisPt.y + 4, 18, h - 18);
-            RECT lr = { pt.x - 30, labelY, pt.x + 30, labelY + 16 };
-            DrawTextA(mem, label.c_str(), -1, &lr, DT_CENTER | DT_SINGLELINE);
-        }
-    }
-
-    // Horizontal grid
-    double startY = std::floor(state.minY / yStep) * yStep;
-    for (double y = startY; y <= state.maxY + yStep * 0.5; y += yStep) {
-        POINT pt = state.mathToPixel(0.0, y, localRect);
-        MoveToEx(mem, 0, pt.y, nullptr);
-        LineTo(mem, w, pt.y);
-
-        if (std::fabs(y) > 1e-9) {
-            std::string label = formatAxisNumber(y, yStep);
-            POINT axisPt = state.mathToPixel(0.0, y, localRect);
-            int labelX = std::clamp((int)axisPt.x + 6, 6, w - 44);
-            RECT lr = { labelX, pt.y - 8, labelX + 38, pt.y + 8 };
-            DrawTextA(mem, label.c_str(), -1, &lr, DT_LEFT | DT_SINGLELINE);
-        }
-    }
-
-    // 4. Main Axes
-    HPEN axisPen = CreatePen(PS_SOLID, 2, axisColor);
-    SelectObject(mem, axisPen);
-
-    POINT originPt = state.mathToPixel(0.0, 0.0, localRect);
-    // Y Axis (x = 0)
-    if (originPt.x >= 0 && originPt.x <= w) {
-        MoveToEx(mem, originPt.x, 0, nullptr);
-        LineTo(mem, originPt.x, h);
-    }
-    // X Axis (y = 0)
-    if (originPt.y >= 0 && originPt.y <= h) {
-        MoveToEx(mem, 0, originPt.y, nullptr);
-        LineTo(mem, w, originPt.y);
-    }
-    DeleteObject(axisPen);
-    DeleteObject(gridPen);
-
-    // 5. Draw Function / Curve
-    if (analysis.isValid) {
-        HPEN curvePen = CreatePen(PS_SOLID, 2, curveColor);
-        SelectObject(mem, curvePen);
-
-        if (analysis.kind == GraphEquationKind::ExplicitY) {
-            bool inSegment = false;
-            int lastPy = 0;
-            double lastMathY = 0.0;
-
-            for (int px = 0; px < w; ++px) {
-                double mx, dummyMy;
-                state.pixelToMath(px, 0, localRect, mx, dummyMy);
-                double my = analysis.evalExplicit(mx);
-
-                if (!std::isfinite(my) || std::isnan(my)) {
-                    inSegment = false;
-                    continue;
-                }
-
-                POINT pt = state.mathToPixel(mx, my, localRect);
-                int py = std::clamp((int)pt.y, -h, 2 * h);
-
-                if (!inSegment) {
-                    MoveToEx(mem, px, py, nullptr);
-                    inSegment = true;
-                } else {
-                    // Check for vertical asymptote jump (e.g. tan(x), 1/x)
-                    double mathDiff = std::fabs(my - lastMathY);
-                    int pixelDiff = std::abs(py - lastPy);
-                    bool isPoleJump = (pixelDiff > h * 0.4 && mathDiff > (state.maxY - state.minY) * 0.35 && (my * lastMathY < 0.0));
-                    if (isPoleJump) {
-                        // Draw crisp dotted vertical line down the asymptote
-                        HPEN dotPen = CreatePen(PS_DOT, 1, RGB(
-                            (GetRValue(curveColor) * 2 + GetRValue(gridColor)) / 3,
-                            (GetGValue(curveColor) * 2 + GetGValue(gridColor)) / 3,
-                            (GetBValue(curveColor) * 2 + GetBValue(gridColor)) / 3
-                        ));
-                        HPEN prevPen = (HPEN)SelectObject(mem, dotPen);
-                        MoveToEx(mem, px, 0, nullptr);
-                        LineTo(mem, px, h);
-                        SelectObject(mem, prevPen);
-                        DeleteObject(dotPen);
-
-                        MoveToEx(mem, px, py, nullptr);
-                    } else {
-                        LineTo(mem, px, py);
-                    }
-                }
-                lastPy = py;
-                lastMathY = my;
+    FrameKey key;
+    key.valid = analysis.isValid;
+    key.kind = analysis.kind;
+    key.title = analysis.isValid ? analysis.title : std::string();
+    key.w = w;
+    key.h = h;
+    key.minX = view.minX;
+    key.maxX = view.maxX;
+    key.minY = view.minY;
+    key.maxY = view.maxY;
+    key.step = step;
+    key.bg = pal.bg;
+    key.grid = pal.grid;
+    key.axis = pal.axis;
+    key.curve = pal.curve;
+    if (!s_frame.filled || !(s_frame.key == key)) {
+        rasterizeGrid(s_frame.pixels, view, step, step, pal);
+        bool gpu = false;
+        if (analysis.isValid) {
+            s_coverage.reset(w, h);
+            if (analysis.kind == GraphEquationKind::ImplicitXY) {
+                gpu = renderImplicitCoverageGpu(analysis, view, s_coverage);
+                if (!gpu) rasterizeImplicitCurve(s_coverage, view, analysis);
+            } else {
+                rasterizeExplicitCurve(s_coverage, view, analysis);
             }
-        } else if (analysis.kind == GraphEquationKind::ExplicitX) {
-            bool inSegment = false;
-            int lastPx = 0;
-            double lastMathX = 0.0;
-
-            for (int py = 0; py < h; ++py) {
-                double dummyMx, my;
-                state.pixelToMath(0, py, localRect, dummyMx, my);
-                double mx = analysis.evalExplicitX(my);
-
-                if (!std::isfinite(mx) || std::isnan(mx)) {
-                    inSegment = false;
-                    continue;
-                }
-
-                POINT pt = state.mathToPixel(mx, my, localRect);
-                int px = std::clamp((int)pt.x, -w, 2 * w);
-
-                if (!inSegment) {
-                    MoveToEx(mem, px, py, nullptr);
-                    inSegment = true;
-                } else {
-                    double mathDiff = std::fabs(mx - lastMathX);
-                    int pixelDiff = std::abs(px - lastPx);
-                    bool isPoleJump = (pixelDiff > w * 0.4 && mathDiff > (state.maxX - state.minX) * 0.35 && (mx * lastMathX < 0.0));
-                    if (isPoleJump) {
-                        HPEN dotPen = CreatePen(PS_DOT, 1, RGB(
-                            (GetRValue(curveColor) * 2 + GetRValue(gridColor)) / 3,
-                            (GetGValue(curveColor) * 2 + GetGValue(gridColor)) / 3,
-                            (GetBValue(curveColor) * 2 + GetBValue(gridColor)) / 3
-                        ));
-                        HPEN prevPen = (HPEN)SelectObject(mem, dotPen);
-                        MoveToEx(mem, 0, py, nullptr);
-                        LineTo(mem, w, py);
-                        SelectObject(mem, prevPen);
-                        DeleteObject(dotPen);
-
-                        MoveToEx(mem, px, py, nullptr);
-                    } else {
-                        LineTo(mem, px, py);
-                    }
-                }
-                lastPx = px;
-                lastMathX = mx;
-            }
-        } else if (analysis.kind == GraphEquationKind::ImplicitXY) {
-            // Marching squares 2D contouring with dynamic resolution
-            int gridCols = std::clamp(w / 5, 60, 160);
-            int gridRows = std::clamp(h / 5, 60, 160);
-            std::vector<std::vector<double>> values(gridRows + 1, std::vector<double>(gridCols + 1));
-
-            for (int r = 0; r <= gridRows; ++r) {
-                int py = (r * h) / gridRows;
-                for (int c = 0; c <= gridCols; ++c) {
-                    int px = (c * w) / gridCols;
-                    double mx, my;
-                    state.pixelToMath(px, py, localRect, mx, my);
-                    values[r][c] = analysis.evalImplicit(mx, my);
-                }
-            }
-
-            for (int r = 0; r < gridRows; ++r) {
-                int py0 = (r * h) / gridRows;
-                int py1 = ((r + 1) * h) / gridRows;
-                for (int c = 0; c < gridCols; ++c) {
-                    int px0 = (c * w) / gridCols;
-                    int px1 = ((c + 1) * w) / gridCols;
-
-                    double tl = values[r][c];
-                    double tr = values[r][c + 1];
-                    double bl = values[r + 1][c];
-                    double br = values[r + 1][c + 1];
-
-                    if (!std::isfinite(tl) || !std::isfinite(tr) ||
-                        !std::isfinite(bl) || !std::isfinite(br)) continue;
-
-                    // Reject cells where values jump violently across asymptotes/singularities (e.g. tan(x), 1/x)
-                    double maxV = std::max({std::fabs(tl), std::fabs(tr), std::fabs(bl), std::fabs(br)});
-                    double minV = std::min({std::fabs(tl), std::fabs(tr), std::fabs(bl), std::fabs(br)});
-                    if (maxV > 25.0 && (maxV - minV) > 15.0) continue;
-
-                    int mask = 0;
-                    if (tl > 0) mask |= 1;
-                    if (tr > 0) mask |= 2;
-                    if (br > 0) mask |= 4;
-                    if (bl > 0) mask |= 8;
-
-                    if (mask == 0 || mask == 15) continue;
-
-                    auto interp = [](int p0, int p1, double v0, double v1) -> int {
-                        double denom = v0 - v1;
-                        if (std::fabs(denom) < 1e-12) return (p0 + p1) / 2;
-                        double t = v0 / denom;
-                        return p0 + (int)std::lround(t * (p1 - p0));
-                    };
-
-                    POINT topEdge = { interp(px0, px1, tl, tr), py0 };
-                    POINT rightEdge = { px1, interp(py0, py1, tr, br) };
-                    POINT bottomEdge = { interp(px0, px1, bl, br), py1 };
-                    POINT leftEdge = { px0, interp(py0, py1, tl, bl) };
-
-                    auto drawSeg = [&](POINT p1, POINT p2) {
-                        MoveToEx(mem, p1.x, p1.y, nullptr);
-                        LineTo(mem, p2.x, p2.y);
-                    };
-
-                    switch (mask) {
-                        case 1: case 14: drawSeg(leftEdge, topEdge); break;
-                        case 2: case 13: drawSeg(topEdge, rightEdge); break;
-                        case 3: case 12: drawSeg(leftEdge, rightEdge); break;
-                        case 4: case 11: drawSeg(rightEdge, bottomEdge); break;
-                        case 5: drawSeg(leftEdge, topEdge); drawSeg(rightEdge, bottomEdge); break;
-                        case 6: case 9: drawSeg(topEdge, bottomEdge); break;
-                        case 7: case 8: drawSeg(leftEdge, bottomEdge); break;
-                        case 10: drawSeg(leftEdge, bottomEdge); drawSeg(topEdge, rightEdge); break;
-                    }
-                }
-            }
+            compositeCoverage(s_frame.pixels, s_coverage, pal.curve);
         }
-        DeleteObject(curvePen);
+        s_frame.key = key;
+        s_frame.filled = true;
+        s_frame.gpu = gpu;
     }
 
-    // 6. Header / Formula badge & Controls
-    {
-        COLORREF headerBg = theme.isDark ? RGB(0x18, 0x1A, 0x20) : RGB(0xF3, 0xF5, 0xF8);
-        HBRUSH hb = CreateSolidBrush(headerBg);
-        RECT headerRect = { 0, 0, w, 34 };
-        FillRect(mem, &headerRect, hb);
-        DeleteObject(hb);
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h;  // top-down
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    SetDIBitsToDevice(hdc, graphRect.left, graphRect.top, w, h, 0, 0, 0, h,
+                      s_frame.pixels.data(), &bmi, DIB_RGB_COLORS);
 
-        HPEN hp = CreatePen(PS_SOLID, 1, axisColor);
-        HPEN op = (HPEN)SelectObject(mem, hp);
-        MoveToEx(mem, 0, 34, nullptr);
-        LineTo(mem, w, 34);
-        SelectObject(mem, op);
-        DeleteObject(hp);
-
-        // Title text
-        SelectObject(mem, font);
-        SetTextColor(mem, theme.screenText);
-        std::string titleStr = analysis.isValid ? ("// " + analysis.title + " //") : "// LIVE GRAPH ENGINE //";
-        RECT titleRect = { 12, 6, w - 110, 30 };
-        DrawTextA(mem, titleStr.c_str(), -1, &titleRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-
-        // Zoom / Reset buttons in header: sharp angular HUD buttons
-        SelectObject(mem, smallFont);
-        int btnW = 24, btnH = 22, btnY = 6;
-        int bx = w - 10 - btnW;
-
-        auto drawBtn = [&](int left, int width, const wchar_t* label) {
-            RECT br = { left, btnY, left + width, btnY + btnH };
-            COLORREF btnBg = theme.isDark ? RGB(0x1F, 0x0A, 0x0E) : RGB(0xE0, 0xE4, 0xEB);
-            COLORREF borderCol = theme.isDark ? RGB(0xC0, 0x35, 0x18) : RGB(0xC0, 0xC5, 0xD0);
-            HBRUSH btnBrush = CreateSolidBrush(btnBg);
-            HPEN btnPen = CreatePen(PS_SOLID, 1, borderCol);
-            HBRUSH oldB = (HBRUSH)SelectObject(mem, btnBrush);
-            HPEN oldP = (HPEN)SelectObject(mem, btnPen);
-            Rectangle(mem, br.left, br.top, br.right, br.bottom);
-            SelectObject(mem, oldB);
-            SelectObject(mem, oldP);
-            DeleteObject(btnBrush);
-            DeleteObject(btnPen);
-
-            SetTextColor(mem, theme.isDark ? RGB(0xF5, 0xEB, 0xE1) : theme.text);
-            DrawTextW(mem, label, -1, &br, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        };
-
-        drawBtn(bx, btnW, L"+");
-        drawBtn(bx - btnW - 4, btnW, L"\u2212");
-        drawBtn(bx - 2 * btnW - 48, 44, L"RESET");
-    }
-
-
-    // 7b. Right-click probe tooltip HUD
+    if (labelFont) SelectObject(hdc, labelFont);
+    drawAxisLabels(hdc, graphRect, view, step, pal);
+    drawGraphHeader(hdc, graphRect, analysis, theme, font, smallFont, s_frame.gpu);
     if (state.isRightProbing) {
-        drawProbeTooltip(mem, localRect, state, analysis, theme, font ? font : smallFont);
+        RECT localRect = graphRect;
+        drawProbeTooltip(hdc, localRect, state, analysis, theme, font ? font : smallFont);
     }
-
-    // 8. Blit to target DC
-    BitBlt(hdc, graphRect.left, graphRect.top, w, h, mem, 0, 0, SRCCOPY);
-
-    SelectObject(mem, oldFont);
-    SelectObject(mem, oldPen);
-    SelectObject(mem, oldBmp);
-    DeleteObject(bmp);
-    DeleteDC(mem);
+    if (oldFont) SelectObject(hdc, oldFont);
 }

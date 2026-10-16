@@ -431,13 +431,29 @@ static void serializeItem(const Item* it, std::string& out) {
             serializeRow(it->a.get(), out);
             out += it->isBrace ? '}' : (it->isBracket ? ']' : ')');
             break;
-        case ItemType::Power:
-            out += '(';
+        case ItemType::Power: {
+            bool needsParensBase = !(it->a && (it->a->items.size() == 1 &&
+                (it->a->items[0]->type == ItemType::Number ||
+                 it->a->items[0]->type == ItemType::Variable ||
+                 it->a->items[0]->type == ItemType::Paren ||
+                 it->a->items[0]->type == ItemType::Function ||
+                 it->a->items[0]->type == ItemType::Constant)));
+            bool needsParensExp = !(it->b && (it->b->items.size() == 1 &&
+                (it->b->items[0]->type == ItemType::Number ||
+                 it->b->items[0]->type == ItemType::Variable ||
+                 it->b->items[0]->type == ItemType::Paren ||
+                 it->b->items[0]->type == ItemType::Function ||
+                 it->b->items[0]->type == ItemType::Constant)));
+                 
+            if (needsParensBase) out += '(';
             serializeRow(it->a.get(), out);
-            out += ")^(";
+            if (needsParensBase) out += ')';
+            out += "^";
+            if (needsParensExp) out += '(';
             serializeRow(it->b.get(), out);
-            out += ')';
+            if (needsParensExp) out += ')';
             break;
+        }
         case ItemType::Sqrt:
             out += "sqrt(";
             serializeRow(it->a.get(), out);
@@ -653,9 +669,16 @@ void insertOperator(Expression& expr, char op) {
 }
 
 void insertEquals(Expression& expr) {
-    if (isBRow(expr.cursor.row) && expr.cursor.row->owner &&
-        expr.cursor.row->owner->type == ItemType::Power &&
-        expr.cursor.index == (int)expr.cursor.row->items.size()) {
+    // '=' separates the sides of an equation, so typed at the end of a
+    // denominator, exponent or radicand it steps out first: "y/x=2" is
+    // y/x = 2, not y/(x = 2). Sum/product limits keep theirs ("n=1").
+    while (expr.cursor.row->owner &&
+           expr.cursor.index == (int)expr.cursor.row->items.size()) {
+        const Item* owner = expr.cursor.row->owner;
+        bool denominator = owner->type == ItemType::Fraction && isBRow(expr.cursor.row);
+        bool exponent = owner->type == ItemType::Power && isBRow(expr.cursor.row);
+        bool radicand = owner->type == ItemType::Sqrt;
+        if (!denominator && !exponent && !radicand) break;
         moveRight(expr);
     }
     Row* row = expr.cursor.row;
@@ -1405,6 +1428,25 @@ void insertNameLetter(Expression& expr, char letter) {
     expr.cursor.index = idx + 1;
 }
 
+// How an item was typed, for re-spelling words that per-keystroke
+// normalization already split: "e" became a constant, "x" a variable, digits
+// a Number. False for anything that is not a letter or digit run.
+static bool spelledText(const Item* it, std::string& out) {
+    switch (it->type) {
+        case ItemType::Name: out = it->nameText; return true;
+        case ItemType::Variable: out = std::string(1, it->variableName); return true;
+        case ItemType::Constant:
+            out = it->constantName == 'p' ? "pi" : (it->constantName == 'f' ? "phi" : "e");
+            return true;
+        case ItemType::Number:
+            if (it->numText.empty() || it->numText.find('.') != std::string::npos) return false;
+            out = it->numText;
+            return true;
+        default:
+            return false;
+    }
+}
+
 // Resolve one row's Name items. Returns true if any conversion happened.
 static bool normalizeRowNames(Expression& expr, Row* row) {
     if (!row) return false;
@@ -1422,6 +1464,49 @@ static bool normalizeRowNames(Expression& expr, Row* row) {
         } else {
             ++i;
         }
+    }
+
+    // Typing resolves letters eagerly ("e" -> constant, "x" -> variable) and
+    // digits end a word, so "exp", "inv", "eye", "log2", "log1p" or "atan2"
+    // arrive in pieces. Once "(" follows, the longest run of pieces before it
+    // that spells a function becomes that call; shorter, ordinary products
+    // like 2ex(...) stay as they are.
+    for (size_t j = 1; j < row->items.size(); ++j) {
+        Item* paren = row->items[j].get();
+        if (paren->type != ItemType::Paren || paren->isBrace || paren->isBracket) continue;
+        std::string spelled;
+        size_t bestK = 0;
+        int bestId = -1;
+        bool bestSqrt = false;
+        for (size_t k = 1; k <= 6 && k <= j; ++k) {
+            std::string piece;
+            if (!spelledText(row->items[j - k].get(), piece)) break;
+            spelled = piece + spelled;
+            const std::string lower = lowerName(spelled);
+            int id = -1;
+            if (lower == "sqrt") {
+                bestK = k;
+                bestSqrt = true;
+            } else if (findSciFunction(lower, id)) {
+                bestK = k;
+                bestId = id;
+                bestSqrt = false;
+            }
+        }
+        if (bestK < 2) continue;  // a single Name word is handled below
+        const size_t first = j - bestK;
+        auto call = std::make_unique<Item>(bestSqrt ? ItemType::Sqrt : ItemType::Function);
+        if (!bestSqrt) call->functionId = bestId;
+        call->a = std::move(paren->a);
+        call->a->owner = call.get();  // ownerParentRow is unchanged
+        row->items[first] = std::move(call);
+        row->items.erase(row->items.begin() + first + 1, row->items.begin() + j + 1);
+        if (expr.cursor.row == row) {
+            if (expr.cursor.index > (int)j) expr.cursor.index -= (int)bestK;
+            else if (expr.cursor.index > (int)first) expr.cursor.index = (int)first;
+        }
+        j = first;
+        changed = true;
     }
 
     for (size_t i = 0; i < row->items.size(); ++i) {

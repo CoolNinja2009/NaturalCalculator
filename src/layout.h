@@ -80,3 +80,8 @@ int fontHeightForDepth(int depth);
 
 // Releases cached GDI font handles. Call once at process exit.
 void shutdownFonts();
+
+// Single-line Unicode rendering of a row in the same natural notation as the
+// 2D layout (sin⁻¹(x), |x|, ⌊x⌋, √x, x², π ...), for places that only show
+// plain text, such as the graph header.
+std::wstring rowToDisplayText(const Row* row);

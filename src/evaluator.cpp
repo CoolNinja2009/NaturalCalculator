@@ -669,10 +669,31 @@ static double riemannZeta(double s) {
         double sum = 0.0;
         int N = 40;
         for (int k = 1; k <= N; ++k) sum += std::pow(k, -s);
+        // Euler-Maclaurin tail. The sum above includes k = N, so its half
+        // weight comes back off; then the B2 and B4 corrections.
         double term1 = std::pow(N, 1.0 - s) / (s - 1.0);
         double term2 = 0.5 * std::pow(N, -s);
         double term3 = (s / 12.0) * std::pow(N, -s - 1.0);
-        return sum + term1 + term2 - term3;
+        double term4 = (s * (s + 1.0) * (s + 2.0) / 720.0) * std::pow(N, -s - 3.0);
+        return sum + term1 - term2 + term3 - term4;
+    }
+    if (s > 0.0) {
+        // 0 < s < 1: the reflection below maps this strip onto itself and
+        // would recurse forever. Borwein's accelerated alternating (Dirichlet
+        // eta) series converges here; 30 terms give ~1e-15 relative error.
+        const int n = 30;
+        double d[n + 1];
+        double term = 1.0 / n, partial = term;
+        d[0] = n * partial;
+        for (int i = 1; i <= n; ++i) {
+            term *= 4.0 * (n + i - 1) * (n - i + 1) / ((2.0 * i) * (2.0 * i - 1.0));
+            partial += term;
+            d[i] = n * partial;
+        }
+        double sum = 0.0;
+        for (int k = 0; k < n; ++k)
+            sum += ((k % 2) ? -1.0 : 1.0) * (d[k] - d[n]) / std::pow(k + 1.0, s);
+        return -sum / (d[n] * (1.0 - std::pow(2.0, 1.0 - s)));
     }
     double reflection = std::pow(2.0, s) * std::pow(kSciPi, s - 1.0) *
                         std::sin(kSciPi * s / 2.0) * std::tgamma(1.0 - s) * riemannZeta(1.0 - s);
@@ -2601,22 +2622,31 @@ double evaluate(const Row* root) {
     return evaluate(root, EvaluationContext{});
 }
 
-std::string evaluateToString(const Row* root, const EvaluationContext& context) {
+std::string evaluateToString(const Row* root, const EvaluationContext& context, bool& failed) {
+    failed = false;
     try {
         EvalValue val = evaluateValue(root, context);
         if (val.isSymbolic()) return val.text;
         if (val.isSet()) return val.setVal.toString();
         if (val.isMatrix()) return val.mat.toString();
         double v = val.num;
-        if (!std::isfinite(v))
+        if (!std::isfinite(v)) {
+            failed = std::isnan(v);
             return std::isnan(v) ? "Error" : (v > 0 ? "Infinity" : "-Infinity");
+        }
         std::string radical;
         if (simpleSquareRootPower(root, radical))
             return radical + " = " + numberString(v);
         return formatFiniteDouble(v);
     } catch (const std::exception& e) {
+        failed = true;
         return std::string(e.what());
     }
+}
+
+std::string evaluateToString(const Row* root, const EvaluationContext& context) {
+    bool failed = false;
+    return evaluateToString(root, context, failed);
 }
 
 std::string evaluateToString(const Row* root) {
@@ -3327,4 +3357,8 @@ bool solveComplexEquation(const Row* equation, double& x, double& y, std::string
         message = e.what();
         return false;
     }
+}
+
+double sciFunctionValue(int id, double x, bool degrees) {
+    return applySciFunction(id, x, degrees);
 }

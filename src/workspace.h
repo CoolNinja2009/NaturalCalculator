@@ -28,11 +28,16 @@ public:
     // Evaluate the current expression, push it (with its result) onto the
     // history list, and start a fresh empty expression. Returns false (and
     // does nothing) if the current expression is entirely empty.
+    //
+    // x and y are variables unless declared by an assignment ("x = 5");
+    // undeclared ones stay symbolic ("2x + y = 9" -> "y = 9 - 2x") and
+    // solving an equation reports values without declaring them.
     bool commitCurrent(const EvaluationContext& context = EvaluationContext{});
 
     // Recall the previous committed expression into the editable line.
     bool recallPrevious();
 
+    // The context after the last commit, including declared x/y values.
     bool hasSolvedValues() const { return hasSolvedValues_; }
     const EvaluationContext& solvedValues() const { return solvedValues_; }
 
@@ -49,6 +54,10 @@ public:
     }
 
 private:
+    void evaluateExpression(HistoryEntry& entry, const EvaluationContext& context);
+    void solveEquation(HistoryEntry& entry, const EvaluationContext& context);
+    void solveSystemWithPrevious();
+
     std::vector<std::unique_ptr<HistoryEntry>> history_;
     std::unique_ptr<Expression> current_;
     size_t recallIndex_ = 0;

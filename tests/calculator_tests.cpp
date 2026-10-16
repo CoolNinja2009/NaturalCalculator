@@ -5,6 +5,7 @@
 #include "graph.h"
 #include <cassert>
 #include <cmath>
+#include <cstdio>
 #include <iostream>
 
 static Expression expressionFrom(const char* text) {
@@ -89,9 +90,14 @@ static void testSystems() {
     assert(nonlinearWorkspace.history()[nonlinearWorkspace.history().size() - 2]->result ==
            "Solved as part of the system");
     assert(nonlinearWorkspace.history().back()->result.find("x = ") == 0);
-    assertNear(nonlinearWorkspace.solvedValues().x * nonlinearWorkspace.solvedValues().y, 4.0);
-    assertNear(std::sqrt(3233.0 + nonlinearWorkspace.solvedValues().x / 2.0),
-               nonlinearWorkspace.solvedValues().y - 45.0);
+    double solvedX = 0.0, solvedY = 0.0;
+    assert(std::sscanf(nonlinearWorkspace.history().back()->result.c_str(), "x = %lf, y = %lf",
+                       &solvedX, &solvedY) == 2);
+    assert(std::fabs(solvedX * solvedY - 4.0) < 1e-6);
+    assert(std::fabs(std::sqrt(3233.0 + solvedX / 2.0) - (solvedY - 45.0)) < 1e-6);
+    // Solving a system reports x and y without declaring them.
+    assert(!nonlinearWorkspace.solvedValues().xDefined);
+    assert(!nonlinearWorkspace.solvedValues().yDefined);
 }
 
 static void testQuadratics() {
@@ -160,7 +166,7 @@ static void testAssignmentsPersist() {
     workspace.clearVariables();
     workspace.current() = expressionFrom("x");
     assert(workspace.commitCurrent(workspace.solvedValues()));
-    assert(workspace.history().back()->result == "0");
+    assert(workspace.history().back()->result == "x");
     assert(workspace.history().size() == 3);
 
     Workspace rootWorkspace;
@@ -182,9 +188,9 @@ static void testGeneralEquations() {
     assert(workspace.commitCurrent());
     assert(workspace.history().back()->result.find("x =") == 0);
     assert(workspace.history().back()->result.find("2.4") != std::string::npos);
-    assertNear(workspace.solvedValues().x, std::stod(workspace.history().back()->result.substr(4)));
+    assert(!workspace.solvedValues().xDefined);   // solved, not declared
 
-    workspace.current() = expressionFrom("x^2+2x-4");
+    workspace.current() = expressionFrom("x^2+2x-4=0");
     assert(workspace.commitCurrent());
     assert(workspace.history().back()->result.find("x1 =") == 0);
     assert(workspace.history().back()->result.find(", x2 =") != std::string::npos);
@@ -214,6 +220,61 @@ static void testGeneralEquations() {
     insertFraction(squareRootPower);
     insertDigit(squareRootPower, '2');
     assert(evaluateToString(squareRootPower.root.get()).find("\xE2\x88\x9A" "2 = ") == 0);
+}
+
+static std::string commitText(Workspace& workspace, const char* text) {
+    insertFromText(workspace.current(), text);
+    normalizeNames(workspace.current());
+    assert(workspace.commitCurrent(workspace.solvedValues()));
+    return workspace.history().back()->result;
+}
+
+static void testUndeclaredVariablesStaySymbolic() {
+    // x and y are variables until assigned; they never silently become 0.
+    { Workspace w; assert(commitText(w, "2x+y=09") == "y = 9 \xE2\x88\x92 2x"); }
+    { Workspace w; assert(commitText(w, "2x+3") == "2x + 3"); }
+    { Workspace w; assert(commitText(w, "x+y") == "x + y"); }
+    { Workspace w; assert(commitText(w, "sin(x)") == "sin(x)"); }
+    { Workspace w; assert(commitText(w, "x^2+2x-4") == "x\xC2\xB2 + 2x \xE2\x88\x92 4"); }
+    { Workspace w; assert(commitText(w, "2(x+3)+x") == "3x + 6"); }
+    { Workspace w; assert(commitText(w, "x^2+y^2=25") == "y = \xC2\xB1\xE2\x88\x9A(25 \xE2\x88\x92 x\xC2\xB2)"); }
+    { Workspace w; assert(commitText(w, "xy=6") == "y = 6/x"); }
+    { Workspace w; assert(commitText(w, "x+y=tan(x)") == "y = tan(x) \xE2\x88\x92 x"); }
+    { Workspace w; assert(commitText(w, "y/x=2") == "y = 2x"); }   // '=' leaves the denominator
+
+    // "y = 2x + 1" relates the variables; it does not assign y.
+    {
+        Workspace w;
+        assert(commitText(w, "y=2x+1") == "y = 2x + 1");
+        assert(!w.solvedValues().yDefined);
+    }
+
+    // Assignments declare; declared values substitute everywhere.
+    {
+        Workspace w;
+        assert(commitText(w, "x=5") == "x = 5");
+        assert(w.solvedValues().xDefined);
+        assert(commitText(w, "2x+y=09") == "y = -1");
+        assert(commitText(w, "2x+3") == "13");
+        assert(commitText(w, "x+y") == "y + 5");
+    }
+
+    // Solving an equation reports the value without declaring it.
+    {
+        Workspace w;
+        assert(commitText(w, "2x+1=9") == "x = 4");
+        assert(!w.solvedValues().xDefined);
+        assert(commitText(w, "x+1") == "x + 1");
+    }
+
+    // Two equations in x and y still solve as a system.
+    {
+        Workspace w;
+        assert(commitText(w, "2x+y=9") == "y = 9 \xE2\x88\x92 2x");
+        assert(commitText(w, "x-y=3") == "x = 4, y = 1");
+        assert(w.history()[0]->result == "Solved as part of the system");
+        assert(commitText(w, "x+y") == "x + y");
+    }
 }
 
 static void testProModeTriggerCalculation() {
@@ -281,7 +342,7 @@ static void testCloseParenExitsNestedStructure() {
     insertOperator(expression, '+');
     insertDigit(expression, '1');
 
-    assert(expression.toPlainString() == "((x)^(2)) + 1");
+    assert(expression.toPlainString() == "(x^2) + 1");
     assertNear(evaluate(expression.root.get(), { 3.0, 0.0 }), 10.0);
 }
 
@@ -326,7 +387,7 @@ static void testClickPlacesStructuralCursor() {
     int exponentY = (exponentCaret.top + exponentCaret.bottom) / 2;
     assert(placeCursorAtPoint(power, hdc, 10, 50, exponentCaret.x, exponentY));
     insertDigit(power, '4');
-    assert(power.toPlainString() == "(x)^(42) + 3");
+    assert(power.toPlainString() == "x^(42) + 3");
     assertNear(evaluate(power.root.get(), { 2.0, 0.0 }), std::pow(2.0, 42.0) + 3.0);
     DeleteDC(hdc);
 }
@@ -608,7 +669,7 @@ static void testPowerEditing() {
     insertPower(expression);
     std::cerr << "Power: [" << expression.toPlainString() << "]\n";
     backspace(expression);
-    assert(expression.toPlainString() == "(2)^(2)");
+    assert(expression.toPlainString() == "2^2");
 }
 
 static void testCombinatoricsTypingAndEvaluation() {
@@ -824,6 +885,7 @@ int main() {
     testInvalidLinearTerms();
     testAssignmentsPersist();
     testGeneralEquations();
+    testUndeclaredVariablesStaySymbolic();
     testProModeTriggerCalculation();
     testProModeBigNumbers();
     testSciFunctions();

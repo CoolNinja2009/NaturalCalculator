@@ -33,6 +33,7 @@
 #include "workspace.h"
 #include "graph.h"
 #include "gpu_graph.h"
+#include "ui_theme.h"
 #include "resource.h"
 
 namespace {
@@ -64,6 +65,9 @@ enum Action {
     ActSciFirst,
     ActSciLast = ActSciFirst + SciFunctionCount - 1
 };
+
+// Header buttons, laid out right to left by layoutTopBar().
+enum TopAction { TopVarX, TopVarY, TopQuadratic, TopAngle, TopSci, TopTheme, TopCount };
 
 struct App {
     HWND hwnd = nullptr;
@@ -110,19 +114,47 @@ struct App {
     HICON appIcon = nullptr;
     std::vector<std::unique_ptr<Expression>> undo;
 
+    // --- Chrome: fonts, header layout, pointer feedback ---
+    UiFonts fonts;
+    RECT topRects[TopCount]{};
+    bool topVisible[TopCount]{};
+    std::wstring title;          // shortened by layoutTopBar() to fit
+    int hoverKey = -1;           // index into buttons, -1 = none
+    int pressedKey = -1;         // key held down by the mouse
+    int flashKey = -1;           // key lit briefly by keyboard input
+    int hoverTop = -1;           // TopAction under the pointer
+    int pressedTop = -1;
+    bool trackingMouse = false;
+    RECT lastPetRect{};
+
     // --- High-performance render caches ---
     HDC backbufferDC = nullptr;
     HBITMAP backbufferBmp = nullptr;
     HBITMAP backbufferOldBmp = nullptr;
     int backbufferW = 0;
     int backbufferH = 0;
+    // The back buffer persists between frames, so a section whose inputs
+    // hash the same as last time is left as drawn.
+    bool backbufferFresh = true;
+    uint64_t topBarKey = 0;
+    uint64_t historyKey = 0;
 
-    HDC buttonCacheDC = nullptr;
-    HBITMAP buttonCacheBmp = nullptr;
-    HBITMAP buttonCacheOldBmp = nullptr;
-    int buttonCacheW = 0;
-    int buttonCacheH = 0;
-    bool buttonCacheValid = false;
+    // The keypad rendered once per KeyState over the button area; a frame
+    // composes them with a few BitBlts, so hover and press cost almost nothing.
+    HDC keyLayerDC[(int)KeyState::Count]{};
+    HBITMAP keyLayerBmp[(int)KeyState::Count]{};
+    HBITMAP keyLayerOldBmp[(int)KeyState::Count]{};
+    bool keyLayerValid[(int)KeyState::Count]{};
+    std::vector<char> keyLayerKeyDrawn[(int)KeyState::Count];   // hover/pressed fill in per key
+    int keyLayerW = 0;
+    int keyLayerH = 0;
+
+    // Ctrl+Shift+P overlay: input-to-pixels latency of the last frame.
+    bool perfOverlay = false;
+    LONGLONG inputStamp = 0;     // QPC tick of the oldest unpainted input
+    double lastInputMs = 0.0;
+    double lastPaintMs = 0.0;
+    double worstInputMs = 0.0;
 
     HDC graphCacheDC = nullptr;
     HBITMAP graphCacheBmp = nullptr;
@@ -136,11 +168,23 @@ struct App {
 } g;
 
 void invalidateButtonCache() {
-    g.buttonCacheValid = false;
+    for (bool& valid : g.keyLayerValid) valid = false;
 }
 
 void invalidateGraphCache() {
     g.graphCacheValid = false;
+}
+
+constexpr UINT_PTR kGraphRefreshTimerId = 4;
+constexpr UINT kGraphRefreshMs = 12;
+
+// An expression edit changes the editor and, in Pro Max, the live graph of
+// it. The editor repaints at once; the graph follows a moment later, so a
+// keystroke echoes in well under a millisecond and fast typing re-graphs
+// once per pause instead of once per key.
+void invalidateEdit() {
+    InvalidateRect(g.hwnd, &g.editorRect, FALSE);
+    if (g.proMode) SetTimer(g.hwnd, kGraphRefreshTimerId, kGraphRefreshMs, nullptr);
 }
 
 void cleanupRenderCaches() {
@@ -153,16 +197,17 @@ void cleanupRenderCaches() {
         g.backbufferOldBmp = nullptr;
         g.backbufferW = g.backbufferH = 0;
     }
-    if (g.buttonCacheDC) {
-        if (g.buttonCacheOldBmp) SelectObject(g.buttonCacheDC, g.buttonCacheOldBmp);
-        if (g.buttonCacheBmp) DeleteObject(g.buttonCacheBmp);
-        DeleteDC(g.buttonCacheDC);
-        g.buttonCacheDC = nullptr;
-        g.buttonCacheBmp = nullptr;
-        g.buttonCacheOldBmp = nullptr;
-        g.buttonCacheW = g.buttonCacheH = 0;
-        g.buttonCacheValid = false;
+    for (int i = 0; i < (int)KeyState::Count; ++i) {
+        if (!g.keyLayerDC[i]) continue;
+        if (g.keyLayerOldBmp[i]) SelectObject(g.keyLayerDC[i], g.keyLayerOldBmp[i]);
+        if (g.keyLayerBmp[i]) DeleteObject(g.keyLayerBmp[i]);
+        DeleteDC(g.keyLayerDC[i]);
+        g.keyLayerDC[i] = nullptr;
+        g.keyLayerBmp[i] = nullptr;
+        g.keyLayerOldBmp[i] = nullptr;
+        g.keyLayerValid[i] = false;
     }
+    g.keyLayerW = g.keyLayerH = 0;
     if (g.graphCacheDC) {
         if (g.graphCacheOldBmp) SelectObject(g.graphCacheDC, g.graphCacheOldBmp);
         if (g.graphCacheBmp) DeleteObject(g.graphCacheBmp);
@@ -177,6 +222,8 @@ void cleanupRenderCaches() {
 
 constexpr UINT_PTR kCaretTimerId = 1;
 constexpr UINT_PTR kProAnimationTimerId = 2;
+constexpr UINT_PTR kFlashTimerId = 3;      // ends a keyboard key flash
+constexpr UINT kFlashMs = 110;
 constexpr DWORD kProTransitionMs = 720;
 constexpr int kMinWidth = 340;
 constexpr int kMinHeight = 480;
@@ -358,12 +405,13 @@ void layoutButtons(int areaLeft, int areaTop, int areaW, int areaH) {
 
     // Row 0: quick-access clear row, like the AC/DEL pair on a real
     // scientific calculator, sitting above the main keypad.
+    static const wchar_t kBackspaceLabel[] = { Icon::Backspace, 0 };
     place(0, 0, 2, L"AC", ActClearAll, false, false, false, true);
-    place(2, 0, 2, L"DEL", ActBackspace, false, false, true);
+    place(2, 0, 2, kBackspaceLabel, ActBackspace, false, false, true);
 
     place(0, 1, 1, L"(", ActOpenParen, false, false, true);
     place(1, 1, 1, L")", ActCloseParen, false, false, true);
-    place(2, 1, 1, L"x^y", ActPower, false, false, true);
+    place(2, 1, 1, L"xʸ", ActPower, false, false, true);
     place(3, 1, 1, L"\u221A", ActSqrt, false, false, true);
 
     place(0, 2, 1, L"7", ActDigit7);
@@ -398,17 +446,17 @@ void layoutButtons(int areaLeft, int areaTop, int areaW, int areaH) {
             place(6, 0, 1, toggleLabel, ActToggle2nd, false, false, true);
 
             place(4, 1, 1, L"sin", sciAct(SciSin), false, false, true);
-            place(5, 1, 1, L"asin", sciAct(SciAsin), false, false, true);
+            place(5, 1, 1, L"sin⁻¹", sciAct(SciAsin), false, false, true);
             place(6, 1, 1, L"sinh", sciAct(SciSinh), false, false, true);
             place(4, 2, 1, L"cos", sciAct(SciCos), false, false, true);
-            place(5, 2, 1, L"acos", sciAct(SciAcos), false, false, true);
+            place(5, 2, 1, L"cos⁻¹", sciAct(SciAcos), false, false, true);
             place(6, 2, 1, L"cosh", sciAct(SciCosh), false, false, true);
             place(4, 3, 1, L"tan", sciAct(SciTan), false, false, true);
-            place(5, 3, 1, L"atan", sciAct(SciAtan), false, false, true);
+            place(5, 3, 1, L"tan⁻¹", sciAct(SciAtan), false, false, true);
             place(6, 3, 1, L"tanh", sciAct(SciTanh), false, false, true);
             place(4, 4, 1, L"ln", sciAct(SciLn), false, false, true);
             place(5, 4, 1, L"log", sciAct(SciLog), false, false, true);
-            place(6, 4, 1, L"exp", sciAct(SciExp), false, false, true);
+            place(6, 4, 1, L"eˣ", sciAct(SciExp), false, false, true);
             place(4, 5, 1, L"\u03C0", ActPi, false, false, true);
             place(5, 5, 1, L"e", ActE, false, false, true);
             place(6, 5, 1, L"|x|", sciAct(SciAbs), false, false, true);
@@ -418,20 +466,20 @@ void layoutButtons(int areaLeft, int areaTop, int areaW, int areaH) {
             place(6, 0, 1, toggleLabel, ActToggle2nd, false, false, true);
 
             place(4, 1, 1, L"sec", sciAct(SciSec), false, false, true);
-            place(5, 1, 1, L"asec", sciAct(SciAsec), false, false, true);
+            place(5, 1, 1, L"sec⁻¹", sciAct(SciAsec), false, false, true);
             place(6, 1, 1, L"sech", sciAct(SciSech), false, false, true);
             place(4, 2, 1, L"csc", sciAct(SciCsc), false, false, true);
-            place(5, 2, 1, L"acsc", sciAct(SciAcsc), false, false, true);
+            place(5, 2, 1, L"csc⁻¹", sciAct(SciAcsc), false, false, true);
             place(6, 2, 1, L"csch", sciAct(SciCsch), false, false, true);
             place(4, 3, 1, L"cot", sciAct(SciCot), false, false, true);
-            place(5, 3, 1, L"acot", sciAct(SciAcot), false, false, true);
+            place(5, 3, 1, L"cot⁻¹", sciAct(SciAcot), false, false, true);
             place(6, 3, 1, L"coth", sciAct(SciCoth), false, false, true);
-            place(4, 4, 1, L"log2", sciAct(SciLog2), false, false, true);
+            place(4, 4, 1, L"log₂", sciAct(SciLog2), false, false, true);
             place(5, 4, 1, L"\u00B3\u221A", sciAct(SciCbrt), false, false, true);
             place(6, 4, 1, L"\u0393", sciAct(SciGamma), false, false, true);
             place(4, 5, 1, L"\u03C6", ActPhi, false, false, true);
             place(5, 5, 1, L"n!", sciAct(SciFact), false, false, true);
-            place(6, 5, 1, L"rnd", sciAct(SciRound), false, false, true);
+            place(6, 5, 1, L"Rnd", sciAct(SciRound), false, false, true);
         } else {
             place(4, 0, 1, L"\u222B", sciAct(SciIntegrate), false, false, true);
             place(5, 0, 1, L"d/dx", sciAct(SciDiff), false, false, true);
@@ -441,14 +489,14 @@ void layoutButtons(int areaLeft, int areaTop, int areaW, int areaH) {
             place(5, 1, 1, L"\u03A3", sciAct(SciSum), false, false, true);
             place(6, 1, 1, L"\u03A0", sciAct(SciProduct), false, false, true);
             place(4, 2, 1, L"det", sciAct(SciDet), false, false, true);
-            place(5, 2, 1, L"inv", sciAct(SciInv), false, false, true);
-            place(6, 2, 1, L"trans", sciAct(SciTranspose), false, false, true);
-            place(4, 3, 1, L"trace", sciAct(SciTrace), false, false, true);
+            place(5, 2, 1, L"A⁻¹", sciAct(SciInv), false, false, true);
+            place(6, 2, 1, L"Aᵀ", sciAct(SciTranspose), false, false, true);
+            place(4, 3, 1, L"tr", sciAct(SciTrace), false, false, true);
             place(5, 3, 1, L"rref", sciAct(SciRref), false, false, true);
-            place(6, 3, 1, L"norm", sciAct(SciNorm), false, false, true);
-            place(4, 4, 1, L"dot", sciAct(SciDot), false, false, true);
-            place(5, 4, 1, L"cross", sciAct(SciCross), false, false, true);
-            place(6, 4, 1, L"eye", sciAct(SciEye), false, false, true);
+            place(6, 3, 1, L"‖v‖", sciAct(SciNorm), false, false, true);
+            place(4, 4, 1, L"u·v", sciAct(SciDot), false, false, true);
+            place(5, 4, 1, L"u×v", sciAct(SciCross), false, false, true);
+            place(6, 4, 1, L"Iₙ", sciAct(SciEye), false, false, true);
             place(4, 5, 1, L"[", ActOpenBracket, false, false, true);
             place(5, 5, 1, L"]", ActCloseParen, false, false, true);
             place(6, 5, 1, L",", ActComma, false, false, true);
@@ -458,12 +506,65 @@ void layoutButtons(int areaLeft, int areaTop, int areaW, int areaH) {
     place(0, 6, g.proMode ? 7 : 4, L"=", ActEquals, false, true);
 }
 
+// Header: buttons packed right to left (theme, mode, angle unit, Quadratic,
+// y, x), then the longest title that still fits in front of them.
+void layoutTopBar() {
+    HDC dc = GetDC(g.hwnd);
+    if (!dc) return;
+    const int height = 28, gap = 6;
+    int top = g.topBarRect.top + (g.topBarRect.bottom - g.topBarRect.top - height) / 2;
+    int x = g.topBarRect.right - 8;
+    for (bool& visible : g.topVisible) visible = false;
+    auto place = [&](TopAction action, int width) {
+        g.topRects[action] = { x - width, top, x, top + height };
+        g.topVisible[action] = true;
+        x -= width + gap;
+    };
+    place(TopTheme, height);
+    place(TopSci, headerButtonWidth(dc, g.proMode ? L"PRO MAX" : L"Sci", g.fonts, height));
+    if (g.proMode) {
+        HFONT old = (HFONT)SelectObject(dc, g.fonts.pill);
+        SIZE unit{};
+        GetTextExtentPoint32W(dc, L"RAD", 3, &unit);
+        SelectObject(dc, old);
+        place(TopAngle, 2 * (unit.cx + 16) + 4);
+    }
+    place(TopQuadratic, headerButtonWidth(dc, L"Quadratic", g.fonts, height));
+    place(TopVarY, height);
+    place(TopVarX, height);
+
+    int available = x + gap - 12 - (g.topBarRect.left + 14);
+    const wchar_t* titles[] = { g.proMode ? L"Calc Pro Max" : L"Natural Calculator",
+                                g.proMode ? L"Pro Max" : L"Calculator" };
+    g.title.clear();
+    HFONT old = (HFONT)SelectObject(dc, g.fonts.title);
+    for (const wchar_t* candidate : titles) {
+        SIZE size{};
+        GetTextExtentPoint32W(dc, candidate, (int)wcslen(candidate), &size);
+        if (size.cx <= available) { g.title = candidate; break; }
+    }
+    SelectObject(dc, old);
+    ReleaseDC(g.hwnd, dc);
+}
+
+int keyAt(POINT point) {
+    for (size_t i = 0; i < g.buttons.size(); ++i)
+        if (PtInRect(&g.buttons[i].rect, point)) return (int)i;
+    return -1;
+}
+
+int topActionAt(POINT point) {
+    for (int i = 0; i < TopCount; ++i)
+        if (g.topVisible[i] && PtInRect(&g.topRects[i], point)) return i;
+    return -1;
+}
+
 void recomputeLayout(const RECT& rc) {
     int w = rc.right - rc.left;
     int h = rc.bottom - rc.top;
     if (w <= 0 || h <= 0) return;
 
-    int topBarH = 40;
+    int topBarH = 44;
     int editorH = std::max(70, h / 6);
     int buttonAreaH = std::min(420, std::max(300, h * 1 / 2));
 
@@ -487,6 +588,10 @@ void recomputeLayout(const RECT& rc) {
         layoutButtons(g.buttonAreaRect.left, g.buttonAreaRect.top,
                       w, g.buttonAreaRect.bottom - g.buttonAreaRect.top);
     }
+    layoutTopBar();
+    g.hoverKey = g.pressedKey = g.flashKey = -1;
+    g.hoverTop = g.pressedTop = -1;
+    g.backbufferFresh = true;
     invalidateButtonCache();
     invalidateGraphCache();
 }
@@ -645,7 +750,12 @@ void doAction(int action) {
     }
     normalizeNames(cur);   // resolve any words left over from button edits
     ensureCaretVisible();
-    InvalidateRect(g.hwnd, nullptr, FALSE);
+    // Committing, clearing and mode switches touch everything; a plain edit
+    // only the editor (and the graph of it).
+    bool wholeWindow = action == ActEquals || action == ActClearAll || action == ActToggleTheme ||
+                       action == ActToggleAngle || action == ActToggleScientific || action == ActToggle2nd;
+    if (wholeWindow) InvalidateRect(g.hwnd, nullptr, FALSE);
+    else invalidateEdit();
 }
 
 void undoLastEdit() {
@@ -809,41 +919,6 @@ void copySelectedOutput() {
     CloseClipboard();
 }
 
-bool findOutputAtPoint(POINT point, int& entryIndex, int& characterIndex) {
-    HDC hdc = GetDC(g.hwnd);
-    if (!hdc) return false;
-    const auto& history = g.workspace.history();
-    int pad = 14;
-    int entrySpacing = 10;
-    int y = g.historyRect.top + pad - g.scrollY;
-    for (size_t i = 0; i < history.size(); ++i) {
-        Size size = measureExpression(hdc, history[i]->expr->root.get());
-        int resultTop = y + size.height() + 2;
-        RECT resultRect = { g.historyRect.left + pad, resultTop,
-                            g.historyRect.right - pad, resultTop + 22 };
-        if (PtInRect(&resultRect, point)) {
-            std::wstring text = outputText((int)i);
-            HFONT old = (HFONT)SelectObject(hdc, g.uiFontSmall);
-            int index = 0;
-            int bestDistance = INT_MAX;
-            for (int candidate = 0; candidate <= (int)text.size(); ++candidate) {
-                SIZE prefix{};
-                GetTextExtentPoint32W(hdc, text.c_str(), candidate, &prefix);
-                int distance = std::abs(point.x - (resultRect.left + prefix.cx));
-                if (distance < bestDistance) { bestDistance = distance; index = candidate; }
-            }
-            SelectObject(hdc, old);
-            ReleaseDC(g.hwnd, hdc);
-            entryIndex = (int)i;
-            characterIndex = index;
-            return true;
-        }
-        y += size.height() + entrySpacing + 22 + entrySpacing;
-    }
-    ReleaseDC(g.hwnd, hdc);
-    return false;
-}
-
 void pasteExpression() {
     if (!OpenClipboard(g.hwnd)) return;
     HANDLE data = GetClipboardData(CF_UNICODETEXT);
@@ -873,15 +948,6 @@ void pasteExpression() {
     g.rangeSelected = false;
     ensureCaretVisible();
     InvalidateRect(g.hwnd, nullptr, FALSE);
-}
-
-RECT topActionRect(int right, int width) {
-    RECT r = g.topBarRect;
-    r.left = right - width;
-    r.right = right;
-    r.top += 6;
-    r.bottom -= 6;
-    return r;
 }
 
 void setDarkTitleBar(HWND hwnd, bool dark) {
@@ -1036,18 +1102,6 @@ void solveQuadraticFromDialog() {
 }
 
 // ------------------------------------------------------------- painting
-
-RECT topActionRect(int right, int width);
-
-RECT topActionXRect() { return topActionRect(g.topBarRect.right - 68, 28); }
-RECT topActionYRect() { return topActionRect(g.topBarRect.right - 100, 28); }
-RECT topActionQuadraticRect() { return topActionRect(g.topBarRect.right - 132, 76); }
-RECT topActionSciRect() { return topActionRect(g.topBarRect.right - 214, g.proMode ? 72 : 44); }
-RECT topActionAngleRect() { return topActionRect(g.topBarRect.right - (g.proMode ? 292 : 264), 46); }
-
-RECT themeToggleRect() {
-    return topActionRect(g.topBarRect.right - 8, 52);
-}
 
 // Lighten/darken a color by a signed delta per channel (clamped), used to
 // fake a raised-keycap bevel without needing alpha blending.
@@ -1361,7 +1415,7 @@ void drawProExplosion(HDC hdc, RECT client, const Theme& theme) {
     }
 }
 
-void paintButtonPro(HDC hdc, const ButtonDef& b, const Theme& theme, double proProgress) {
+void paintButtonPro(HDC hdc, const ButtonDef& b, const Theme& theme, double proProgress, KeyState state) {
     (void)theme;
     (void)proProgress;
     int bW = b.rect.right - b.rect.left;
@@ -1370,10 +1424,12 @@ void paintButtonPro(HDC hdc, const ButtonDef& b, const Theme& theme, double proP
 
     // Hardcore sharp chamfer: 6px 45-degree angled corner cuts
     int ch = std::min(6, std::min(bW, bH) / 4);
+    // A pressed key sinks one pixel onto its shadow.
+    int sink = state == KeyState::Pressed ? 1 : 0;
     int x0 = (int)b.rect.left;
-    int y0 = (int)b.rect.top;
+    int y0 = (int)b.rect.top + sink;
     int x1 = (int)b.rect.right;
-    int y1 = (int)b.rect.bottom;
+    int y1 = (int)b.rect.bottom + sink;
 
     COLORREF fg = RGB(0xF2, 0xE6, 0xDB);
     bool drawnByGdiPlus = false;
@@ -1398,12 +1454,14 @@ void paintButtonPro(HDC hdc, const ButtonDef& b, const Theme& theme, double proP
         btnPath.AddPolygon(pts, 8);
 
         // 1. Dark charred faceted drop shadow
-        Gdiplus::Point shadowPts[8];
-        for (int i = 0; i < 8; ++i) shadowPts[i] = Gdiplus::Point(pts[i].X + 1, pts[i].Y + 2);
-        Gdiplus::GraphicsPath shadowPath;
-        shadowPath.AddPolygon(shadowPts, 8);
-        Gdiplus::SolidBrush shadowBrush(Gdiplus::Color(160, 4, 1, 2));
-        graphics.FillPath(&shadowBrush, &shadowPath);
+        if (!sink) {
+            Gdiplus::Point shadowPts[8];
+            for (int i = 0; i < 8; ++i) shadowPts[i] = Gdiplus::Point(pts[i].X + 1, pts[i].Y + 2);
+            Gdiplus::GraphicsPath shadowPath;
+            shadowPath.AddPolygon(shadowPts, 8);
+            Gdiplus::SolidBrush shadowBrush(Gdiplus::Color(160, 4, 1, 2));
+            graphics.FillPath(&shadowBrush, &shadowPath);
+        }
 
         // 2. Base texture & dulled obsidian wash
         if (g.brickBrush) {
@@ -1500,6 +1558,17 @@ void paintButtonPro(HDC hdc, const ButtonDef& b, const Theme& theme, double proP
             graphics.DrawLine(&tickPen, (INT)(x1 - 1), (INT)(y1 - ch + 1), (INT)(x1 - ch + 1), (INT)(y1 - 1));
         }
 
+        // 6. Pointer feedback: an ember glow on hover, charred when pressed.
+        if (state == KeyState::Hover) {
+            Gdiplus::SolidBrush glow(Gdiplus::Color(24, 255, 150, 70));
+            graphics.FillPath(&glow, &btnPath);
+            Gdiplus::Pen hotEdge(Gdiplus::Color(200, 255, 140, 60), 1.2f);
+            graphics.DrawPath(&hotEdge, &btnPath);
+        } else if (state == KeyState::Pressed) {
+            Gdiplus::SolidBrush charred(Gdiplus::Color(110, 0, 0, 0));
+            graphics.FillPath(&charred, &btnPath);
+        }
+
         // Custom sharp geometric glyphs for Pro Max mode
         if (b.action == ActEquals) {
             int midY = (y0 + y1) / 2;
@@ -1554,73 +1623,501 @@ void paintButtonPro(HDC hdc, const ButtonDef& b, const Theme& theme, double proP
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, fg);
 
-    std::wstring displayLabel = b.label;
-    if (b.action == ActPower) {
-        displayLabel = L"x^y";
-    }
-
-    HFONT fontToUse = (b.isFunction && displayLabel.length() > 2) ? g.uiFontSmall : g.uiFont;
+    const std::wstring& displayLabel = b.label;
+    HFONT fontToUse = isIconLabel(displayLabel) ? g.fonts.keyIcon
+                    : (b.isFunction && displayLabel.length() > 2) ? g.uiFontSmall : g.uiFont;
     HFONT old = (HFONT)SelectObject(hdc, fontToUse);
     RECT r = b.rect;
-    DrawTextW(hdc, displayLabel.c_str(), -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    OffsetRect(&r, 0, sink);
+    DrawTextW(hdc, displayLabel.c_str(), -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     SelectObject(hdc, old);
 }
 
-void paintButton(HDC hdc, const ButtonDef& b, const Theme& theme) {
+KeyRole keyRole(const ButtonDef& b) {
+    if (b.isDanger) return KeyRole::Danger;
+    if (b.isAccent) return KeyRole::Equals;
+    if (b.isOperator) return KeyRole::Operator;
+    if (b.isFunction) return KeyRole::Function;
+    return KeyRole::Digit;
+}
+
+void paintButton(HDC hdc, const ButtonDef& b, const Theme& theme, const UiPalette& palette, KeyState state) {
     if (g.proMode) {
-        paintButtonPro(hdc, b, theme, proTransitionProgress());
+        paintButtonPro(hdc, b, theme, proTransitionProgress(), state);
         return;
     }
-
-    // Normal mode: Casio-style keycap palette with classic rounded styling
-    COLORREF fill;
-    COLORREF fg;
-    if (b.isDanger) { fill = theme.isDark ? RGB(0xB0, 0x36, 0x27) : RGB(0xC7, 0x3E, 0x2A); fg = RGB(255, 255, 255); }
-    else if (b.isAccent) { fill = theme.accent; fg = RGB(255, 255, 255); }
-    else if (b.isOperator) { fill = theme.accent; fg = RGB(255, 255, 255); }
-    else if (b.isFunction) { fill = theme.isDark ? RGB(0x3A, 0x3D, 0x45) : RGB(0x50, 0x54, 0x5C); fg = RGB(0xF2, 0xF2, 0xF2); }
-    else { fill = theme.isDark ? RGB(0x4E, 0x51, 0x58) : RGB(0xF9, 0xF7, 0xF2); fg = theme.isDark ? RGB(0xF2, 0xF2, 0xF2) : RGB(0x24, 0x24, 0x24); }
-
-    int radius = 6;
-
-    // Drop shadow
-    HBRUSH shadowBrush = CreateSolidBrush(shade(theme.background, theme.isDark ? -18 : -35));
-    HBRUSH oldShadowBrush = (HBRUSH)SelectObject(hdc, shadowBrush);
-    HPEN nullPen = (HPEN)GetStockObject(NULL_PEN);
-    HPEN oldPen0 = (HPEN)SelectObject(hdc, nullPen);
-    RoundRect(hdc, b.rect.left + 1, b.rect.top + 2, b.rect.right + 1, b.rect.bottom + 2, radius, radius);
-    SelectObject(hdc, oldShadowBrush);
-    SelectObject(hdc, oldPen0);
-    DeleteObject(shadowBrush);
-
-    // The keycap itself
-    HBRUSH brush = CreateSolidBrush(fill);
-    HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, brush);
-    HPEN pen = CreatePen(PS_SOLID, 1, shade(fill, theme.isDark ? -35 : -45));
-    HPEN oldPen = (HPEN)SelectObject(hdc, pen);
-    RoundRect(hdc, b.rect.left, b.rect.top, b.rect.right, b.rect.bottom, radius, radius);
-    SelectObject(hdc, oldPen);
-    DeleteObject(pen);
-
-    // Bevel highlight along the top edge for a subtle raised look.
-    HPEN hi = CreatePen(PS_SOLID, 1, shade(fill, theme.isDark ? 25 : 40));
-    HPEN oldHi = (HPEN)SelectObject(hdc, hi);
-    MoveToEx(hdc, b.rect.left + radius, b.rect.top + 2, nullptr);
-    LineTo(hdc, b.rect.right - radius, b.rect.top + 2);
-    SelectObject(hdc, oldHi);
-    SelectObject(hdc, oldBrush);
-    DeleteObject(brush);
-    DeleteObject(hi);
-
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, fg);
-    HFONT old = (HFONT)SelectObject(hdc, g.uiFont);
-    RECT r = b.rect;
-    DrawTextW(hdc, b.label.c_str(), -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    SelectObject(hdc, old);
+    drawKeyCap(hdc, b.rect, keyRole(b), state, b.label, palette, g.fonts);
 }
 
-void paint(HDC hdc, RECT client) {
+// ------------------------------------------------------------- chrome painting
+
+constexpr int kScreenPad = 16;
+
+uint64_t hashMix(uint64_t hash, uint64_t value) {
+    return (hash ^ value) * 0x100000001B3ull + 0x9E3779B97F4A7C15ull;
+}
+
+uint64_t hashText(const std::string& text) {
+    uint64_t hash = 0xCBF29CE484222325ull;
+    for (unsigned char c : text) hash = (hash ^ c) * 0x100000001B3ull;
+    return hash;
+}
+
+uint64_t themeHash(const Theme& theme) {
+    uint64_t hash = 0;
+    for (COLORREF c : { theme.background, theme.panelBackground, theme.screenBackground,
+                        theme.screenText, theme.screenResult, theme.divider })
+        hash = hashMix(hash, c);
+    return hashMix(hash, theme.isDark);
+}
+
+struct HistoryRow {
+    int top = 0;             // content coordinates (0 = top of the scroll area)
+    int baseline = 0;
+    Size size;
+    RECT result{};           // result line box
+    int textLeft = 0;        // where outputText() starts
+    int bottom = 0;          // end of the row, spacing included
+    bool error = false;
+    HFONT font = nullptr;    // the result is drawn and hit-tested in this font
+};
+
+// Vertical layout of the history column, shared by painting and hit-testing
+// so a click selects exactly the characters that were drawn. Results sit
+// right-aligned under their expression, like a calculator display.
+std::vector<HistoryRow> layoutHistory(HDC hdc, int& contentHeight) {
+    const auto& hist = g.workspace.history();
+    std::vector<HistoryRow> rows(hist.size());
+    int left = g.historyRect.left + kScreenPad;
+    int right = g.historyRect.right - kScreenPad;
+    int y = 12;
+    for (size_t i = 0; i < hist.size(); ++i) {
+        HistoryRow& row = rows[i];
+        row.size = measureExpression(hdc, hist[i]->expr->root.get());
+        row.top = y;
+        row.baseline = y + row.size.ascent;
+        row.error = hist[i]->isError;
+        row.font = row.error ? g.fonts.note : g.fonts.result;
+        std::wstring text = outputText((int)i);
+        SIZE extent{};
+        HFONT old = (HFONT)SelectObject(hdc, row.font);
+        GetTextExtentPoint32W(hdc, text.c_str(), (int)text.size(), &extent);
+        if (extent.cx > right - left && !row.error) {
+            // Long results drop to the smaller face before they overflow.
+            row.font = g.fonts.note;
+            SelectObject(hdc, row.font);
+            GetTextExtentPoint32W(hdc, text.c_str(), (int)text.size(), &extent);
+        }
+        SelectObject(hdc, old);
+        int lineH = row.font == g.fonts.result ? 32 : 22;
+        int resultTop = y + row.size.height() + 2;
+        row.result = { left, resultTop, right, resultTop + lineH };
+        row.textLeft = extent.cx <= right - left ? right - extent.cx : left;
+        y = resultTop + lineH + 14;
+        row.bottom = y;
+    }
+    contentHeight = y;
+    return rows;
+}
+
+bool findOutputAtPoint(POINT point, int& entryIndex, int& characterIndex) {
+    if (!PtInRect(&g.historyRect, point)) return false;
+    HDC hdc = GetDC(g.hwnd);
+    if (!hdc) return false;
+    int contentH = 0;
+    std::vector<HistoryRow> rows = layoutHistory(hdc, contentH);
+    int origin = g.historyRect.top - g.scrollY;
+    for (size_t i = 0; i < rows.size(); ++i) {
+        RECT resultRect = rows[i].result;
+        OffsetRect(&resultRect, 0, origin);
+        if (!PtInRect(&resultRect, point)) continue;
+        std::wstring text = outputText((int)i);
+        HFONT old = (HFONT)SelectObject(hdc, rows[i].font);
+        int index = 0;
+        int bestDistance = INT_MAX;
+        for (int candidate = 0; candidate <= (int)text.size(); ++candidate) {
+            SIZE prefix{};
+            GetTextExtentPoint32W(hdc, text.c_str(), candidate, &prefix);
+            int distance = std::abs(point.x - (rows[i].textLeft + prefix.cx));
+            if (distance < bestDistance) { bestDistance = distance; index = candidate; }
+        }
+        SelectObject(hdc, old);
+        ReleaseDC(g.hwnd, hdc);
+        entryIndex = (int)i;
+        characterIndex = index;
+        return true;
+    }
+    ReleaseDC(g.hwnd, hdc);
+    return false;
+}
+
+void paintTopBarNormal(HDC mem, const UiPalette& pal) {
+    HBRUSH bar = CreateSolidBrush(pal.topBar);
+    FillRect(mem, &g.topBarRect, bar);
+    DeleteObject(bar);
+    for (int i = 0; i < TopCount; ++i) {
+        if (!g.topVisible[i]) continue;
+        KeyState state = g.pressedTop == i ? KeyState::Pressed
+                       : g.hoverTop == i ? KeyState::Hover : KeyState::Normal;
+        std::wstring label;
+        switch (i) {
+            case TopVarX: label = L"x"; break;
+            case TopVarY: label = L"y"; break;
+            case TopQuadratic: label = L"Quadratic"; break;
+            case TopSci: label = L"Sci"; break;
+            case TopTheme: label = std::wstring(1, g.dark ? Icon::Sun : Icon::Moon); break;
+            case TopAngle:
+                drawSegmentedToggle(mem, g.topRects[i], L"DEG", L"RAD", g.degrees, state, pal, g.fonts);
+                continue;
+        }
+        drawHeaderButton(mem, g.topRects[i], label, state, false, pal, g.fonts);
+    }
+}
+
+// Pro Max header: chamfered HUD badges. `lit` marks the active mode.
+void drawHudBadge(HDC mem, const RECT& rect, const std::wstring& label, KeyState state, bool lit) {
+    int c = 4;
+    POINT pts[8] = {
+        { rect.left + c, rect.top }, { rect.right - c, rect.top },
+        { rect.right, rect.top + c }, { rect.right, rect.bottom - c },
+        { rect.right - c, rect.bottom }, { rect.left + c, rect.bottom },
+        { rect.left, rect.bottom - c }, { rect.left, rect.top + c }
+    };
+    COLORREF fill = lit ? RGB(0x8A, 0x06, 0x1A) : RGB(0x1B, 0x07, 0x0A);
+    COLORREF border = lit ? RGB(0xFF, 0x55, 0x18) : RGB(0xB8, 0x2A, 0x12);
+    if (state == KeyState::Hover) { fill = shade(fill, 22); border = RGB(0xFF, 0x8A, 0x30); }
+    if (state == KeyState::Pressed) fill = shade(fill, -10);
+    HBRUSH b = CreateSolidBrush(fill);
+    HPEN p = CreatePen(PS_SOLID, 1, border);
+    HBRUSH ob = (HBRUSH)SelectObject(mem, b);
+    HPEN op = (HPEN)SelectObject(mem, p);
+    Polygon(mem, pts, 8);
+    SelectObject(mem, ob);
+    SelectObject(mem, op);
+    DeleteObject(b);
+    DeleteObject(p);
+    if (state != KeyState::Pressed) {
+        HPEN hiPen = CreatePen(PS_SOLID, 1, RGB(0xFF, 0x88, 0x30));
+        HPEN oldHi = (HPEN)SelectObject(mem, hiPen);
+        MoveToEx(mem, rect.left + c, rect.top + 1, nullptr);
+        LineTo(mem, rect.right - c, rect.top + 1);
+        SelectObject(mem, oldHi);
+        DeleteObject(hiPen);
+    }
+    RECT textRect = rect;
+    if (state == KeyState::Pressed) OffsetRect(&textRect, 0, 1);
+    SetBkMode(mem, TRANSPARENT);
+    SetTextColor(mem, lit ? RGB(0xFF, 0xF4, 0xEA) : RGB(0xF5, 0xEB, 0xE1));
+    HFONT old = (HFONT)SelectObject(mem, isIconLabel(label) ? g.fonts.icon : g.fonts.pill);
+    DrawTextW(mem, label.c_str(), -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(mem, old);
+}
+
+void paintTopBarPro(HDC mem, const Theme& theme) {
+    HBRUSH bar = CreateSolidBrush(theme.panelBackground);
+    FillRect(mem, &g.topBarRect, bar);
+    DeleteObject(bar);
+    for (int i = 0; i < TopCount; ++i) {
+        if (!g.topVisible[i]) continue;
+        KeyState state = g.pressedTop == i ? KeyState::Pressed
+                       : g.hoverTop == i ? KeyState::Hover : KeyState::Normal;
+        const RECT& r = g.topRects[i];
+        switch (i) {
+            case TopVarX: drawHudBadge(mem, r, L"x", state, false); break;
+            case TopVarY: drawHudBadge(mem, r, L"y", state, false); break;
+            case TopQuadratic: drawHudBadge(mem, r, L"Quadratic", state, false); break;
+            case TopSci: drawHudBadge(mem, r, L"PRO MAX", state, true); break;
+            case TopTheme: drawHudBadge(mem, r, std::wstring(1, g.dark ? Icon::Sun : Icon::Moon), state, false); break;
+            case TopAngle: {
+                // DEG | RAD: both units visible, the active one lit.
+                int mid = (r.left + r.right) / 2;
+                RECT deg = { r.left, r.top, mid + 1, r.bottom };
+                RECT rad = { mid - 1, r.top, r.right, r.bottom };
+                drawHudBadge(mem, deg, L"DEG", g.degrees ? state : KeyState::Normal, g.degrees);
+                drawHudBadge(mem, rad, L"RAD", g.degrees ? KeyState::Normal : state, !g.degrees);
+                break;
+            }
+        }
+    }
+}
+
+void paintTopBar(HDC mem, const Theme& theme, const UiPalette& pal) {
+    if (g.proMode) paintTopBarPro(mem, theme);
+    else paintTopBarNormal(mem, pal);
+
+    if (!g.title.empty()) {
+        int right = g.topBarRect.right;
+        for (int i = 0; i < TopCount; ++i)
+            if (g.topVisible[i]) right = std::min(right, (int)g.topRects[i].left);
+        RECT r = { g.topBarRect.left + 14, g.topBarRect.top, right - 12, g.topBarRect.bottom };
+        SetBkMode(mem, TRANSPARENT);
+        SetTextColor(mem, g.proMode ? RGB(0xF5, 0xEB, 0xE1) : pal.title);
+        HFONT old = (HFONT)SelectObject(mem, g.fonts.title);
+        DrawTextW(mem, g.title.c_str(), -1, &r, DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        SelectObject(mem, old);
+    }
+
+    HPEN divPen = CreatePen(PS_SOLID, 1, theme.divider);
+    HPEN oldPen = (HPEN)SelectObject(mem, divPen);
+    MoveToEx(mem, g.topBarRect.left, g.topBarRect.bottom - 1, nullptr);
+    LineTo(mem, g.topBarRect.right, g.topBarRect.bottom - 1);
+    SelectObject(mem, oldPen);
+    DeleteObject(divPen);
+}
+
+void paintHistory(HDC mem, const Theme& theme, const Theme& screenTheme, const UiPalette& pal) {
+    HBRUSH screenBrush = CreateSolidBrush(pal.screen);
+    FillRect(mem, &g.historyRect, screenBrush);
+    DeleteObject(screenBrush);
+
+    HRGN clip = CreateRectRgnIndirect(&g.historyRect);
+    SelectClipRgn(mem, clip);
+
+    int contentH = 0;
+    std::vector<HistoryRow> rows = layoutHistory(mem, contentH);
+    int viewH = g.historyRect.bottom - g.historyRect.top;
+    int maxScroll = std::max(0, contentH - viewH);
+    if (g.scrollToBottomPending) { g.scrollY = maxScroll; g.scrollToBottomPending = false; }
+    g.scrollY = std::clamp(g.scrollY, 0, maxScroll);
+    int origin = g.historyRect.top - g.scrollY;
+    SetBkMode(mem, TRANSPARENT);
+
+    if (rows.empty()) {
+        // Empty state: say what the area is for and how to fill it.
+        RECT r = g.historyRect;
+        r.left += kScreenPad;
+        r.right -= kScreenPad;
+        int midY = (r.top + r.bottom) / 2;
+        RECT line1 = { r.left, midY - 26, r.right, midY - 2 };
+        RECT line2 = { r.left, midY + 2, r.right, midY + 22 };
+        SetTextColor(mem, pal.screenMuted);
+        HFONT old = (HFONT)SelectObject(mem, g.fonts.title);
+        DrawTextW(mem, L"No calculations yet", -1, &line1, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        SelectObject(mem, g.fonts.note);
+        DrawTextW(mem, L"Type below, then press Enter", -1, &line2,
+                  DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        SelectObject(mem, old);
+    }
+
+    const auto& hist = g.workspace.history();
+    for (size_t i = 0; i < rows.size(); ++i) {
+        const HistoryRow& row = rows[i];
+        if (origin + row.bottom < g.historyRect.top || origin + row.top > g.historyRect.bottom) continue;
+        drawExpression(mem, hist[i]->expr->root.get(), g.historyRect.left + kScreenPad,
+                       origin + row.baseline, screenTheme, nullptr, nullptr);
+
+        RECT rr = row.result;
+        OffsetRect(&rr, 0, origin);
+        std::wstring text = outputText((int)i);
+        HFONT old = (HFONT)SelectObject(mem, row.font);
+        if (g.outputEntry == (int)i && g.outputAnchor != g.outputCaret) {
+            int begin = std::min(g.outputAnchor, g.outputCaret);
+            int end = std::max(g.outputAnchor, g.outputCaret);
+            SIZE before{}, selected{};
+            GetTextExtentPoint32W(mem, text.c_str(), begin, &before);
+            GetTextExtentPoint32W(mem, text.c_str() + begin, end - begin, &selected);
+            RECT highlight = { row.textLeft + before.cx, rr.top + 2, row.textLeft + before.cx + selected.cx, rr.bottom - 2 };
+            HBRUSH highlightBrush = CreateSolidBrush(pal.selection);
+            FillRect(mem, &highlight, highlightBrush);
+            DeleteObject(highlightBrush);
+        }
+        // "= " in the muted tone, the value itself in the result color.
+        SIZE prefix{};
+        GetTextExtentPoint32W(mem, text.c_str(), 2, &prefix);
+        RECT prefixRect = { row.textLeft, rr.top, row.textLeft + prefix.cx, rr.bottom };
+        RECT valueRect = { row.textLeft + prefix.cx, rr.top, rr.right + kScreenPad, rr.bottom };
+        SetTextColor(mem, pal.screenMuted);
+        DrawTextW(mem, text.c_str(), 2, &prefixRect, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        SetTextColor(mem, row.error ? pal.error : pal.result);
+        DrawTextW(mem, text.c_str() + 2, (int)text.size() - 2, &valueRect,
+                  DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        SelectObject(mem, old);
+
+        if (i + 1 < rows.size()) {
+            int ruleY = origin + row.bottom - 7;
+            HPEN rule = CreatePen(PS_SOLID, 1, pal.screenRule);
+            HPEN oldRule = (HPEN)SelectObject(mem, rule);
+            MoveToEx(mem, g.historyRect.left + kScreenPad, ruleY, nullptr);
+            LineTo(mem, g.historyRect.right - kScreenPad, ruleY);
+            SelectObject(mem, oldRule);
+            DeleteObject(rule);
+        }
+    }
+    // Soft edges where entries continue past the viewport.
+    const int fadeH = 18;
+    if (g.scrollY > 0)
+        fadeEdge(mem, { g.historyRect.left, g.historyRect.top, g.historyRect.right, g.historyRect.top + fadeH },
+                 pal.screen, true);
+    if (g.scrollY < maxScroll)
+        fadeEdge(mem, { g.historyRect.left, g.historyRect.bottom - fadeH, g.historyRect.right, g.historyRect.bottom },
+                 pal.screen, false);
+    (void)theme;
+    SelectClipRgn(mem, nullptr);
+    DeleteObject(clip);
+}
+
+void paintEditor(HDC mem, const Theme& theme, const Theme& screenTheme, const UiPalette& pal) {
+    HBRUSH b = CreateSolidBrush(pal.screen);
+    FillRect(mem, &g.editorRect, b);
+    DeleteObject(b);
+    HPEN p = CreatePen(PS_SOLID, 1, mixColor(pal.screen, theme.screenText, 0.22));
+    HPEN op = (HPEN)SelectObject(mem, p);
+    MoveToEx(mem, g.editorRect.left, g.editorRect.top, nullptr);
+    LineTo(mem, g.editorRect.right, g.editorRect.top);
+    SelectObject(mem, op);
+    DeleteObject(p);
+
+    Expression& cur = g.workspace.current();
+    Size s = measureExpression(mem, cur.root.get());
+    int midY = (g.editorRect.top + g.editorRect.bottom) / 2;
+    int baseline = midY + (s.ascent - s.descent) / 2;
+    if ((g.allSelected || g.rangeSelected || g.editorCaret != g.editorAnchor) && !rowIsEmpty(cur.root.get())) {
+        int selectionLeft = g.editorRect.left + 12;
+        int selectionRight = g.editorRect.left + 20 + s.width;
+        if (g.editorCaret != g.editorAnchor && !g.allSelected && !g.rangeSelected) {
+            std::string plain = cur.toPlainString();
+            HDC measure = mem;
+            HFONT oldFont = (HFONT)SelectObject(measure, g.uiFont);
+            std::wstring before(plain.begin(), plain.begin() + std::min(g.editorAnchor, g.editorCaret));
+            std::wstring selected(plain.begin() + std::min(g.editorAnchor, g.editorCaret),
+                                  plain.begin() + std::max(g.editorAnchor, g.editorCaret));
+            SIZE beforeSize{}, selectedSize{};
+            HFONT expressionFont = CreateFontW(-fontHeightForDepth(0), 0, 0, 0, FW_NORMAL,
+                                               FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                               OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                               CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+                                               L"Segoe UI");
+            HFONT previousFont = (HFONT)SelectObject(measure, expressionFont);
+            GetTextExtentPoint32W(measure, before.c_str(), (int)before.size(), &beforeSize);
+            GetTextExtentPoint32W(measure, selected.c_str(), (int)selected.size(), &selectedSize);
+            SelectObject(measure, previousFont);
+            DeleteObject(expressionFont);
+            int origin = g.editorRect.left + kScreenPad;
+            selectionLeft = origin + beforeSize.cx;
+            selectionRight = selectionLeft + selectedSize.cx;
+            SelectObject(measure, oldFont);
+        }
+        RECT selection = { selectionLeft, baseline - s.ascent - 4,
+                           selectionRight, baseline + s.descent + 4 };
+        HBRUSH selectionBrush = CreateSolidBrush(pal.selection);
+        FillRect(mem, &selection, selectionBrush);
+        DeleteObject(selectionBrush);
+    }
+    CaretInfo caret;
+    drawExpression(mem, cur.root.get(), g.editorRect.left + kScreenPad, baseline, screenTheme, &cur.cursor, &caret);
+
+    if (rowIsEmpty(cur.root.get())) {
+        // First-run hint beside the empty slot; it disappears on the first key.
+        RECT hint = { g.editorRect.left + kScreenPad + s.width + 12, baseline - s.ascent,
+                      g.editorRect.right - kScreenPad, baseline + s.descent };
+        SetBkMode(mem, TRANSPARENT);
+        SetTextColor(mem, pal.screenMuted);
+        HFONT old = (HFONT)SelectObject(mem, g.fonts.note);
+        DrawTextW(mem, L"Type an expression", -1, &hint, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        SelectObject(mem, old);
+    }
+
+    if (g.editorTextCursor >= 0) {
+        caret.valid = true;
+        caret.x = editorTextX(mem, cur.toPlainString(), g.editorTextCursor);
+        caret.top = baseline - s.ascent;
+        caret.bottom = baseline + s.descent;
+    }
+
+    if (caret.valid && g.caretVisible) {
+        HPEN cp = CreatePen(PS_SOLID, 2, screenTheme.caret);
+        HPEN ocp = (HPEN)SelectObject(mem, cp);
+        MoveToEx(mem, caret.x, caret.top, nullptr);
+        LineTo(mem, caret.x, caret.bottom);
+        SelectObject(mem, ocp);
+        DeleteObject(cp);
+    }
+}
+
+// The keypad drawn in `state` over the button area, reused frame after frame
+// until the layout or theme changes. The normal layer renders whole; hover and
+// pressed variants render one key at a time on first use, so the first hover
+// in Pro Max costs one textured key instead of the whole keypad.
+HDC keyLayer(HDC compatible, KeyState state, const Theme& theme, const UiPalette& pal, int key) {
+    int w = g.buttonAreaRect.right - g.buttonAreaRect.left;
+    int h = g.buttonAreaRect.bottom - g.buttonAreaRect.top;
+    int i = (int)state;
+    if (g.keyLayerW != w || g.keyLayerH != h) {
+        for (int k = 0; k < (int)KeyState::Count; ++k) {
+            if (!g.keyLayerDC[k]) continue;
+            SelectObject(g.keyLayerDC[k], g.keyLayerOldBmp[k]);
+            DeleteObject(g.keyLayerBmp[k]);
+            DeleteDC(g.keyLayerDC[k]);
+            g.keyLayerDC[k] = nullptr;
+            g.keyLayerBmp[k] = nullptr;
+            g.keyLayerValid[k] = false;
+        }
+        g.keyLayerW = w;
+        g.keyLayerH = h;
+    }
+    if (!g.keyLayerDC[i]) {
+        g.keyLayerDC[i] = CreateCompatibleDC(compatible);
+        g.keyLayerBmp[i] = CreateCompatibleBitmap(compatible, w, h);
+        g.keyLayerOldBmp[i] = (HBITMAP)SelectObject(g.keyLayerDC[i], g.keyLayerBmp[i]);
+        g.keyLayerValid[i] = false;
+    }
+    // The Pro Max intro is still blending the theme when the first layer
+    // renders; use its final color so every layer matches whenever drawn.
+    COLORREF fill = g.proMode ? proTheme(g.dark ? darkTheme() : lightTheme(), 1.0).background
+                              : theme.background;
+    std::vector<char>& drawn = g.keyLayerKeyDrawn[i];
+    auto paintKey = [&](size_t index) {
+        ButtonDef local = g.buttons[index];
+        OffsetRect(&local.rect, -g.buttonAreaRect.left, -g.buttonAreaRect.top);
+        RECT clear = local.rect;
+        InflateRect(&clear, 1, 2);   // the drop shadow
+        HBRUSH background = CreateSolidBrush(fill);
+        FillRect(g.keyLayerDC[i], &clear, background);
+        DeleteObject(background);
+        paintButton(g.keyLayerDC[i], local, theme, pal, state);
+        drawn[index] = 1;
+    };
+    if (!g.keyLayerValid[i]) {
+        drawn.assign(g.buttons.size(), 0);
+        if (state == KeyState::Normal) {
+            RECT all = { 0, 0, w, h };
+            HBRUSH background = CreateSolidBrush(fill);
+            FillRect(g.keyLayerDC[i], &all, background);
+            DeleteObject(background);
+            for (size_t k = 0; k < g.buttons.size(); ++k) paintKey(k);
+        }
+        g.keyLayerValid[i] = true;
+    }
+    if (key >= 0 && key < (int)drawn.size() && !drawn[key]) paintKey((size_t)key);
+    return g.keyLayerDC[i];
+}
+
+void paintKeypad(HDC mem, const Theme& theme, const UiPalette& pal) {
+    RECT area = g.buttonAreaRect;
+    int w = area.right - area.left;
+    int h = area.bottom - area.top;
+    if (w <= 0 || h <= 0) return;
+    BitBlt(mem, area.left, area.top, w, h, keyLayer(mem, KeyState::Normal, theme, pal, -1), 0, 0, SRCCOPY);
+    auto overlay = [&](int index, KeyState state) {
+        if (index < 0 || index >= (int)g.buttons.size()) return;
+        RECT r = g.buttons[index].rect;
+        InflateRect(&r, 1, 2);   // include the drop shadow
+        IntersectRect(&r, &r, &area);
+        BitBlt(mem, r.left, r.top, r.right - r.left, r.bottom - r.top,
+               keyLayer(mem, state, theme, pal, index), r.left - area.left, r.top - area.top, SRCCOPY);
+    };
+    int pressed = g.pressedKey >= 0 ? g.pressedKey : g.flashKey;
+    if (g.hoverKey != pressed) overlay(g.hoverKey, KeyState::Hover);
+    overlay(pressed, KeyState::Pressed);
+}
+
+RECT petPaintRect() {
+    RECT r = petBounds();
+    InflateRect(&r, 24, 24);   // spikes, glow and bounce
+    return r;
+}
+
+void paint(HDC hdc, RECT client, const RECT& dirty) {
     Theme theme = g.dark ? darkTheme() : lightTheme();
     double proProgress = proTransitionProgress();
     if (g.proMode) theme = proTheme(theme, proProgress);
@@ -1637,6 +2134,7 @@ void paint(HDC hdc, RECT client) {
     screenTheme.resultColor = theme.screenResult;
     screenTheme.caret = theme.screenCaret;
     screenTheme.placeholder = theme.screenPlaceholder;
+    UiPalette pal = makePalette(theme);
 
     int clientW = client.right - client.left;
     int clientH = client.bottom - client.top;
@@ -1653,271 +2151,65 @@ void paint(HDC hdc, RECT client) {
         g.backbufferOldBmp = (HBITMAP)SelectObject(g.backbufferDC, g.backbufferBmp);
         g.backbufferW = clientW;
         g.backbufferH = clientH;
+        g.backbufferFresh = true;
     }
     HDC mem = g.backbufferDC;
     if (!mem) return;
 
-    HBRUSH bgBrush = CreateSolidBrush(theme.background);
-    FillRect(mem, &client, bgBrush);
-    DeleteObject(bgBrush);
+    // Sections are redrawn only when what they show changed; the Pro intro
+    // animation and a freshly sized buffer redraw everything.
+    bool animating = g.proMode && (proProgress < 1.0 || g.explosionActive);
+    bool full = g.backbufferFresh || animating;
+    if (full) {
+        HBRUSH bgBrush = CreateSolidBrush(theme.background);
+        FillRect(mem, &client, bgBrush);
+        DeleteObject(bgBrush);
+    }
+    bool petOverTop = false, petOverHistory = false;
+    if (g.proMode && proProgress > 0.16) {
+        RECT now = petPaintRect(), overlap{};
+        petOverTop = IntersectRect(&overlap, &now, &g.topBarRect) || IntersectRect(&overlap, &g.lastPetRect, &g.topBarRect);
+        petOverHistory = IntersectRect(&overlap, &now, &g.historyRect) || IntersectRect(&overlap, &g.lastPetRect, &g.historyRect);
+    }
 
     // --- top bar ---
-    HBRUSH panelBrush = CreateSolidBrush(theme.panelBackground);
-    FillRect(mem, &g.topBarRect, panelBrush);
-    DeleteObject(panelBrush);
-    {
-        SetBkMode(mem, TRANSPARENT);
-        SetTextColor(mem, theme.isDark ? RGB(0xF0, 0xF0, 0xF0) : RGB(0x2A, 0x2A, 0x2A));
-        HFONT old = (HFONT)SelectObject(mem, g.uiFont);
-        RECT r = g.topBarRect; r.left += 12;
-        DrawTextW(mem, g.proMode ? L"Calc Pro Max" : L"Natural Calculator",
-              -1, &r, DT_VCENTER | DT_SINGLELINE);
-        SelectObject(mem, old);
+    uint64_t topKey = hashMix(themeHash(theme), (uint64_t)g.proMode | ((uint64_t)g.degrees << 1) | ((uint64_t)g.dark << 2));
+    topKey = hashMix(topKey, (uint64_t)(g.hoverTop + 1) | ((uint64_t)(g.pressedTop + 1) << 8));
+    topKey = hashMix(topKey, ((uint64_t)g.topBarRect.right << 32) | (uint32_t)g.topBarRect.bottom);
+    topKey = hashMix(topKey, hashText(std::string(g.title.begin(), g.title.end())));
+    // A section outside the update region keeps its pixels. If its inputs
+    // changed meanwhile, its stored key still holds the old value, so it is
+    // redrawn as soon as it is exposed again.
+    RECT overlap{};
+    auto exposed = [&](const RECT& r) { return full || IntersectRect(&overlap, &dirty, &r) != FALSE; };
+    if (exposed(g.topBarRect) && (full || petOverTop || topKey != g.topBarKey)) {
+        paintTopBar(mem, theme, pal);
+        g.topBarKey = topKey;
     }
-    auto drawPill = [&](RECT rect, const wchar_t* label, bool active = false) {
-        if (!g.proMode) {
-            // Standard smooth rounded pill in normal mode
-            COLORREF regularFill = theme.isDark ? RGB(0x3A, 0x3D, 0x45) : RGB(0x50, 0x54, 0x5C);
-            COLORREF fill = regularFill;
-            HBRUSH b = CreateSolidBrush(fill);
-            HBRUSH ob = (HBRUSH)SelectObject(mem, b);
-            HPEN nullPen = (HPEN)GetStockObject(NULL_PEN);
-            HPEN op = (HPEN)SelectObject(mem, nullPen);
-            RoundRect(mem, rect.left, rect.top, rect.right, rect.bottom, 8, 8);
-            SelectObject(mem, ob); SelectObject(mem, op);
-            DeleteObject(b);
-            SetTextColor(mem, RGB(0xF2, 0xF2, 0xF2));
-            HFONT old = (HFONT)SelectObject(mem, g.uiFontSmall);
-            DrawTextW(mem, label, -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            SelectObject(mem, old);
-            return;
-        }
-
-        // Pro Max: Hardcore sharp chamfered tactical HUD badge
-        int c = 4;
-        POINT pts[8] = {
-            { rect.left + c, rect.top },
-            { rect.right - c, rect.top },
-            { rect.right, rect.top + c },
-            { rect.right, rect.bottom - c },
-            { rect.right - c, rect.bottom },
-            { rect.left + c, rect.bottom },
-            { rect.left, rect.bottom - c },
-            { rect.left, rect.top + c }
-        };
-        COLORREF fill = active ? RGB(0x8A, 0x06, 0x1A) : RGB(0x1B, 0x07, 0x0A);
-        COLORREF border = active ? RGB(0xFF, 0x55, 0x18) : RGB(0xB8, 0x2A, 0x12);
-        HBRUSH b = CreateSolidBrush(fill);
-        HPEN p = CreatePen(PS_SOLID, 1, border);
-        HBRUSH ob = (HBRUSH)SelectObject(mem, b);
-        HPEN op = (HPEN)SelectObject(mem, p);
-        Polygon(mem, pts, 8);
-        SelectObject(mem, ob);
-        SelectObject(mem, op);
-        DeleteObject(b);
-        DeleteObject(p);
-
-        HPEN hiPen = CreatePen(PS_SOLID, 1, RGB(0xFF, 0x88, 0x30));
-        HPEN oldHi = (HPEN)SelectObject(mem, hiPen);
-        MoveToEx(mem, rect.left + c, rect.top + 1, nullptr);
-        LineTo(mem, rect.right - c, rect.top + 1);
-        SelectObject(mem, oldHi);
-        DeleteObject(hiPen);
-
-        SetTextColor(mem, active ? RGB(0xFF, 0xF4, 0xEA) : RGB(0xF5, 0xEB, 0xE1));
-        HFONT old = (HFONT)SelectObject(mem, g.uiFontSmall);
-        DrawTextW(mem, label, -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        SelectObject(mem, old);
-    };
-    {
-        RECT xr = topActionXRect();
-        RECT yr = topActionYRect();
-        RECT qr = topActionQuadraticRect();
-        RECT sciRect = topActionSciRect();
-        drawPill(xr, L"x");
-        drawPill(yr, L"y");
-        drawPill(qr, L"Quadratic");
-        drawPill(sciRect, g.proMode ? L"PRO MAX" : L"Sci", g.proMode);
-        if (g.proMode) {
-            RECT angleRect = topActionAngleRect();
-            drawPill(angleRect, g.degrees ? L"DEG" : L"RAD", true);
-        }
-    }
-    drawPill(themeToggleRect(), g.dark ? L"Light" : L"Dark");
-    HPEN divPen = CreatePen(PS_SOLID, 1, theme.divider);
-    HPEN oldPen = (HPEN)SelectObject(mem, divPen);
-    MoveToEx(mem, 0, g.topBarRect.bottom, nullptr);
-    LineTo(mem, client.right, g.topBarRect.bottom);
-    SelectObject(mem, oldPen);
-    DeleteObject(divPen);
 
     // --- history (scrollable) ---
-    {
-        HBRUSH screenBrush = CreateSolidBrush(theme.screenBackground);
-        FillRect(mem, &g.historyRect, screenBrush);
-        DeleteObject(screenBrush);
-
-        HRGN clip = CreateRectRgnIndirect(&g.historyRect);
-        SelectClipRgn(mem, clip);
-
-        const auto& hist = g.workspace.history();
-        int pad = 14;
-        int entrySpacing = 10;
-
-        // First pass: compute total content height so we can clamp scroll.
-        int totalH = 0;
-        std::vector<Size> sizes(hist.size());
-        for (size_t i = 0; i < hist.size(); ++i) {
-            sizes[i] = measureExpression(mem, hist[i]->expr->root.get());
-            totalH += sizes[i].height() + entrySpacing + 22 /* result line */ + entrySpacing;
-        }
-        int viewH = g.historyRect.bottom - g.historyRect.top;
-        int maxScroll = std::max(0, totalH - viewH + pad);
-        if (g.scrollToBottomPending) { g.scrollY = maxScroll; g.scrollToBottomPending = false; }
-        g.scrollY = std::clamp(g.scrollY, 0, maxScroll);
-
-        int y = g.historyRect.top + pad - g.scrollY;
-        for (size_t i = 0; i < hist.size(); ++i) {
-            const Size& s = sizes[i];
-            int baseline = y + s.ascent;
-            if (baseline + s.descent >= g.historyRect.top && baseline - s.ascent <= g.historyRect.bottom) {
-                drawExpression(mem, hist[i]->expr->root.get(), g.historyRect.left + pad, baseline,
-                                screenTheme, nullptr, nullptr);
-
-                HFONT old = (HFONT)SelectObject(mem, g.uiFontSmall);
-                SetTextColor(mem, hist[i]->isError ? RGB(0xD8, 0x3B, 0x3B) : screenTheme.resultColor);
-                SetBkMode(mem, TRANSPARENT);
-                std::wstring res = L"= " + wideResult(hist[i]->result);
-                RECT rr = { g.historyRect.left + pad, y + s.height() + 2,
-                            g.historyRect.right - pad, y + s.height() + 24 };
-                int selectionBegin = -1;
-                int selectionEnd = -1;
-                if (g.outputEntry == (int)i && g.outputAnchor != g.outputCaret) {
-                    selectionBegin = std::min(g.outputAnchor, g.outputCaret);
-                    selectionEnd = std::max(g.outputAnchor, g.outputCaret);
-                    SIZE before{}, selected{};
-                    GetTextExtentPoint32W(mem, res.c_str(), selectionBegin, &before);
-                    GetTextExtentPoint32W(mem, res.c_str() + selectionBegin,
-                                          selectionEnd - selectionBegin, &selected);
-                    RECT highlight = { rr.left + before.cx, rr.top,
-                                       rr.left + before.cx + selected.cx, rr.bottom };
-                    HBRUSH highlightBrush = CreateSolidBrush(theme.isDark ? RGB(0x16, 0x4E, 0x73) : RGB(0xC7, 0xE8, 0xFF));
-                    FillRect(mem, &highlight, highlightBrush);
-                    DeleteObject(highlightBrush);
-                }
-                DrawTextW(mem, res.c_str(), -1, &rr, DT_LEFT | DT_SINGLELINE);
-                SelectObject(mem, old);
-            }
-            y += s.height() + entrySpacing + 22 + entrySpacing;
-        }
-        SelectClipRgn(mem, nullptr);
-        DeleteObject(clip);
+    const auto& hist = g.workspace.history();
+    uint64_t historyKey = hashMix(themeHash(theme), hist.size());
+    if (!hist.empty()) historyKey = hashMix(historyKey, hashText(hist.back()->result));
+    if (hist.size() >= 2) historyKey = hashMix(historyKey, hashText(hist[hist.size() - 2]->result));
+    historyKey = hashMix(historyKey, (uint64_t)(uint32_t)g.scrollY | ((uint64_t)g.scrollToBottomPending << 32));
+    historyKey = hashMix(historyKey, ((uint64_t)(uint32_t)(g.outputEntry + 1) << 40) ^
+                                     ((uint64_t)(uint32_t)g.outputAnchor << 20) ^ (uint32_t)g.outputCaret);
+    historyKey = hashMix(historyKey, ((uint64_t)g.historyRect.right << 32) ^ ((uint64_t)g.historyRect.top << 16) ^
+                                     (uint64_t)g.historyRect.bottom);
+    if (exposed(g.historyRect) && (full || petOverHistory || historyKey != g.historyKey)) {
+        paintHistory(mem, theme, screenTheme, pal);
+        g.historyKey = historyKey;
     }
 
-    // --- editor (current expression) ---
-    {
-        HBRUSH b = CreateSolidBrush(theme.screenBackground);
-        FillRect(mem, &g.editorRect, b);
-        DeleteObject(b);
-        HPEN p = CreatePen(PS_SOLID, 1, shade(theme.screenBackground, theme.isDark ? 20 : -30));
-        HPEN op = (HPEN)SelectObject(mem, p);
-        MoveToEx(mem, 0, g.editorRect.top, nullptr);
-        LineTo(mem, client.right, g.editorRect.top);
-        SelectObject(mem, op);
-        DeleteObject(p);
+    // --- editor (current expression): caret and typing ---
+    if (exposed(g.editorRect)) paintEditor(mem, theme, screenTheme, pal);
 
-        Expression& cur = g.workspace.current();
-        Size s = measureExpression(mem, cur.root.get());
-        int midY = (g.editorRect.top + g.editorRect.bottom) / 2;
-        int baseline = midY + (s.ascent - s.descent) / 2;
-        if ((g.allSelected || g.rangeSelected || g.editorCaret != g.editorAnchor) && !rowIsEmpty(cur.root.get())) {
-            int selectionLeft = g.editorRect.left + 12;
-            int selectionRight = g.editorRect.left + 20 + s.width;
-            if (g.editorCaret != g.editorAnchor && !g.allSelected && !g.rangeSelected) {
-                std::string plain = cur.toPlainString();
-                HDC measure = mem;
-                HFONT oldFont = (HFONT)SelectObject(measure, g.uiFont);
-                std::wstring before(plain.begin(), plain.begin() + std::min(g.editorAnchor, g.editorCaret));
-                std::wstring selected(plain.begin() + std::min(g.editorAnchor, g.editorCaret),
-                                      plain.begin() + std::max(g.editorAnchor, g.editorCaret));
-                SIZE beforeSize{}, selectedSize{};
-                HFONT expressionFont = CreateFontW(-fontHeightForDepth(0), 0, 0, 0, FW_NORMAL,
-                                                   FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                                                   OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                                   CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
-                                                   L"Segoe UI");
-                HFONT previousFont = (HFONT)SelectObject(measure, expressionFont);
-                GetTextExtentPoint32W(measure, before.c_str(), (int)before.size(), &beforeSize);
-                GetTextExtentPoint32W(measure, selected.c_str(), (int)selected.size(), &selectedSize);
-                SelectObject(measure, previousFont);
-                DeleteObject(expressionFont);
-                int origin = g.editorRect.left + 16;
-                selectionLeft = origin + beforeSize.cx;
-                selectionRight = selectionLeft + selectedSize.cx;
-                SelectObject(measure, oldFont);
-            }
-            RECT selection = { selectionLeft, baseline - s.ascent - 4,
-                               selectionRight, baseline + s.descent + 4 };
-            HBRUSH selectionBrush = CreateSolidBrush(theme.isDark ? RGB(0x16, 0x4E, 0x73) : RGB(0xC7, 0xE8, 0xFF));
-            FillRect(mem, &selection, selectionBrush);
-            DeleteObject(selectionBrush);
-        }
-        CaretInfo caret;
-        drawExpression(mem, cur.root.get(), g.editorRect.left + 16, baseline, screenTheme, &cur.cursor, &caret);
-
-        if (g.editorTextCursor >= 0) {
-            caret.valid = true;
-            caret.x = editorTextX(mem, cur.toPlainString(), g.editorTextCursor);
-            caret.top = baseline - s.ascent;
-            caret.bottom = baseline + s.descent;
-        }
-
-        if (caret.valid && g.caretVisible) {
-            HPEN cp = CreatePen(PS_SOLID, 2, screenTheme.caret);
-            HPEN ocp = (HPEN)SelectObject(mem, cp);
-            MoveToEx(mem, caret.x, caret.top, nullptr);
-            LineTo(mem, caret.x, caret.bottom);
-            SelectObject(mem, ocp);
-            DeleteObject(cp);
-        }
-    }
-
-    // --- button panel (cached off-screen) ---
-    {
-        int btnW = g.buttonAreaRect.right - g.buttonAreaRect.left;
-        int btnH = g.buttonAreaRect.bottom - g.buttonAreaRect.top;
-        if (btnW > 0 && btnH > 0) {
-            if (!g.buttonCacheDC || !g.buttonCacheBmp || g.buttonCacheW != clientW || g.buttonCacheH != clientH) {
-                if (g.buttonCacheDC) {
-                    if (g.buttonCacheOldBmp) SelectObject(g.buttonCacheDC, g.buttonCacheOldBmp);
-                    if (g.buttonCacheBmp) DeleteObject(g.buttonCacheBmp);
-                } else {
-                    g.buttonCacheDC = CreateCompatibleDC(mem);
-                }
-                g.buttonCacheBmp = CreateCompatibleBitmap(mem, clientW, clientH);
-                g.buttonCacheOldBmp = (HBITMAP)SelectObject(g.buttonCacheDC, g.buttonCacheBmp);
-                g.buttonCacheW = clientW;
-                g.buttonCacheH = clientH;
-                g.buttonCacheValid = false;
-            }
-
-            if (!g.buttonCacheValid) {
-                HBRUSH b = CreateSolidBrush(theme.background);
-                FillRect(g.buttonCacheDC, &g.buttonAreaRect, b);
-                DeleteObject(b);
-
-                for (auto& btn : g.buttons) paintButton(g.buttonCacheDC, btn, theme);
-
-                g.buttonCacheValid = true;
-            }
-
-            BitBlt(mem, g.buttonAreaRect.left, g.buttonAreaRect.top, btnW, btnH,
-                   g.buttonCacheDC, g.buttonAreaRect.left, g.buttonAreaRect.top, SRCCOPY);
-        }
-    }
+    // --- keypad: cached layers composed with BitBlt ---
+    if (exposed(g.buttonAreaRect)) paintKeypad(mem, theme, pal);
 
     // --- live graph panel in scientific mode (cached off-screen) ---
-    if (g.proMode && g.graphRect.right > g.graphRect.left) {
+    if (g.proMode && g.graphRect.right > g.graphRect.left && exposed(g.graphRect)) {
         int gw = g.graphRect.right - g.graphRect.left;
         int gh = g.graphRect.bottom - g.graphRect.top;
         if (gw > 0 && gh > 0) {
@@ -1925,21 +2217,24 @@ void paint(HDC hdc, RECT client) {
             if (curPlain.empty() && !g.workspace.history().empty()) {
                 curPlain = g.workspace.history().back()->expr->toPlainString();
             }
-            uint64_t stateHash = 0;
-            auto hashDouble = [](double v) -> uint64_t {
-                uint64_t u = 0;
-                std::memcpy(&u, &v, sizeof(u));
-                return u;
+            // Everything drawn in the panel; hover is tracked but never drawn.
+            auto graphStateHash = [&]() -> uint64_t {
+                auto hashDouble = [](double v) -> uint64_t {
+                    uint64_t u = 0;
+                    std::memcpy(&u, &v, sizeof(u));
+                    return u;
+                };
+                uint64_t hash = 0;
+                hash ^= hashDouble(g.graphState.minX) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+                hash ^= hashDouble(g.graphState.maxX) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+                hash ^= hashDouble(g.graphState.minY) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+                hash ^= hashDouble(g.graphState.maxY) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+                hash ^= ((uint64_t)g.graphState.probePos.x << 32) | (uint32_t)g.graphState.probePos.y;
+                hash ^= (uint64_t)(g.degrees ? 1 : 0) |
+                        ((uint64_t)(g.graphState.isRightProbing ? 1 : 0) << 2);
+                return hash;
             };
-            stateHash ^= hashDouble(g.graphState.minX) + 0x9e3779b9 + (stateHash << 6) + (stateHash >> 2);
-            stateHash ^= hashDouble(g.graphState.maxX) + 0x9e3779b9 + (stateHash << 6) + (stateHash >> 2);
-            stateHash ^= hashDouble(g.graphState.minY) + 0x9e3779b9 + (stateHash << 6) + (stateHash >> 2);
-            stateHash ^= hashDouble(g.graphState.maxY) + 0x9e3779b9 + (stateHash << 6) + (stateHash >> 2);
-            stateHash ^= ((uint64_t)g.graphState.hoverPos.x << 32) | (uint32_t)g.graphState.hoverPos.y;
-            stateHash ^= ((uint64_t)g.graphState.probePos.x << 32) | (uint32_t)g.graphState.probePos.y;
-            stateHash ^= (uint64_t)(g.degrees ? 1 : 0) |
-                         ((uint64_t)(g.graphState.isHovering ? 1 : 0) << 1) |
-                         ((uint64_t)(g.graphState.isRightProbing ? 1 : 0) << 2);
+            uint64_t stateHash = graphStateHash();
 
             bool needGraphRender = !g.graphCacheValid ||
                                    g.graphCacheW != gw ||
@@ -1970,7 +2265,8 @@ void paint(HDC hdc, RECT client) {
                 renderGraph(g.graphCacheDC, localRect, analysis, g.graphState, theme, g.uiFont, g.uiFontSmall);
 
                 g.graphCacheExpr = curPlain;
-                g.graphCacheStateHash = stateHash;
+                // Rendering may square up the view; hash what was actually drawn.
+                g.graphCacheStateHash = graphStateHash();
                 g.graphCacheDark = theme.isDark;
                 g.graphCacheValid = true;
             }
@@ -1991,10 +2287,109 @@ void paint(HDC hdc, RECT client) {
         GetCursorPos(&cursor);
         ScreenToClient(g.hwnd, &cursor);
         drawProPet(mem, g.petX, g.petY + petBounceOffset(), cursor);
+        g.lastPetRect = petPaintRect();
     }
     drawProExplosion(mem, client, theme);
 
-    BitBlt(hdc, 0, 0, client.right, client.bottom, mem, 0, 0, SRCCOPY);
+    if (g.perfOverlay) {
+        wchar_t text[112];
+        swprintf(text, 112, L"input → pixels %.2f ms  ·  paint %.2f ms  ·  worst %.2f ms",
+                 g.lastInputMs, g.lastPaintMs, g.worstInputMs);
+        HFONT old = (HFONT)SelectObject(mem, g.fonts.note);
+        SIZE size{};
+        GetTextExtentPoint32W(mem, text, (int)wcslen(text), &size);
+        RECT box = { g.editorRect.right - size.cx - 24, g.editorRect.top + 6,
+                     g.editorRect.right - 8, g.editorRect.top + 12 + size.cy };
+        fillRoundRect(mem, box, 6.0f, mixColor(pal.screen, theme.screenText, 0.12), CLR_INVALID);
+        SetBkMode(mem, TRANSPARENT);
+        SetTextColor(mem, theme.screenText);
+        DrawTextW(mem, text, -1, &box, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SelectObject(mem, old);
+    }
+
+    g.backbufferFresh = false;
+    BitBlt(hdc, dirty.left, dirty.top, dirty.right - dirty.left, dirty.bottom - dirty.top,
+           mem, dirty.left, dirty.top, SRCCOPY);
+}
+
+// ------------------------------------------------------------- pointer & key feedback
+
+void stampInput() {
+    if (g.inputStamp) return;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    g.inputStamp = now.QuadPart;
+}
+
+void invalidateKey(int index) {
+    if (index < 0 || index >= (int)g.buttons.size()) return;
+    RECT r = g.buttons[index].rect;
+    InflateRect(&r, 1, 2);   // the drop shadow
+    InvalidateRect(g.hwnd, &r, FALSE);
+}
+
+void invalidateTopAction(int index) {
+    if (index >= 0 && index < TopCount && g.topVisible[index])
+        InvalidateRect(g.hwnd, &g.topRects[index], FALSE);
+}
+
+// Hover feedback for keys and header buttons; only the rects that change
+// are repainted, so moving the pointer costs a BitBlt or two.
+void updateHover(POINT point) {
+    bool busy = g.editorSelecting || g.outputSelecting || g.petDragging ||
+                g.graphState.isDragging || g.graphState.isRightProbing;
+    int key = busy ? -1 : keyAt(point);
+    int top = busy ? -1 : topActionAt(point);
+    if (key != g.hoverKey) {
+        invalidateKey(g.hoverKey);
+        invalidateKey(key);
+        g.hoverKey = key;
+    }
+    if (top != g.hoverTop) {
+        invalidateTopAction(g.hoverTop);
+        invalidateTopAction(top);
+        g.hoverTop = top;
+    }
+}
+
+void releasePressed() {
+    invalidateKey(g.pressedKey);
+    invalidateTopAction(g.pressedTop);
+    g.pressedKey = -1;
+    g.pressedTop = -1;
+}
+
+// The keypad key a typed character corresponds to, for the press flash.
+int actionForChar(wchar_t c) {
+    if (c >= L'0' && c <= L'9') return ActDigit0 + (c - L'0');
+    switch (c) {
+        case L'.': return ActDot;
+        case L'+': return ActPlus;
+        case L'-': return ActMinus;
+        case L'*': return ActMul;
+        case L'/': return ActFrac;
+        case L'(': return ActOpenParen;
+        case L')': return ActCloseParen;
+        case L'^': return ActPower;
+        case L',': return ActComma;
+        case L'[': return ActOpenBracket;
+        case 13: return ActEquals;
+        case 8: return ActBackspace;
+        default: return -1;
+    }
+}
+
+// Typing lights the matching key for a moment, like a physical keypad.
+void flashKeyForAction(int action) {
+    if (action < 0) return;
+    for (size_t i = 0; i < g.buttons.size(); ++i) {
+        if (g.buttons[i].action != action) continue;
+        invalidateKey(g.flashKey);
+        g.flashKey = (int)i;
+        invalidateKey(g.flashKey);
+        SetTimer(g.hwnd, kFlashTimerId, kFlashMs, nullptr);
+        return;
+    }
 }
 
 // ------------------------------------------------------------- WndProc
@@ -2013,6 +2408,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g.uiFontSmall = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                     DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
                                     CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+            g.fonts.create();
             recomputeLayout();
             SetTimer(hwnd, kCaretTimerId, 530, nullptr);
             return 0;
@@ -2039,7 +2435,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             RECT client;
             GetClientRect(hwnd, &client);
             if (client.right > client.left && client.bottom > client.top) {
-                paint(hdc, client);
+                LARGE_INTEGER start{}, end{}, frequency{};
+                QueryPerformanceCounter(&start);
+                paint(hdc, client, ps.rcPaint);
+                QueryPerformanceCounter(&end);
+                QueryPerformanceFrequency(&frequency);
+                double toMs = 1000.0 / (double)frequency.QuadPart;
+                g.lastPaintMs = (end.QuadPart - start.QuadPart) * toMs;
+                if (g.inputStamp) {
+                    double latency = (end.QuadPart - g.inputStamp) * toMs;
+                    // A stamp older than this never got its own repaint.
+                    if (latency < 250.0) {
+                        g.lastInputMs = latency;
+                        g.worstInputMs = std::max(g.worstInputMs, latency);
+                    }
+                    g.inputStamp = 0;
+                }
             }
             EndPaint(hwnd, &ps);
             return 0;
@@ -2049,6 +2460,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (wParam == kCaretTimerId) {
                 g.caretVisible = !g.caretVisible;
                 InvalidateRect(hwnd, &g.editorRect, FALSE);
+            } else if (wParam == kFlashTimerId) {
+                KillTimer(hwnd, kFlashTimerId);
+                invalidateKey(g.flashKey);
+                g.flashKey = -1;
+            } else if (wParam == kGraphRefreshTimerId) {
+                KillTimer(hwnd, kGraphRefreshTimerId);
+                if (g.proMode) InvalidateRect(hwnd, &g.graphRect, FALSE);
             } else if (wParam == kProAnimationTimerId && g.proMode) {
                 int oldY = g.petY + petBounceOffset();
                 RECT oldPetRect = { g.petX - 20, oldY - 20, g.petX + 80, oldY + 80 };
@@ -2070,6 +2488,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             POINT point;
             GetCursorPos(&point);
             ScreenToClient(hwnd, &point);
+            if (keyAt(point) >= 0 || topActionAt(point) >= 0) {
+                SetCursor(LoadCursorW(nullptr, IDC_HAND));
+                return TRUE;
+            }
             int outputEntry = -1;
             int outputCharacter = 0;
             if (findOutputAtPoint(point, outputEntry, outputCharacter) ||
@@ -2083,6 +2505,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_LBUTTONDOWN: {
             POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            stampInput();
             RECT currentPetBounds = petBounds();
             if (g.proMode && proTransitionProgress() > 0.16 && PtInRect(&currentPetBounds, pt)) {
                 g.petDragging = true;
@@ -2098,19 +2521,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     return 0;
                 }
             }
-            RECT toggleRect = themeToggleRect();
-            RECT xRect = topActionXRect();
-            RECT yRect = topActionYRect();
-            RECT quadraticRect = topActionQuadraticRect();
-            RECT sciRect = topActionSciRect();
-            RECT angleRect = topActionAngleRect();
-            if (PtInRect(&toggleRect, pt)) { doAction(ActToggleTheme); return 0; }
-            if (PtInRect(&xRect, pt)) { doAction(ActVariableX); return 0; }
-            if (PtInRect(&yRect, pt)) { doAction(ActVariableY); return 0; }
-            if (PtInRect(&quadraticRect, pt)) { solveQuadraticFromDialog(); return 0; }
-            if (PtInRect(&sciRect, pt)) { doAction(ActToggleScientific); return 0; }
-            if (g.proMode && PtInRect(&angleRect, pt)) {
-                doAction(ActToggleAngle);
+            int top = topActionAt(pt);
+            if (top == TopQuadratic) {
+                // Modal dialog: no capture, or its own controls could not be clicked.
+                solveQuadraticFromDialog();
+                return 0;
+            }
+            if (top >= 0) {
+                g.pressedTop = top;
+                SetCapture(hwnd);
+                InvalidateRect(hwnd, &g.topRects[top], FALSE);
+                switch (top) {
+                    case TopTheme: doAction(ActToggleTheme); break;
+                    case TopVarX: doAction(ActVariableX); break;
+                    case TopVarY: doAction(ActVariableY); break;
+                    case TopSci: doAction(ActToggleScientific); break;
+                    case TopAngle: doAction(ActToggleAngle); break;
+                }
                 return 0;
             }
             if (PtInRect(&g.editorRect, pt)) {
@@ -2140,8 +2567,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 InvalidateRect(hwnd, &g.historyRect, FALSE);
                 return 0;
             }
-            for (auto& b : g.buttons) {
-                if (PtInRect(&b.rect, pt)) { doAction(b.action); return 0; }
+            int key = keyAt(pt);
+            if (key >= 0) {
+                // Act on press like a physical keypad; the key stays sunk until release.
+                int action = g.buttons[key].action;
+                invalidateKey(g.flashKey);
+                g.flashKey = -1;
+                g.pressedKey = key;
+                SetCapture(hwnd);
+                invalidateKey(key);
+                doAction(action);
+                if (g.pressedKey >= (int)g.buttons.size() ||
+                    (g.pressedKey >= 0 && g.buttons[g.pressedKey].action != action))
+                    g.pressedKey = -1;   // the keypad was rebuilt (2nd, Pro Max)
+                return 0;
             }
             g.outputEntry = -1;
             g.outputAnchor = 0;
@@ -2158,6 +2597,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 clampPetToClient();
                 InvalidateRect(hwnd, nullptr, FALSE);
                 return 0;
+            }
+            {
+                POINT point = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+                if (!g.trackingMouse) {
+                    TRACKMOUSEEVENT track{ sizeof(track), TME_LEAVE, hwnd, 0 };
+                    g.trackingMouse = TrackMouseEvent(&track) != FALSE;
+                }
+                updateHover(point);
             }
             if (g.proMode) {
                 POINT point = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
@@ -2187,11 +2634,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             break;
 
+        case WM_MOUSELEAVE:
+            g.trackingMouse = false;
+            updateHover({ -1, -1 });
+            return 0;
+
         case WM_LBUTTONUP:
             if (g.petDragging) {
                 g.petDragging = false;
                 ReleaseCapture();
                 InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            if (g.pressedKey >= 0 || g.pressedTop >= 0) {
+                releasePressed();
+                ReleaseCapture();
                 return 0;
             }
             if (g.proMode && g.graphState.isDragging) {
@@ -2239,6 +2696,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_CANCELMODE:
         case WM_CAPTURECHANGED: {
+            releasePressed();
             if (g.petDragging) g.petDragging = false;
             if (g.editorSelecting) g.editorSelecting = false;
             if (g.outputSelecting) g.outputSelecting = false;
@@ -2252,6 +2710,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
 
         case WM_MOUSEWHEEL: {
+            stampInput();
             int delta = GET_WHEEL_DELTA_WPARAM(wParam);
             if (g.proMode) {
                 POINT point = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
@@ -2271,6 +2730,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_CHAR: {
             wchar_t c = (wchar_t)wParam;
+            stampInput();
+            flashKeyForAction(actionForChar(c));
             if (g.editorTextCursor >= 0 && !g.allSelected && !g.rangeSelected) {
                 std::string text = g.workspace.current().toPlainString();
                 int position = currentEditorTextCursor();
@@ -2292,7 +2753,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 rebuildEditorText(text, position);
                 invalidateGraphCache();
                 ensureCaretVisible();
-                InvalidateRect(hwnd, nullptr, FALSE);
+                invalidateEdit();
                 return 0;
             }
             if (c == L'!' || c == L'=' || c == L'%' || c == L',' || c == L';')
@@ -2309,7 +2770,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     replaceEditorSelection(std::string(1, replacement));
                 } else return 0;
                 ensureCaretVisible();
-                InvalidateRect(hwnd, nullptr, FALSE);
+                invalidateEdit();
                 return 0;
             }
             if (c == 8) { doAction(ActBackspace); return 0; }
@@ -2323,7 +2784,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 insertNameLetter(g.workspace.current(), (char)tolower((char)c));
                 normalizeNames(g.workspace.current());
                 ensureCaretVisible();
-                InvalidateRect(hwnd, nullptr, FALSE);
+                invalidateEdit();
                 return 0;
             }
             switch (c) {
@@ -2340,44 +2801,44 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     g.undo.push_back(cloneExpression(g.workspace.current()));
                     insertOpenBrace(g.workspace.current());
                     ensureCaretVisible();
-                    InvalidateRect(hwnd, nullptr, FALSE);
+                    invalidateEdit();
                     return 0;
                 case L'}':
                     g.undo.push_back(cloneExpression(g.workspace.current()));
                     insertCloseParen(g.workspace.current());
                     ensureCaretVisible();
-                    InvalidateRect(hwnd, nullptr, FALSE);
+                    invalidateEdit();
                     return 0;
                 case L'\u222A':
                     g.undo.push_back(cloneExpression(g.workspace.current()));
                     insertOperator(g.workspace.current(), 'U');
                     ensureCaretVisible();
-                    InvalidateRect(hwnd, nullptr, FALSE);
+                    invalidateEdit();
                     return 0;
                 case L'\u2229':
                     g.undo.push_back(cloneExpression(g.workspace.current()));
                     insertOperator(g.workspace.current(), 'I');
                     ensureCaretVisible();
-                    InvalidateRect(hwnd, nullptr, FALSE);
+                    invalidateEdit();
                     return 0;
                 case L'\u0394':
                     g.undo.push_back(cloneExpression(g.workspace.current()));
                     insertOperator(g.workspace.current(), 'D');
                     ensureCaretVisible();
-                    InvalidateRect(hwnd, nullptr, FALSE);
+                    invalidateEdit();
                     return 0;
                 case L'\u222B':
                     g.undo.push_back(cloneExpression(g.workspace.current()));
                     insertIntegral(g.workspace.current());
                     ensureCaretVisible();
-                    InvalidateRect(hwnd, nullptr, FALSE);
+                    invalidateEdit();
                     return 0;
                 case L',': doAction(ActComma); return 0;
                 case L';': doAction(ActSemicolon); return 0;
                 case L'^': doAction(ActPower); return 0;
-                case L'!': insertOperator(g.workspace.current(), '!'); ensureCaretVisible(); InvalidateRect(hwnd, nullptr, FALSE); return 0;
-                case L'%': insertOperator(g.workspace.current(), '%'); ensureCaretVisible(); InvalidateRect(hwnd, nullptr, FALSE); return 0;
-                case L'=': insertEquals(g.workspace.current()); ensureCaretVisible(); InvalidateRect(hwnd, nullptr, FALSE); return 0;
+                case L'!': insertOperator(g.workspace.current(), '!'); ensureCaretVisible(); invalidateEdit(); return 0;
+                case L'%': insertOperator(g.workspace.current(), '%'); ensureCaretVisible(); invalidateEdit(); return 0;
+                case L'=': insertEquals(g.workspace.current()); ensureCaretVisible(); invalidateEdit(); return 0;
                 default: return 0;
             }
         }
@@ -2385,6 +2846,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_KEYDOWN: {
             Expression& cur = g.workspace.current();
             bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            bool shiftHeld = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            if (control && shiftHeld && wParam == 'P') {
+                g.perfOverlay = !g.perfOverlay;
+                g.worstInputMs = 0.0;
+                InvalidateRect(hwnd, &g.editorRect, FALSE);
+                return 0;
+            }
+            if (wParam != VK_SHIFT && wParam != VK_CONTROL && wParam != VK_MENU) stampInput();
             if (control && wParam == 'Z') { undoLastEdit(); return 0; }
             if (control && wParam == 'A') {
                 g.editorAnchor = 0;
@@ -2410,7 +2879,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 else cur = Expression();
                 g.allSelected = false;
                 g.rangeSelected = false;
-                InvalidateRect(hwnd, nullptr, FALSE);
+                invalidateEdit();
                 return 0;
             }
             if (control && wParam == 'V') { pasteExpression(); return 0; }
@@ -2441,7 +2910,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         g.allSelected = false;
                     }
                     ensureCaretVisible();
-                    InvalidateRect(hwnd, nullptr, FALSE);
+                    invalidateEdit();
                     return 0;
                 }
                 case VK_UP:
@@ -2456,7 +2925,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     // replace what you were typing with old history.
                     if (!moveUp(cur)) g.workspace.recallPrevious();
                     ensureCaretVisible();
-                    InvalidateRect(hwnd, nullptr, FALSE);
+                    invalidateEdit();
                     return 0;
                 case VK_HOME:
                     if (GetKeyState(VK_SHIFT) & 0x8000) {
@@ -2470,7 +2939,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         g.editorAnchor = g.editorCaret = 0;
                     }
                     ensureCaretVisible();
-                    InvalidateRect(hwnd, nullptr, FALSE);
+                    invalidateEdit();
                     return 0;
                 case VK_END:
                     if (GetKeyState(VK_SHIFT) & 0x8000) {
@@ -2484,9 +2953,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         g.editorAnchor = g.editorCaret = 0;
                     }
                     ensureCaretVisible();
-                    InvalidateRect(hwnd, nullptr, FALSE);
+                    invalidateEdit();
                     return 0;
-                case VK_DOWN: moveDown(cur); ensureCaretVisible(); InvalidateRect(hwnd, nullptr, FALSE); return 0;
+                case VK_DOWN: moveDown(cur); ensureCaretVisible(); invalidateEdit(); return 0;
                 case VK_DELETE: {
                     DWORD now = GetTickCount();
                     if (now - g.lastDeleteTick <= 600) {
@@ -2498,7 +2967,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         g.lastDeleteTick = now;
                     }
                     ensureCaretVisible();
-                    InvalidateRect(hwnd, nullptr, FALSE);
+                    invalidateEdit();
                     return 0;
                 }
                 case VK_ESCAPE:
@@ -2506,6 +2975,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         g.allSelected = false;
                         InvalidateRect(hwnd, &g.editorRect, FALSE);
                     } else {
+                        flashKeyForAction(ActClear);
                         doAction(ActClear);
                     }
                     return 0;
@@ -2523,6 +2993,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (g.appIcon) DestroyIcon(g.appIcon);
             if (g.uiFont) DeleteObject(g.uiFont);
             if (g.uiFontSmall) DeleteObject(g.uiFontSmall);
+            g.fonts.destroy();
             shutdownFonts();
             PostQuitMessage(0);
             return 0;
