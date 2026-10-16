@@ -645,9 +645,13 @@ void ensureCaretVisible() {
 }
 
 void doAction(int action) {
-    if (action != ActToggleTheme && action != ActToggleAngle && action != ActEquals)
+    // Theme, DEG/RAD, Sci and 2nd change the calculator, not the expression:
+    // they keep the selection and leave no undo step.
+    bool modeSwitch = action == ActToggleTheme || action == ActToggleAngle ||
+                      action == ActToggleScientific || action == ActToggle2nd;
+    bool editsExpression = !modeSwitch && action != ActEquals;
+    if (editsExpression)
         g.undo.push_back(cloneExpression(g.workspace.current()));
-    bool editsExpression = action != ActToggleTheme && action != ActEquals;
     if ((g.allSelected || g.rangeSelected) && editsExpression) {
         if (g.rangeSelected) deleteRange(g.workspace.current(), g.selectionAnchor,
                                           g.workspace.current().cursor);
@@ -2668,6 +2672,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 ReleaseCapture();
                 return 0;
             }
+            // A press that rebuilt the layout (Sci, 2nd, an "=" that starts
+            // Pro Max) or only hit a graph button has nothing above to end,
+            // yet still holds the capture. Kept, it would starve the window of
+            // WM_SETCURSOR and turn clicks on its frame into client clicks.
+            if (GetCapture() == hwnd && !g.graphState.isRightProbing) ReleaseCapture();
             break;
 
         case WM_RBUTTONDOWN: {
@@ -2696,6 +2705,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_CANCELMODE:
         case WM_CAPTURECHANGED: {
+            // SetCapture() while this window already holds the capture reports
+            // a change to itself. Nothing was lost, so the press that just
+            // began must not be cancelled.
+            if (msg == WM_CAPTURECHANGED && (HWND)lParam == hwnd) break;
             releasePressed();
             if (g.petDragging) g.petDragging = false;
             if (g.editorSelecting) g.editorSelecting = false;
