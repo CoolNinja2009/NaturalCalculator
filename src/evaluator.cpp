@@ -924,6 +924,33 @@ static std::unique_ptr<Item> copyItem(const Item* source) {
     return it;
 }
 
+// True when the item can begin an operand (factor). Used to distinguish the
+// two meanings of '%': "a%b" is modulo (b exists), while a trailing "%" with
+// no operand after it is a percent suffix ("100+2%" = 102).
+static bool itemCanStartFactor(const Item* it) {
+    if (!it) return false;
+    switch (it->type) {
+        case ItemType::Number:
+        case ItemType::Variable:
+        case ItemType::Constant:
+        case ItemType::Fraction:
+        case ItemType::Paren:
+        case ItemType::Power:
+        case ItemType::Sqrt:
+        case ItemType::Name:
+        case ItemType::Function:
+        case ItemType::Permutation:
+        case ItemType::Combination:
+        case ItemType::Integral:
+        case ItemType::Derivative:
+        case ItemType::Summation:
+        case ItemType::Product:
+            return true;
+        default:
+            return false;
+    }
+}
+
 struct RowParser {
     const std::vector<std::unique_ptr<Item>>& items;
     const EvaluationContext& context;
@@ -1701,7 +1728,7 @@ struct RowParser {
         throw std::runtime_error("Unknown item");
     }
 
-    EvalValue parseFactorValue() {
+    EvalValue parseFactorValue(bool* percentFlag = nullptr) {
         bool neg = false;
         while (peekIsOperatorChar('-') || peekIsOperatorChar('+')) {
             if (peekIsOperatorChar('-')) neg = !neg;
@@ -1716,14 +1743,26 @@ struct RowParser {
                 for (double& d : v.mat.data) d = factorial(d);
             }
         }
+        // Trailing '%' with no operand after it is a percent suffix: the factor
+        // becomes its value divided by 100. "a%b" stays modulo at the term
+        // level.
+        while (peekIsOperatorChar('%') &&
+               !itemCanStartFactor(pos + 1 < end ? items[pos + 1].get() : nullptr)) {
+            pos++;
+            if (percentFlag) *percentFlag = true;
+            v = evalValueMul(v, EvalValue(0.01));
+        }
         return neg ? evalValueSub(EvalValue(0.0), v) : v;
     }
 
-    EvalValue parseTermValue() {
-        EvalValue v = parseFactorValue();
+    EvalValue parseTermValue(bool* percentFlag = nullptr) {
+        EvalValue v = parseFactorValue(percentFlag);
         for (;;) {
             if (peekIsOperatorChar('*')) {
                 pos++;
+                // Multiplication beyond the leading factor means the term is
+                // no longer "just a percent" for the additive level above.
+                if (percentFlag) *percentFlag = false;
                 EvalValue next = parseFactorValue();
                 if (v.isSet() && next.isSet()) {
                     v = EvalValue(setProduct(v.asSet(), next.asSet()));
@@ -1734,6 +1773,7 @@ struct RowParser {
             }
             if (peekIsOperatorChar('%')) {
                 pos++;
+                if (percentFlag) *percentFlag = false;
                 EvalValue div = parseFactorValue();
                 if (v.isNumber() && div.isNumber()) {
                     if (div.num == 0.0) throw std::runtime_error("Division by zero");
@@ -1745,6 +1785,7 @@ struct RowParser {
             }
             const Item* nxt = peek();
             if (nxt && nxt->type != ItemType::Operator) {
+                if (percentFlag) *percentFlag = false;
                 v = evalValueMul(v, parseFactorValue());
                 continue;
             }
@@ -1760,7 +1801,10 @@ struct RowParser {
         for (;;) {
             if (peekIsOperatorChar('+')) {
                 pos++;
-                v = evalValueAdd(v, parseTermValue());
+                bool pct = false;
+                EvalValue t = parseTermValue(&pct);
+                // Casio-style percent: "A + B%" adds B/100 *of A* to A.
+                v = pct ? evalValueAdd(v, evalValueMul(v, t)) : evalValueAdd(v, t);
             } else if (peekIsOperatorChar('U')) {
                 pos++;
                 EvalValue next = parseTermValue();
@@ -1791,7 +1835,9 @@ struct RowParser {
                     }
                 }
                 pos++;
-                v = evalValueSub(v, parseTermValue());
+                bool pct = false;
+                EvalValue t = parseTermValue(&pct);
+                v = pct ? evalValueSub(v, evalValueMul(v, t)) : evalValueSub(v, t);
             } else {
                 break;
             }
@@ -2223,7 +2269,7 @@ struct BigParser {
         throw std::runtime_error("Unknown item");
     }
 
-    BigValue parseFactor() {
+    BigValue parseFactor(bool* percentFlag = nullptr) {
         bool negated = false;
         while (peekIsOperatorChar('-') || peekIsOperatorChar('+')) {
             if (peekIsOperatorChar('-')) negated = !negated;
@@ -2234,22 +2280,34 @@ struct BigParser {
             pos++;
             v = bigFactorial(v);
         }
+        // Trailing "%" (no operand) is a percent suffix even in big-number
+        // mode: divide the log-space magnitude by 100.
+        while (peekIsOperatorChar('%') &&
+               !itemCanStartFactor(pos + 1 < end ? items[pos + 1].get() : nullptr)) {
+            pos++;
+            if (percentFlag) *percentFlag = true;
+            if (!v.isZero) v.log10Abs -= 2.0;
+        }
         if (negated && !v.isZero) v.negative = !v.negative;
         return v;
     }
 
     // '*' explicit, or bare adjacency of two atoms (implicit multiplication,
     // e.g. "2(3+4)").
-    BigValue parseTerm() {
-        BigValue v = parseFactor();
+    BigValue parseTerm(bool* percentFlag = nullptr) {
+        BigValue v = parseFactor(percentFlag);
         for (;;) {
             if (peekIsOperatorChar('*')) {
                 pos++;
+                // See RowParser::parseTermValue: multiplication past the
+                // leading factor stops this from being a percent-of-base term.
+                if (percentFlag) *percentFlag = false;
                 v = bigMul(v, parseFactor());
                 continue;
             }
             if (peekIsOperatorChar('%')) {
                 pos++;
+                if (percentFlag) *percentFlag = false;
                 BigValue divisor = parseFactor();
                 if (divisor.isZero) throw std::runtime_error("Division by zero");
                 double num = (v.negative ? -1.0 : 1.0) * std::pow(10.0, v.log10Abs);
@@ -2259,6 +2317,7 @@ struct BigParser {
             }
             const Item* next = peek();
             if (next && next->type != ItemType::Operator) {
+                if (percentFlag) *percentFlag = false;
                 v = bigMul(v, parseFactor());
                 continue;
             }
@@ -2273,10 +2332,14 @@ struct BigParser {
         for (;;) {
             if (peekIsOperatorChar('+')) {
                 pos++;
-                v = bigAdd(v, parseTerm());
+                bool pct = false;
+                BigValue t = parseTerm(&pct);
+                v = pct ? bigAdd(v, bigMul(v, t)) : bigAdd(v, t);
             } else if (peekIsOperatorChar('-')) {
                 pos++;
-                v = bigSub(v, parseTerm());
+                bool pct = false;
+                BigValue t = parseTerm(&pct);
+                v = pct ? bigSub(v, bigMul(v, t)) : bigSub(v, t);
             } else {
                 break;
             }
@@ -3169,10 +3232,14 @@ struct ComplexEvaluator {
         while (!atEnd()) {
             if (peekIsOperatorChar('+')) {
                 pos++;
-                val += parseTerm();
+                bool pct = false;
+                auto t = parseTerm(&pct);
+                val = pct ? val + val * t : val + t;
             } else if (peekIsOperatorChar('-')) {
                 pos++;
-                val -= parseTerm();
+                bool pct = false;
+                auto t = parseTerm(&pct);
+                val = pct ? val - val * t : val - t;
             } else {
                 break;
             }
@@ -3180,15 +3247,23 @@ struct ComplexEvaluator {
         return val;
     }
 
-    std::complex<double> parseTerm() {
-        auto val = parseFactor();
+    std::complex<double> parseTerm(bool* percentFlag = nullptr) {
+        auto val = parseFactor(percentFlag);
         while (!atEnd()) {
             if (peekIsOperatorChar('*')) {
                 pos++;
+                if (percentFlag) *percentFlag = false;
                 val *= parseFactor();
             } else if (peekIsOperatorChar('%')) {
-                throw std::runtime_error("Modulo not supported in complex equation");
+                // "a%b" modulo is unsupported here, but a trailing "%" with
+                // no operand after it is still a valid percent suffix.
+                if (itemCanStartFactor(pos + 1 < end ? items[pos + 1].get() : nullptr))
+                    throw std::runtime_error("Modulo not supported in complex equation");
+                pos++;
+                val *= 0.01;
+                if (percentFlag) *percentFlag = true;
             } else if (peek() && peek()->type != ItemType::Operator && peek()->type != ItemType::Equals) {
+                if (percentFlag) *percentFlag = false;
                 val *= parseFactor();
             } else {
                 break;
@@ -3197,13 +3272,19 @@ struct ComplexEvaluator {
         return val;
     }
 
-    std::complex<double> parseFactor() {
+    std::complex<double> parseFactor(bool* percentFlag = nullptr) {
         bool neg = false;
         while (peekIsOperatorChar('-') || peekIsOperatorChar('+')) {
             if (peekIsOperatorChar('-')) neg = !neg;
             pos++;
         }
         auto val = parseAtom();
+        while (peekIsOperatorChar('%') &&
+               !itemCanStartFactor(pos + 1 < end ? items[pos + 1].get() : nullptr)) {
+            pos++;
+            if (percentFlag) *percentFlag = true;
+            val *= 0.01;
+        }
         if (neg) val = -val;
         return val;
     }

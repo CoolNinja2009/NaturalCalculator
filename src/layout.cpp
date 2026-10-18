@@ -2146,7 +2146,7 @@ void appendItemText(const Item* it, bool unary, std::wstring& out) {
                 case '+': out += unary ? L"+" : L" + "; break;
                 case '-': out += unary ? L"−" : L" − "; break;
                 case '*': out += L" · "; break;
-                case '%': out += L" mod "; break;
+                case '%': out += unary ? L"%" : L" % "; break;
                 case ',': out += L", "; break;
                 case ';': out += L"; "; break;
                 case 'U': out += L" ∪ "; break;

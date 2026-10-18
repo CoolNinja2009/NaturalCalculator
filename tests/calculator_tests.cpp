@@ -905,6 +905,21 @@ static void testAllScientificFunctions() {
     assertNear(evalText("10%3", rad), 1.0);
     assertNear(evalText("7.5%2", rad), 1.5);
     assertNear(evalText("14%5", rad), 4.0);
+
+    // Trailing % (no right operand) is a percent suffix, Casio-style.
+    // "A + B%" adds B/100 *of A*; multiply/divide just scale by B/100.
+    assertNear(evalText("100+2%", rad), 102.0);
+    assertNear(evalText("200+10%", rad), 220.0);
+    assertNear(evalText("100-10%", rad), 90.0);
+    assertNear(evalText("200*10%", rad), 20.0);
+    assertNear(evalText("200/10%", rad), 2000.0);
+    assertNear(evalText("10%", rad), 0.1);
+    // Percent inside parens and with variables still resolves.
+    assertNear(evalText("(50%)+50", rad), 50.5);
+    EvaluationContext withX = rad;
+    withX.x = 200.0;
+    withX.xDefined = true;
+    assertNear(evalText("x+10%", withX), 220.0);
 }
 
 static void testBigCombinatoricsAndFunctions() {
